@@ -198,6 +198,10 @@ func (s *Server) codexBackend(w http.ResponseWriter, r *http.Request) {
 				// model takes (codexSideEffort)
 				body = codexSideEffort(body, model)
 			}
+			if body, err = s.recoverCodexCheckpoints(r, body); err != nil {
+				writeError(w, provider.Responses, http.StatusBadGateway, err.Error())
+				return
+			}
 			// a sealed subagent task goes to a ChatGPT account the model
 			// or group has, or is turned away (serve, sealedReader)
 			// a provider set to compact natively is asked Codex's own

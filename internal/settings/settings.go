@@ -708,6 +708,11 @@ type Settings struct {
 	// lead asked for; CodexSubagentLead puts each on the model its lead's
 	// own turns go on, even when the lead names another.
 	CodexSubagentModel string `json:"codexSubagentModel,omitempty"`
+	// CodexCheckpointModel opts into recovering an untracked OpenAI
+	// compaction before a signed-in Codex switches to a magpie model.
+	// It is a bare ChatGPT model id; empty leaves recovery off. Only the
+	// incoming caller's sign-in is used, never another saved account.
+	CodexCheckpointModel string `json:"codexCheckpointModel,omitempty"`
 	// DesktopSubagentModel is the model the gateway puts Claude Desktop's
 	// subagent tool turns on. "" leaves them on the model their lead asks
 	// for; tool-less helpers and the lead's own turns are never moved.
@@ -2180,6 +2185,10 @@ func saveOwn(s Settings, recording, reads bool) error {
 	s.CodexSubagentModel = strings.TrimSpace(s.CodexSubagentModel)
 	if s.CodexSubagentModel != "" && s.CodexSubagentModel != CodexSubagentLead && !strings.Contains(s.CodexSubagentModel, "/") {
 		return fmt.Errorf("the model for Codex's subagents must be a model's id such as codex/gpt-5.5, not %q", s.CodexSubagentModel)
+	}
+	s.CodexCheckpointModel = strings.TrimSpace(s.CodexCheckpointModel)
+	if strings.ContainsAny(s.CodexCheckpointModel, "/ \t\r\n") {
+		return fmt.Errorf("Codex checkpoint recovery needs a bare ChatGPT model id, not %q", s.CodexCheckpointModel)
 	}
 	s.RedactRouteTo = strings.TrimSpace(s.RedactRouteTo)
 	if s.RedactRouteTo != "" && !strings.Contains(s.RedactRouteTo, "/") {
