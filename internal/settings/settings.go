@@ -63,7 +63,12 @@ var CodexServiceTiers = []string{"", CodexTierStandard, "priority", "ultrafast"}
 
 // Settings is what the user chose. "" and "system" both mean "follow the OS".
 type Settings struct {
-	Theme string `json:"theme,omitempty"` // system | light | dark
+	// CodexCheckpointModel opts into recovering an untracked OpenAI
+	// compaction before a signed-in Codex switches to a magpie model.
+	// It is a bare ChatGPT model id; empty leaves recovery off. Only the
+	// incoming caller's sign-in is used, never another saved account.
+	CodexCheckpointModel string `json:"codexCheckpointModel,omitempty"`
+	Theme                string `json:"theme,omitempty"` // system | light | dark
 	// Colorblind switches chart series (--c1…--c7) to an Okabe–Ito palette
 	// and gives each quota curve window, and its legend key, a dash of its
 	// own (#2073).
@@ -2685,6 +2690,10 @@ func save(s Settings, recording bool) error { return saveOwn(s, recording, false
 // any other save keeps the file's.
 func saveOwn(s Settings, recording, reads bool) error {
 	defer filememo.Forget() // read again, where a request holds it
+	s.CodexCheckpointModel = strings.TrimSpace(s.CodexCheckpointModel)
+	if strings.ContainsAny(s.CodexCheckpointModel, "/ \t\r\n") {
+		return fmt.Errorf("Codex checkpoint recovery needs a bare ChatGPT model id, not %q", s.CodexCheckpointModel)
+	}
 	// what is written is settled: a Settings read from an older file was
 	// settled as it was read, and one made without reading has its Dock
 	// choice read as that file's would be

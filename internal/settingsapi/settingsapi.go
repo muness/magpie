@@ -472,5 +472,6 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 			}
 		}
 	}
+	in.CodexCheckpointModel = cur.CodexCheckpointModel // opt-in in settings.json, not set by the page
 	return in, nil
 }
