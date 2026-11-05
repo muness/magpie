@@ -326,6 +326,7 @@ func Merge(body []byte, cur settings.Settings, web bool) (settings.Settings, err
 	// and the models Codex's and Desktop's subagents are put on, set
 	// in their Agents rows
 	in.CodexSubagentModel = cur.CodexSubagentModel
+	in.CodexCheckpointModel = cur.CodexCheckpointModel // opt-in in settings.json, not set by the page
 	in.DesktopSubagentModel = cur.DesktopSubagentModel
 	// and the model for requests masking would change (redact-route)
 	in.RedactRouteTo = cur.RedactRouteTo

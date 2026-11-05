@@ -469,7 +469,8 @@ type Call struct {
 
 // Server is the gateway.
 type Server struct {
-	client *http.Client
+	client             *http.Client
+	checkpointHandoffs checkpointHandoffs
 	// ending closes once the gateway stops serving, for a stream with no
 	// end of its own (routeEvents) to end before Shutdown, which would
 	// wait its whole drain for it (streamsEnding)
