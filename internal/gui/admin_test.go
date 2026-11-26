@@ -1,0 +1,246 @@
+package gui
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/yetone/magpie/internal/access"
+)
+
+func adminDo(t *testing.T, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	serveAdmin(w, httptest.NewRequest(method, path, strings.NewReader(body)))
+	return w
+}
+
+// ljayic on X: gateway keys are managed through the API by the app's own
+// handlers, and what tells a secret is not served.
+func TestAdminAPIGatewayKeys(t *testing.T) {
+	sandboxHome(t)
+	w := adminDo(t, "POST", "/gateway-keys/add-key", `{"name":"Laptop"}`)
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body)
+	}
+	var added struct {
+		Secret string
+		Keys   []access.Key
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &added); err != nil || added.Secret == "" || len(added.Keys) != 1 {
+		t.Fatalf("add-key: %v %s", err, w.Body)
+	}
+	id := added.Keys[0].ID
+	if w := adminDo(t, "POST", "/gateway-keys/rename-key", `{"key":"`+id+`","name":"Main"}`); w.Code != 200 {
+		t.Fatal(w.Code, w.Body)
+	}
+	list := adminDo(t, "GET", "/gateway-keys", "")
+	if list.Code != 200 || !strings.Contains(list.Body.String(), "Main") {
+		t.Fatalf("list: %d %s", list.Code, list.Body)
+	}
+	if strings.Contains(list.Body.String(), added.Secret) {
+		t.Fatal("the list tells a key's secret")
+	}
+	// what is left out is a 404, whatever the app has
+	for _, c := range []struct{ method, path string }{
+		{"POST", "/gateway-keys/copy-key"},
+		{"POST", "/gateway-keys/admin-key"},
+		{"POST", "/provider/key"},
+		{"POST", "/provider/show"},
+		{"POST", "/provider/restartapp"},
+		{"GET", "/usage"},
+		{"GET", "/caller-keys"},
+		{"POST", "/api/provider/save"},
+	} {
+		if w := adminDo(t, c.method, c.path, `{"key":"`+id+`","admin":"any"}`); w.Code != http.StatusNotFound {
+			t.Errorf("%s %s: %d, want 404", c.method, c.path, w.Code)
+		}
+	}
+	// and a key can't be given the API through it
+	if who, _ := access.Authenticate(added.Secret); who.Admin != "" {
+		t.Errorf("the API gave a key Admin: %q", who.Admin)
+	}
+	if w := adminDo(t, "POST", "/gateway-keys/remove-key", `{"key":"`+id+`"}`); w.Code != 200 {
+		t.Fatal(w.Code, w.Body)
+	}
+	if keys, _ := access.List(); len(keys) != 0 {
+		t.Errorf("remove-key left %d keys", len(keys))
+	}
+}
+
+func TestAdminAPIProviders(t *testing.T) {
+	sandboxHome(t)
+	const canary = "sk-canary-0123456789abcdef"
+	w := adminDo(t, "POST", "/provider/save", `{"id":"relay","name":"Relay","chat":"https://relay.example/v1","key":"`+canary+`"}`)
+	if w.Code != 200 {
+		t.Fatalf("save: %d %s", w.Code, w.Body)
+	}
+	list := adminDo(t, "GET", "/providers", "")
+	if list.Code != 200 || !strings.Contains(list.Body.String(), "relay") {
+		t.Fatalf("providers: %d %.300s", list.Code, list.Body)
+	}
+	if strings.Contains(list.Body.String(), canary) || strings.Contains(w.Body.String(), canary) {
+		t.Fatal("a saved key is told")
+	}
+	if w := adminDo(t, "POST", "/provider/delete", `{"id":"relay"}`); w.Code != 200 {
+		t.Fatalf("delete: %d %s", w.Code, w.Body)
+	}
+	if list := adminDo(t, "GET", "/providers", ""); strings.Contains(list.Body.String(), `"id":"relay"`) {
+		t.Error("delete left the provider")
+	}
+}
+
+// Signing in returns the vendor's page and the code, opens nothing, and
+// takes no password.
+func TestAdminAPISignInOpensNothing(t *testing.T) {
+	sandboxHome(t)
+	w := adminDo(t, "POST", "/signin", `{"agent":"no-such-agent"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown agent: %d %s", w.Code, w.Body)
+	}
+	if w := adminDo(t, "POST", "/signin", `{`); w.Code != http.StatusBadRequest {
+		t.Fatalf("bad body: %d", w.Code)
+	}
+}
+
+// Every route the API serves is one the app has, so it can't list a
+// route that went away.
+func TestAdminRoutesEveryAPIRoute(t *testing.T) {
+	sandboxHome(t)
+	app := http.NewServeMux()
+	providerRoutes(app, nil)
+	callerKeyRoutes(app)
+	for _, ar := range adminRoutes {
+		method, path, _ := strings.Cut(ar.pattern, " ")
+		to := path
+		if ar.to != "" {
+			to = ar.to
+		}
+		to = strings.NewReplacer("{action}", "x", "{id}", "x").Replace(to)
+		r := httptest.NewRequest(method, "/api"+to, strings.NewReader("{}"))
+		if _, pattern := app.Handler(r); pattern == "" {
+			t.Errorf("%s: the app has no route /api%s", ar.pattern, to)
+		}
+	}
+}
+
+// A key allowed to manage magpie from this computer only can't rotate a
+// key allowed from anywhere through the API (it would get that key's new
+// secret, or set one of its own), nor turn off or remove another key that
+// manages magpie. Its own key and keys that don't manage magpie it can.
+func TestAdminAPILeavesOtherManagingKeys(t *testing.T) {
+	sandboxHome(t)
+	add := func(name string) string {
+		t.Helper()
+		if _, err := access.Update("add-key", access.Change{Name: name}); err != nil {
+			t.Fatal(err)
+		}
+		keys, _ := access.List()
+		return keys[len(keys)-1].ID
+	}
+	local, anyKey, plain := add("Local"), add("Any"), add("Plain")
+	if _, err := access.Update("admin-key", access.Change{Key: local, Admin: access.AdminLocal}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := access.Update("admin-key", access.Change{Key: anyKey, Admin: access.AdminAny}); err != nil {
+		t.Fatal(err)
+	}
+	as := func(action, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest("POST", "/gateway-keys/"+action, strings.NewReader(body))
+		r = r.WithContext(access.WithIdentity(r.Context(), access.Identity{KeyID: local, Admin: access.AdminLocal}))
+		w := httptest.NewRecorder()
+		serveAdmin(w, r)
+		return w
+	}
+	for _, c := range []struct{ action, body string }{
+		{"rotate-key", `{"key":"` + anyKey + `"}`},
+		{"rotate-key", `{"key":"` + anyKey + `","secret":"chosen-by-the-caller-1234"}`},
+		{"off-key", `{"key":"` + anyKey + `"}`},
+		{"remove-key", `{"key":"` + anyKey + `"}`},
+		{"access-key", `{"key":"` + anyKey + `","readOnly":true}`},
+	} {
+		w := as(c.action, c.body)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("%s %s: %d, want 403 (%s)", c.action, c.body, w.Code, w.Body)
+		}
+		if strings.Contains(w.Body.String(), `"secret":"magpie`) {
+			t.Errorf("%s told a secret: %s", c.action, w.Body)
+		}
+	}
+	keys, _ := access.List()
+	for _, k := range keys {
+		if k.ID == anyKey && (k.Off || k.Admin != access.AdminAny || k.ReadOnly) {
+			t.Errorf("the other managing key was changed: %+v", k)
+		}
+	}
+	if who, ok := access.Authenticate("chosen-by-the-caller-1234"); ok {
+		t.Errorf("the caller's chosen secret opens %q", who.KeyName)
+	}
+	for _, c := range []struct{ action, body string }{
+		{"rotate-key", `{"key":"` + local + `"}`},
+		{"rotate-key", `{"key":"` + plain + `"}`},
+		{"rename-key", `{"key":"` + plain + `","name":"Renamed"}`},
+	} {
+		if w := as(c.action, c.body); w.Code != 200 {
+			t.Errorf("%s %s: %d, want 200 (%s)", c.action, c.body, w.Code, w.Body)
+		}
+	}
+}
+
+// A key let use Magpie Memory from another computer (access.Key.Memory)
+// is left to the command line and the app as a managing key is: rotating
+// it through the API would hand a managing key its secret, and with it
+// what goes into every agent's instructions here, which managing magpie
+// doesn't give.
+func TestAdminAPILeavesMemoryKeys(t *testing.T) {
+	sandboxHome(t)
+	add := func(name string) string {
+		t.Helper()
+		if _, err := access.Update("add-key", access.Change{Name: name}); err != nil {
+			t.Fatal(err)
+		}
+		keys, _ := access.List()
+		return keys[len(keys)-1].ID
+	}
+	admin, mem := add("Admin"), add("Remote box")
+	if _, err := access.Update("admin-key", access.Change{Key: admin, Admin: access.AdminAny}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := access.Update("memory-key", access.Change{Key: mem, Memory: true}); err != nil {
+		t.Fatal(err)
+	}
+	as := func(action, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest("POST", "/gateway-keys/"+action, strings.NewReader(body))
+		r = r.WithContext(access.WithIdentity(r.Context(), access.Identity{KeyID: admin, Admin: access.AdminAny}))
+		w := httptest.NewRecorder()
+		serveAdmin(w, r)
+		return w
+	}
+	for _, c := range []struct{ action, body string }{
+		{"rotate-key", `{"key":"` + mem + `"}`},
+		{"rotate-key", `{"key":"` + mem + `","secret":"chosen-by-the-caller-5678"}`},
+		{"memory-key", `{"key":"` + admin + `","memory":true}`},
+		{"memory-key", `{"key":"` + mem + `"}`},
+	} {
+		w := as(c.action, c.body)
+		if w.Code != http.StatusForbidden && w.Code != http.StatusNotFound {
+			t.Errorf("%s %s: %d, want 403 or 404 (%s)", c.action, c.body, w.Code, w.Body)
+		}
+		if strings.Contains(w.Body.String(), `"secret":`) {
+			t.Errorf("%s told a secret: %s", c.action, w.Body)
+		}
+	}
+	if who, ok := access.Authenticate("chosen-by-the-caller-5678"); ok {
+		t.Errorf("the caller's chosen secret opens %q", who.KeyName)
+	}
+	keys, _ := access.List()
+	for _, k := range keys {
+		if k.ID == mem && !k.Memory || k.ID == admin && k.Memory {
+			t.Errorf("memory changed through the API: %+v", k)
+		}
+	}
+}

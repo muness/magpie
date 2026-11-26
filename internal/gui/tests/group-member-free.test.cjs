@@ -70,13 +70,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const errors = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang));
-        await page.goto("http://magpie.test/?view=routing");
+        await page.goto("http://magpie.test/?view=groups");
         const card = page.locator('.rt-group[data-id="g"]');
         await card.waitFor();
 
         const mem = (await card.locator(".mem").first().textContent()).trim();
-        const parts = mem.split(" · ");
-        assert.deepEqual(parts, ["Scope", "qwen", w.free, "Paid", "qwen"], `the card's members read ${mem}`);
+        const parts = await card.locator(".mem").first().locator(".mbr").allTextContents();
+        assert.deepEqual(parts, [`Scope qwen · ${w.free}`, "Paid qwen"], `the card's members read ${mem}`);
 
         await card.locator("button", { hasText: w.edit }).click();
         const rows = page.locator(".rt-gedit .fbl").first().locator(".fbrow");

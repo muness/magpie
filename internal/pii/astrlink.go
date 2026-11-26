@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/pii/guard"
 	"github.com/yetone/magpie/internal/redact"
 )
@@ -42,9 +41,9 @@ var guardBase = "https://huggingface.co/QuantumNous/astrlink-guard/resolve/"
 func guardURL(f pinned) string { return guardBase + guardRev + "/" + f.path }
 
 // guardRoot is where AstrLink Guard's files are kept, in magpie's cache
-// beside Privacy Filter's folder: a folder per revision, and the found
+// beside Privacy Filter's folder (Root): a folder per revision, and the found
 // file (cache.go).
-var guardRoot = func() string { return filepath.Join(appdir.Cache(), "astrlink-guard") }
+var guardRoot = func() string { return filepath.Join(Root(), guardFolder) }
 
 func guardDir() string { return filepath.Join(guardRoot(), guardRev[:12]) }
 
@@ -322,7 +321,7 @@ func guardHeldBack() error {
 	if gsrv.lastErr == nil || !time.Now().Before(gsrv.retryAt) {
 		return nil
 	}
-	return fmt.Errorf("%w; it is tried again in %s, and until then a request it hasn't read is held back at once. To send requests masked by the rules alone, turn the model off in Settings → Privacy",
+	return fmt.Errorf("%w; it is tried again in %s, and until then a request it hasn't read is held back at once. To send requests masked by the rules alone, turn the model off in Settings › Privacy",
 		gsrv.lastErr, time.Until(gsrv.retryAt).Round(time.Second))
 }
 
@@ -330,6 +329,10 @@ func guardHeldBack() error {
 type guardModel struct{}
 
 func (guardModel) ID() string { return AstrLinkGuard }
+
+func (guardModel) ManagesWeights() bool { return true }
+
+func (guardModel) Generation() string { return "" }
 
 func (guardModel) Supported() bool { return true }
 
@@ -344,7 +347,7 @@ func (guardModel) Find(ctx context.Context, texts []string) ([][]redact.Found, e
 }
 
 func (guardModel) Now() Status {
-	s := Status{Model: AstrLinkGuard, Supported: true, Installed: guardInstalled(), Size: guardSize(), Rosetta: translated()}
+	s := Status{Model: AstrLinkGuard, ManagedWeights: true, Supported: true, Installed: guardInstalled(), Size: guardSize(), Rosetta: translated(), Emulated: emulated()}
 	gdl.fill(&s)
 	gsrv.mu.Lock()
 	if gsrv.m != nil {
@@ -362,7 +365,12 @@ func (guardModel) Now() Status {
 	return s
 }
 
-func (guardModel) Download(done func()) error { return gdl.run(guardSize(), guardInstall, done) }
+func (guardModel) Download(done func()) error {
+	if err := downloadable(); err != nil {
+		return err
+	}
+	return gdl.run(guardSize(), guardInstall, done)
+}
 
 func (guardModel) Cancel() { gdl.stop() }
 
@@ -386,6 +394,9 @@ func (guardModel) Stop() {
 }
 
 func (g guardModel) Remove() error {
+	if moving() {
+		return errMoving
+	}
 	g.Cancel()
 	g.Stop()
 	gdl.mu.Lock()

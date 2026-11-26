@@ -21,8 +21,11 @@ clone a working tree or synchronize arbitrary files.
   branch or using the repository's default.
 - [`backup.go`](../../internal/backup/backup.go) owns bundle contents and
   sealing. Sync divides the setup into providers, settings, profiles, agents
-  and library. Provider keys, agent models, library and usage have their own
-  inclusion switches.
+  and library. Each part, provider keys, memory, usage and sign-ins have
+  their own inclusion switches (`Config.syncs`).
+- [`plan.go`](../../internal/davsync/plan.go) previews a sync (`Preview`,
+  `PreviewWith`), runs the one previewed (`SyncPreviewed`) and undoes the
+  last sync that brought parts in (`UndoSync`).
 - [`usage.go`](../../internal/davsync/usage.go) shares separately sealed usage
   and quota files through a remote's `files` interface.
 - [`restore.go`](../../internal/davsync/restore.go) replaces local parts from
@@ -37,8 +40,8 @@ The settings part carries the user's preferences, but not what is only about
 one computer. [`Settings.KeepOwn`](../../internal/settings/settings.go) puts
 those back from this computer's settings whenever a sync, a join, a Restore,
 an Undo or a backup file brings settings in, and `hashes` blanks them, so
-changing one is no change to push. They are: the window's size and whether it
-was maximised, the fonts, the proxy, the gateway's port, sharing on the local
+changing one is no change to push. They are: the window's size, whether it
+was maximised and whether it is kept on top (`OnTop`), the fonts, the proxy, the gateway's port, sharing on the local
 network (`LAN`) and the addresses let in to it (`AllowIPs`), the private
 hosts magpie may download from (`FetchPrivate`), the Dock, gateway
 mode, keeping awake, lightweight windows, WSL lookups, account discovery, when
@@ -108,6 +111,51 @@ sync both ways throughout. A kept agent is not listed under Kept on this
 computer, which is the implicit own fields only (`TestAgentHereThroughSync`,
 `TestAgentsHereIsThisComputers`, `agent-here.test.cjs`).
 
+The providers' settings can be kept to each computer the same way, so that
+only the list and the keys sync (StudyingPython on X: "只希望同步供应商的key和列表，
+不希望同步供应商设置"). **Sync only the providers' list and API keys**, under
+Advanced in the sync form (`Config.ProviderSettingsHere`,
+`magpie s3 set provider-settings-here=yes`), is this computer's choice in
+sync.json, off by default and not in the setup text. The settings are the
+fields in [`provider.settingFields`](../../internal/provider/settings_here.go):
+model picks and model rules, on or off, routing, limits and rests, prices
+and balances, request options, headers, proxy and TLS options. What goes
+with a key still syncs: its URLs and API, the header it is sent in, the
+account behind it (AWS, Vertex, Zhipu's team), a client certificate and the
+server's pin, and a secret header (`SecretHeader`) among the headers.
+Which providers there are, their names and icons, their order and the
+routing groups sync too. `TestProviderFieldsSortedForSync` fails on a new
+field of `Provider` until it is put on one side. On, `withSettings` adds the
+`settingsOwn` sentinel to the own set: `withoutOwn` blanks every provider's
+settings in the hashes (`provider.WithoutSettings`), so a setting here is no
+change to push and the server's is none to bring; `keepServersOwn` puts the
+server's settings back into the providers this computer pushes, a provider
+the server lacks going up with this computer's; and `bring` mirrors with
+`provider.MirrorKeepingSettings`, which keeps the settings of a provider here
+and gives one new here the settings it came with. sync-state.json records
+the choice as of the last sync (`Settings`), as `Here` is, so turning it on
+or off is no change on either side. Turned off, the next change here goes up
+again. A Restore from the server keeps the settings too; a backup file's
+Restore and the Restore's Undo do not (`TestProviderSettingsStayOnEachComputer`,
+`TestModelPicksStayOnEachComputer`, `TestProviderSettingsHereTurnedOnSendsNothing`,
+`TestWithSettingsOf`, `sync-provider-settings-here.test.cjs`).
+
+A provider can also be kept on one computer
+([`Provider.ThisDevice`](../../internal/provider/provider.go): the provider
+row's menu, `magpie provider this-device <id> yes|no`), for a local model that
+exists only there (treydtw on X). `collect` leaves it, and its place in the
+provider order, out of what sync sends, so changing it is no change to push
+and the other computers lose their copy of it at their next sync. When a
+bundle is brought in, `provider.Mirror` neither replaces nor removes a provider
+kept here, whatever the other computers have under its id, and takes in none
+that a bundle marks as kept on its computer
+(`TestProviderOnThisDeviceStaysOnIt`). It is off by default for every provider,
+local addresses included: a copy of a `127.0.0.1` provider on a computer that
+runs the same local server works, and turning it on by default would take the
+copies off the computers that have one. A file backup (`backup.Collect`) still
+carries the provider, with the mark, and a Restore keeps the mark a provider
+here has.
+
 Sharing turned on at one computer never turns it on or off at another
 (Lullaby on Discord). A backup restored onto a new computer leaves sharing as
 that computer has it, off on a fresh one: sharing opens the gateway to the
@@ -125,12 +173,37 @@ Each operation holds the sync lock, so configuration changes cannot race a
 sync's state write.
 
 A first computer creates a remote backup. Another computer joining takes
-the remote setup and keeps displaced local parts in its sync folder.
+the remote setup and keeps displaced local parts in its sync folder. A
+part the file holds nothing of its own in (`unset`: no providers or
+routing groups, the default settings, no profiles, an empty library) is
+the folder never having had one, not a removal: on a join, a computer
+with that part set up keeps it and sends it up (#5642: an empty computer
+that synced first emptied the next one's providers and groups). After the
+join an emptied part is a removal and spreads as before
+(`TestSyncEmptyFirstKeepsLaterSetups`).
 Subsequent syncs compare each part with the hashes from the previous sync:
 local-only changes go up, remote-only changes come down, and a part changed
 on both sides keeps the newer version while retaining the replaced copy.
 A conditional write refused because another computer committed in between
 is retried through this same merge.
+
+A computer can follow the server instead (`Config.FollowServer`, set only
+by `SetFollowServer`: Settings → Sync → This computer → Follows the
+server, `/api/davsync/follow-server`, or `magpie <webdav|s3|github>
+follow on|off`; Ramon317317 on X). It takes every changed part from the
+file whichever side is newer, never writes the file (not a merged
+sign-in, not a rebuild of a damaged file), and a change made on it is
+kept in the sync folder like a join's and said in the notice
+(`Notice.Followed`). The join rules still hold: an `unset` part on the
+server leaves this computer's, and own agent fields and agents only here
+stay. Following a server with no file yet is an error, nothing sent.
+The Library page says so above its Instructions, MCP, Skills, Hooks,
+Subagents and Plugins tabs (and Memory while memory is synced), with a link
+to that setting (`followNote` in `plugins/library/client.js`,
+`library-follow-server.test.cjs`).
+`Configure` keeps the choice, as it keeps `AutoEvery`. The computer
+followed is an ordinary two-way one (`TestFollowServer`,
+`TestFollowServerSendsNoSignIn`, `sync-follow-server.test.cjs`).
 
 When a remote file is empty, damaged or another app's format, sync stops and
 describes it through `ServerFile`. Settings and the backend's `upload` command
@@ -141,7 +214,8 @@ repository and `magpie github upload`, rather than WebDAV's recovery path.
 A local file that is there but can't be read is unknown, never empty or the
 defaults. `backup.Collect` stops on an unreadable providers.json (with its groups
 and order), settings.json (`settings.LoadChecked`: unreadable, or
-not parsing with no good `.bak`) or library.json, and on a gateway key
+not parsing with no good `.bak`), library.json or memory (its meta.json, see
+[Memory](memory.md#source-of-truth)), and on a gateway key
 store that fails to export. A backup, an export and a sync all end with that
 error, nothing sealed or pushed; the sync's status shows it. A missing or
 empty settings.json is still none (`TestCollectStopsOnUnreadableSettings`,
@@ -154,6 +228,54 @@ configurations and clients. Only the active server is used. Empty credential
 fields reuse a saved credential only for its matching account; GitHub
 restricts reuse to the same owner/repo. Branch or prefix changes within that
 repository can keep the token. The branch is part of the sync state key.
+
+## What syncs, preview and undo
+
+#6428 (jinpwng on X): sync only the library and memory, keep each
+computer's providers, settings and models, see what a sync changes before
+it does, and take it back.
+
+- **What syncs.** `Config.Providers`, `Settings` and `Profiles` are
+  `*bool`, nil meaning synced, so a `sync.json` from before the choice
+  syncs every part as it did. `Agents`, `Library`, `Memory`, `Usage` and
+  `SignIns` were switches already. A part left out (`Config.syncs` false)
+  is neither read from nor written to the file: this computer keeps its
+  own, the server keeps the others' (a first computer puts none of it up,
+  which a joining one reads as `unset`). The Settings form shows
+  Providers (with their API keys under it), Settings, Agents' models,
+  Library and Memory; Profiles, Usage and Sign-ins sit under a folded
+  Advanced, open when one of them is set away from its default. The form
+  sends a part's choice only when it is off or was off, so saving an old
+  setup leaves it nil. The setup text carries the choice, and the CLI's
+  `set providers=no settings=no profiles=no` sets it. The Sync row says
+  which parts stay on each computer (`sync-left`).
+- **Turned back on.** `state.Off` is the parts the last sync left out. One
+  turned back on is joined like a first sync (`rejoin`, `again` in
+  `syncOnce`): the server's comes here, this computer's kept in the sync
+  folder, and an `unset` one on the server leaves this computer's
+  (`TestSyncPartTurnedBackOn`).
+- **Preview.** `syncOnce` with a `*Plan` runs the same merge and returns
+  before any write, here or on the server. A part's plan says `in`, `up`,
+  `same` or `off`, whether it replaces a change made here (`replaces`), and
+  its items added, removed or changed; memory, sign-ins and plugins removed
+  by another computer are counted. `Plan.Token` hashes what the sync would
+  do; `SyncPreviewed(token)` runs only while a new plan has the same token,
+  else `ErrPlanChanged` and the GUI shows the new plan. A preview from the
+  form (`PreviewWith`) is of the unsaved setup, and its Save and sync is
+  the form's ordinary save, without a token. Reached by Settings → Sync →
+  Preview a sync, the form's Preview, `/api/davsync/preview`,
+  `/api/davsync/sync-previewed` and `magpie <webdav|s3|github> preview`.
+- **Undo.** A sync that brings parts in keeps this computer's setup first
+  (`keepSealed`, as a join does) and records `state.Applied`. `UndoSync`
+  puts those parts back from that file, after keeping what is here now.
+  A part changed here since the sync is `*ChangedSince` (HTTP 409 with
+  `changed`), written over only with `force` (Undo anyway, `undo-sync
+  anyway`). The undo stays on this computer: `state.Local` is set to the
+  undone parts' hashes, so the next sync sends nothing and the server keeps
+  the others' (`TestUndoSync`). A change made here later is an ordinary
+  local change, and that whole part goes up. `/api/davsync/undo-sync`,
+  Settings → Sync → Undo the last sync, `magpie <kind> undo-sync`.
+  Restore's Undo (`davsync/undo`) is unchanged: it undoes a Restore.
 
 ## Backups by themselves
 
@@ -173,13 +295,24 @@ clock.
   there on a schedule. Files are 0600 in a 0700 folder.
 - **Format:** `magpie-YYYYMMDD-HHMMSS[-n]-{auto,restore}.json`, holding the
   bundle and its sha256. Each is written to a `.magpie-backup-*.tmp` and
-  renamed into place. A file whose sum doesn't match, a temp file or a name
-  that doesn't match is never listed, restored or pruned.
+  renamed into place. A file whose sum doesn't match, or a temp file, is
+  never listed or restored; a name that doesn't match is never listed,
+  restored or pruned. A file is a regular one, or on Windows an irregular
+  one (a reparse point such as a cloud drive's placeholder); never a folder
+  or a link (`autoFileType`).
 - **Schedule:** a backup is due `Hours` after the newest, so a restart
   doesn't make one early; one whose bundle equals the newest's is not
-  written. After a write the oldest `-auto` files past `Keep` are removed
-  (and `-restore` ones past `Keep` after a restore), with its own temp files
-  over an hour old; other files in the folder are never touched.
+  written.
+- **Pruning** (`pruneAuto`, WuMark1218 on X): at every look of the
+  schedule (every 10 minutes, made or not) and after each write, per reason
+  (`-auto`, `-restore`), files at a backup's name are ordered by the stamp
+  in their name; the newest `Keep` that read whole are kept and every file
+  of that reason older than the last of them is removed, read or not. One
+  that doesn't read whole and is newer than those stays (unknown). Before,
+  only files that read whole were counted and removed, and only after a
+  write, so a damaged pile, or the extra versions after Keep was lowered,
+  stayed. Temp files over an hour old go too; other files in the folder are
+  never touched.
 - **Restore:** `AutoRestore(name)` first writes a `-restore` backup of what
   is here (and stops if that fails), then `Restore(bundle, All)`, which is
   additive: providers added since stay, each keeps its local key. Restoring
@@ -188,15 +321,113 @@ clock.
   reveal,restore}`. `set` changes only the fields sent; `dir ""` is the
   default folder. Settings draws it under Sync's Export and Import from the
   lazy [`autobackup.js`](../../internal/gui/assets/autobackup.js).
-  The status's `inside` says the folder is `settings.Dir()` or in it (letter
+  Its Versions row says how many and the newest (a state, kept in sight
+  where Settings' hints rest out of it) and folds the versions, each with
+  Restore…, until its name or that line is clicked; the fold is kept over
+  redraws for the window's life (chen2652 on Discord,
+  `auto-backup.test.cjs`). The status's `inside` says the folder is `settings.Dir()` or in it (letter
   case aside off Linux), the default included; Settings then says under the
   folder that a reinstalled system or a lost disk takes the backups too, and
   to pick one on another disk or a cloud drive's (two_2025. on Discord,
-  magpie on C:). Keeping everything elsewhere is portable mode
-  (`internal/appdir`); docs/start's `#data-folder` gives both
-  (`TestAutoInsideMagpiesFolder`, `auto-backup.test.cjs`).
+  magpie on C:). Keeping everything elsewhere is the Data folder's move
+  (below) or portable mode (`internal/appdir`); docs/start's
+  `#data-folder` gives all three (`TestAutoInsideMagpiesFolder`,
+  `auto-backup.test.cjs`).
 - **Sign-ins:** off unless picked (`SignIns`, with `Passphrase`); see
   [Sign-ins, when picked](#sign-ins-when-picked).
+- **Plugins:** ride the providers part. `AddPlugins` only adds, so a removal is
+  `syncOnce`'s: it keeps the names both sides had after the last sync
+  (`state.Plugins`), and a name one side has since lost is removed on the other
+  (`pluginPlan`, `removePlugin`), however the providers part came out. One that
+  can't be removed (its agent is on magpie) is tried again next sync. A plugin
+  added on one side stays (dolacmeo on X; `TestSyncPluginRemovalSpreads`). Not
+  yet: an older sync with no record (`state.Plugins` empty) removes nothing.
+- **Memory:** on unless turned off (`Memory`), merged memory by memory in
+  `syncOnce` after the sign-ins, never replaced as a part; see
+  [Memory's backups and sync](memory.md#backups-and-sync).
+
+## The usage history in a backup file
+
+A backup file made by `magpie backup` or Settings → Sync → Export carries the
+usage history unless `--no-usage` (or the Export form's tick) leaves it out
+(JasonLeeForOnly on Discord: a server moved by backup and restore lost every
+call). [`WithUsage`](../../internal/backup/backup.go) puts in `Bundle.Usage`:
+usage.jsonl's whole lines, gzipped ([`LogBackup`](../../internal/usage/backup_log.go);
+a line still being written is left out), their count, and the gzipped quota
+history (`provider.QuotaHistoryData`). `Collect` never adds it, so a sync, a
+join and an automatic backup carry no usage: sync shares usage by day files
+(`usage.go`), and an automatic backup would hold the whole log every day.
+Routing history (debug data) and `usage-others` (the other computers' days)
+are never in a backup file.
+
+`Restore` with `Parts.Usage` (on in `All`; `magpie restore --no-usage` and
+the Import form's tick turn it off) merges, never replaces:
+[`MergeLog`](../../internal/usage/backup_log.go) appends the backup's lines
+this log doesn't have, compared byte for byte as a multiset, so a line here
+is passed over as often as it is here. Restoring the same file twice adds
+nothing; two calls the old log had as the same bytes both arrive; a line
+that isn't a JSON object is passed over. Most of the log is read before the
+gateway's log lock is taken, the rest under it, and the new lines are
+appended with O_APPEND a few MB at a time after a newline if the log ends
+in an unfinished line. Rows keep `Computer == ""`: they are this computer's
+calls from then on, key spend caps included. Quota points merge with
+`provider.MergeQuotaHistory`. `Result.Usage` is the number of calls added,
+nil when the file has no usage (one made before, or with `--no-usage`),
+which restores as before.
+
+Not yet: where usage is also shared by sync, the old computer's calls are
+in `usage-others` and, after a restore, in this log too, so they count
+twice (#6987).
+
+Tests: `TestBackupCarriesUsageHistory` (two homes, a restore twice, a
+duplicate line, `--no-usage`), `TestOldBackupWithoutUsage`,
+`TestUsageMergeKeepsLinesWhole` (an unfinished last line on both sides),
+and `sync-signins.test.cjs` for the forms.
+
+## Data folder on another disk
+
+Settings › Sync's Data folder (CHENGJIAHEGOXIS and buhaodeshiyehao on X)
+moves magpie's own files and cache to another disk, and back.
+[`internal/appdir/move.go`](../../internal/appdir/move.go) does it:
+
+- **What moves:** `appdir.Config()` and `appdir.Cache()` only, into
+  `<picked>/magpie/config` and `<picked>/magpie/cache`. The agents' own
+  folders (`~/.claude`, `~/.codex`…) and their session histories stay where
+  each agent reads them. A link is left at each old path (a symlink, or a
+  junction on Windows when symlinks need a privilege, as in #973), so every
+  path magpie and the agents were given still works. A portable magpie is
+  never moved.
+- **Refused before anything quits** (`Target`): a relative path, a folder
+  that isn't there, a `magpie` folder there with files in it, or a folder
+  inside magpie's own folders.
+- **Never under a running magpie.** `AskMove` writes `move-to.json` in the
+  config folder. The GUI then starts itself again (`restartSelf`, the
+  update path's relaunch) and quits; when another magpie serves the gateway
+  (`magpie serve`, a launch agent), or for magpie web, it doesn't restart,
+  and the row says the move waits. The next start runs `MovePending` in
+  `cli.Main` before anything reads a file, after the old process is gone
+  and only when no gateway answers. It is made once: a failure is not asked
+  for again, and why is kept in `move-result.json` for the row.
+- **How:** within one disk, a rename. Across disks, a copy, and the old
+  folder is put aside (`.moved`) until the link is made, then removed; a
+  failed copy removes the half copy and leaves the old folder as it was.
+  Moving back takes the link away and renames the folder home; across
+  disks it puts the link back, copies to `<config>.moving` and renames that
+  into place. The empty `magpie` folder on the disk is then removed. The
+  config moves first: a cache that fails after it says so and leaves the
+  config moved.
+- **Disk gone:** a link that leads nowhere is `UnreachableError`. `cli.Main`
+  stops on it, with a native alert from the app (as #989), rather than
+  starting an empty magpie that would write a new config over the link.
+- **CLI:** `magpie data` says where they are; `magpie data move <folder>`
+  moves at once with no gateway up, otherwise asks for it;
+  `magpie data move --home` and `magpie data cancel`.
+
+Routes: `GET /api/datafolder`, `POST /api/datafolder/{move,home,cancel,reveal}`
+([`datafolder.go`](../../internal/gui/datafolder.go)). Tests:
+`internal/appdir/move_test.go` (both disks, refused targets, a failed copy,
+disk gone, once only), `move_windows_test.go` (the junction),
+`TestDataFolderMoveRestarts` and `data-folder.test.cjs`.
 
 ## Sign-ins, when picked
 
@@ -218,6 +449,16 @@ switch that anyone with the file and the passphrase can use those accounts.
   Each record has an id that names the account (agent, lower-case email and
   organisation; or the account key), its time of renewal and a hash; ids two
   rows share are left out on both sides, as no one can tell which is which.
+- **Never carried:** a plugin's sign-in whose vendor spends a refresh
+  token once. Two computers holding one copy race to renew it, and the
+  vendor turns the loser away for good with no newer copy anywhere
+  (#5583, skalitz-wolf). Such a plugin says so with its auth hook's
+  `rotating` (`Provider.Rotating`); MiniMax Code and Qoder are known to
+  (`rotatesKnown`). `CollectSignIns` leaves them out, and `records` leaves
+  out one an older file carried, so a sync neither sends nor takes one
+  and a Restore writes none. Each computer signs in to them itself
+  (`TestCollectSignInsLeavesARotatingSignInOut`,
+  `TestKnownRotatingSignInsStayWithNoPluginListed`).
 - **Sealed:** a backup or export seals them with the rest of the file. An
   automatic backup, which has no passphrase on a schedule, seals them
   alone (`SealData`) with the passphrase asked for as they are turned on,
@@ -251,6 +492,17 @@ switch that anyone with the file and the passphrase can use those accounts.
   form says so (`TestMergeSignInsTheLaterRenewedStays`,
   `TestMergeSignInsRemovedOnlyWhenTheOtherSideRemovedIt`,
   `TestApplySignInsKeepsWhatChangedSinceTheMerge`, `sync-signins.test.cjs`).
+- **Left out here** (`Config.SignInsExcept`, provider ids; Ethereal499 on
+  X): under the Sign-ins tick, **Not synced** picks subscriptions whose
+  sign-ins stay on this computer. [`SignIns.Except`](../../internal/provider/signins_except.go)
+  takes them out of what `collect` sends, and out of the server's before
+  `MergeSignIns`, the preview and a Restore, so the server's are never put
+  in and none here is removed for being missing there. `syncOnce` puts the
+  server's ones back with `With`, so the computers that sync them keep
+  them. An id names its `-plugin` sign-ins too. The choice is this
+  computer's: the setup text doesn't carry it, and a setup without it
+  leaves nothing out (`TestSyncSignInsExcept`, `TestSignInsExcept`,
+  `sync-signins-except.test.cjs`; `magpie webdav set sign-ins-except=claude`).
 
 ## GitHub constraints and errors
 
@@ -315,7 +567,19 @@ switch that anyone with the file and the passphrase can use those accounts.
   responses stay actionable errors. Authentication, permission and branch
   failures remain distinct from missing files. Rate limits use sync backoff.
 - The request archive goes to S3 only when sync has a bucket. Its objects are
-  separate from the encrypted setup and usage files. With no bucket the same
+  separate from the encrypted setup and usage files. In the bucket it is kept
+  to `RequestArchiveMB` (1 GiB unless set; synced, as every computer writes
+  the one bucket) by `gateway/archive_bucket.go`: the oldest calls past it
+  are removed, down to a tenth under it. Only names of `ArchiveName`'s shape
+  under `<prefix>/magpie/archive/` are counted or removed, never the backup,
+  usage or another key. The serving magpie lists the archive once, two
+  minutes after it starts, whether the archive is on or off, so a bucket
+  grown before the cap (18 GB in a month for an R2 user on X) is brought
+  under it on update. After that uploads are counted, and the bucket is
+  listed again only once a tenth of the size has been uploaded since
+  (`TestRequestArchiveKeptUnderItsSize`,
+  `TestBucketArchiveBroughtUnderItsSizeAtStart`,
+  `TestBucketArchiveListedPerTenthUploaded`). With no bucket the same
   files are kept on this computer instead (`gateway.DiskArchive`, in
   `<settings.Dir()>/request-archive/<date>/<id>.json`, written through a
   temporary file and renamed, 0600), under its own switch,
@@ -356,12 +620,86 @@ entries, an older bundle with no list keeps this computer's, and a library
 with none hashes as before (`TestSyncHooks`, `TestNoHooksHashAsBefore`,
 `TestBackupFileCarriesHooks`).
 
+billion-context's own config, `billion-context.json` (`library.Bundle.Bili`,
+see [library](library.md)), goes in the library part by sync and backup file
+alike: the text as written, comments kept, with magpie's summary recipe at
+the canonical gateway address, put back at this computer's gateway when it
+is written, so two computers on different ports don't trade it back and
+forth. A file bili can't read, or one over 1 MiB, is not carried, so it
+never arrives as empty; a bundle without it leaves this computer's alone.
+Before a carried file replaces a different one here, this computer's is
+kept with the backups. Its credential store, `<config>.summary-credentials.json`,
+is never carried: the computer that writes magpie's recipe saves its own
+gateway key there. A file naming a DSN is left out of a keyless backup
+file (`WithoutSecrets`). A library with no such file hashes as before, and
+running bilis are asked to reload after one is written
+(`TestBiliFileCarried`, `TestBiliFileNotCarriedUnreadable`,
+`TestBiliFileDSNNotInKeylessBackup`, `TestBiliFileInLibraryPart`). A sync's preview names it as
+the file `billion-context.json`, added, changed or removed
+(`TestBiliFileInPreview`).
+
+Claude Code's own plugins, the ones installed through its `/plugin`
+marketplaces (`library.Bundle.ClaudePlugins`,
+[`claude_plugins.go`](../../internal/library/claude_plugins.go)), go in the
+library part too. What goes is each marketplace's source (from
+`plugins/known_marketplaces.json` and settings.json's
+`extraKnownMarketplaces`, with only `source` and `autoUpdate` kept) and the
+plugin ids settings.json's `enabledPlugins` has on, under
+`CLAUDE_CONFIG_DIR` when it is set. `installLocation`, `installPath` and the
+downloaded code in `plugins/marketplaces` and `plugins/cache` stay: they are
+this computer's, and Claude Code fetches them again from the sources. A
+marketplace from a local folder or file, or one whose source has a user or
+token in a URL or request headers, is not carried, and neither are its
+plugins. Claude Code adds `claude-plugins-official` itself, so only its
+plugins go. On the other computer they are added to settings.json's
+`extraKnownMarketplaces` and `enabledPlugins`, the setup Claude Code
+installs from at its next interactive start (tried with 2.1.319 in a
+sandbox; `claude -p` does not install). Claude Code's own
+`known_marketplaces.json` and `installed_plugins.json` are never written.
+The file is patched in place (comments and other keys kept) and renamed in
+from a temporary file, and the one it replaces is kept with the backups.
+It only adds: a marketplace known here under that name, and a plugin with
+any value here (turned off too), stay as they are, so a plugin removed on
+one computer is not removed on the others. A settings.json either side
+can't read is neither carried as none nor written over. A computer with no
+such plugins carries none and hashes as before (`TestClaudePluginsCollected`,
+`TestClaudePluginsNoneOrUnknown`, `TestClaudePluginsPut`,
+`TestClaudePluginsInLibraryPart`). The preview names each marketplace and
+plugin (`TestClaudePluginsInPreview`).
+
+The Library's own Claude plugins (`library.Bundle.Plugins`,
+[`plugin_carry.go`](../../internal/library/plugin_carry.go), #6685) go in
+the library part as one record each, never as their parts: a plugin from a
+GitHub or git link as its source, which the other computer installs from
+itself, and one from a folder (or a link holding a sign-in) with its files.
+The other computer makes the parts again, each naming its own plugin
+folder, removes a plugin the bundle lacks, and keeps one it can't fetch yet
+as pending, with a problem. An empty list hashes as a bundle from before
+plugins were carried, and a bundle without the list leaves this computer's
+plugins alone. The preview names each plugin, its files as one digest
+(`TestSyncLibraryPlugins`, `TestNoPluginsHashAsBefore`).
+
+A library skill from GitHub or a git repository goes in the library part as
+its source too (#5715, [`skill_carry.go`](../../internal/library/skill_carry.go)),
+and the other computer fetches it itself, so a big skill no longer counts
+against the 64 MiB. What a sync still leaves out is said, never a silent
+success: `state.LibraryLeft` names the skills and plugins whose files were
+too big to go (or that this computer never had, `Skill.Missing`), and
+`state.LibraryProblems` what the last sync that brought the library in
+couldn't put here (a skill not fetched from its source yet, one kept as it
+was changed here). `Status` gives them as the view's `libraryLeft` and
+`libraryProblems`, dropping a problem settled since (`library.Unsettled`:
+Update fetched the skill), and Settings › Sync shows them in red under the
+status (`askPreviewRows` in syncfiles.js; `TestSyncSkillsBySourceAndLeftOut`,
+`sync-library-left.test.cjs`). A restore (`backup.Restore` through the
+restore and plan paths) doesn't record them yet.
+
 ## Verification
 
 ```sh
 go test -tags nogui ./internal/davsync
 go test -tags nogui ./internal/cli -run 'TestGitHubCmd|TestWebdavCmd|TestS3Cmd'
-node --test internal/gui/tests/github-sync.test.cjs internal/gui/tests/s3-sync.test.cjs internal/gui/tests/sync-other-kind.test.cjs
+node --test internal/gui/tests/github-sync.test.cjs internal/gui/tests/s3-sync.test.cjs internal/gui/tests/sync-other-kind.test.cjs internal/gui/tests/sync-follow-server.test.cjs
 ```
 
 `TestGitHubEmptyRepository` covers the first encrypted backup initializing an

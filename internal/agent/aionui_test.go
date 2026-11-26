@@ -160,7 +160,7 @@ func TestAionUiStatusRereadsOnChange(t *testing.T) {
 	if err := os.WriteFile(path, []byte("junk"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	st := &aionuiStatus{}
+	st := &dbStatus{has: aionuiHas}
 	if _, known := st.read(path, gw); known {
 		t.Fatal("junk read as known")
 	}
@@ -181,6 +181,8 @@ func TestAionUiDetect(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	// installed: on a Mac, AionUi's folder without the app is a leftover
+	plantApp(t, filepath.Join(home, "Applications"), "AionUi.app", "com.aionui.app")
 	a := aionui()
 	if a.detect() {
 		t.Fatal("detected with no AionUi folder")

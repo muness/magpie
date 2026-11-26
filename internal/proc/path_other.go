@@ -5,11 +5,11 @@ package proc
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yetone/magpie/internal/agentenv"
@@ -52,6 +52,7 @@ func UserPath() {
 			addPath(filepath.SplitList(p))
 			login.Lock()
 			login.dirs, login.vars, login.at = filepath.SplitList(p), vars, time.Now()
+			loginSaid.Store(&vars)
 			login.Unlock()
 		}
 	}()
@@ -97,6 +98,7 @@ func LoginPath() []string {
 		return nil
 	}
 	login.dirs, login.vars, login.at = filepath.SplitList(p), vars, time.Now()
+	loginSaid.Store(&vars)
 	return login.dirs
 }
 
@@ -117,14 +119,24 @@ var ProxyVars = []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy
 // the Dock didn't see (timwangdev on X). Only read (LoginEnvKnown).
 var RegistryVars = []string{"BUN_CONFIG_REGISTRY", "NPM_CONFIG_REGISTRY", "npm_config_registry"}
 
+// GeminiKeyVars are the Gemini API variables the login shell is asked for
+// beside them: Antigravity's CLI on a key of the user's own
+// ("modelProvider": "gemini") reads its key and endpoint from the
+// environment a terminal gives it, which magpie opened from the Dock
+// doesn't have, and the Providers page offers that key (provider's
+// readAgySettings). Only read (LoginEnv), never set in magpie's
+// environment: the programs magpie starts don't get them.
+var GeminiKeyVars = []string{"GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL"}
+
 // shellVars are the variables shellProbe asks for, in its order. Claude
 // Code's provider switches (agentenv.ClaudeProviders) are only read, as the
 // proxy variables are.
-var shellVars = slices.Concat(agentenv.Vars, ProxyVars, agentenv.ClaudeProviders, RegistryVars)
+var shellVars = slices.Concat(agentenv.Vars, ProxyVars, agentenv.ClaudeProviders, RegistryVars, GeminiKeyVars)
 
 // LoginEnv is the value a terminal opened now has for k, one of
-// agentenv.Vars, ProxyVars or agentenv.ClaudeProviders: the login shell's, asked as LoginPath asks
-// and with it; "" when the shell has none for it or doesn't say.
+// agentenv.Vars, ProxyVars, agentenv.ClaudeProviders, RegistryVars or
+// GeminiKeyVars: the login shell's, asked as LoginPath asks and with it;
+// "" when the shell has none for it or doesn't say.
 func LoginEnv(k string) string {
 	LoginPath()
 	login.Lock()
@@ -141,6 +153,19 @@ func LoginEnvKnown(k string) string {
 	return login.vars[k]
 }
 
+// loginSaid is login.vars as last stored, for LoginEnvSaid.
+var loginSaid atomic.Pointer[map[string]string]
+
+// LoginEnvSaid is LoginEnvKnown without the lock: LoginPath holds it while
+// the shell answers, which may take seconds, and netproxy reads the
+// shell's proxy on every request magpie makes.
+func LoginEnvSaid(k string) string {
+	if m := loginSaid.Load(); m != nil {
+		return (*m)[k]
+	}
+	return ""
+}
+
 // UserBinDirs are the folders a user's command-line tools are installed in
 // that exist here — npm's prefixes, each Node version of nvm, fnm and mise,
 // bun, volta, pnpm, asdf, the standalone installers' ~/.local/bin,
@@ -152,6 +177,9 @@ func UserBinDirs() []string { return userDirs(true) }
 func userDirs(everyNode bool) []string {
 	home, _ := os.UserHomeDir()
 	var known []string
+	if d := bunBin(); d != "" {
+		known = append(known, d)
+	}
 	for _, d := range []string{".local/bin", ".npm-global/bin", ".npm/bin", ".bun/bin", ".volta/bin", ".asdf/shims", ".local/share/mise/shims", ".cargo/bin", ".deno/bin", "Library/pnpm"} {
 		known = append(known, filepath.Join(home, d))
 	}
@@ -315,7 +343,7 @@ func FindShell(name string) string {
 			}
 		}
 	}
-	p, _ := exec.LookPath(name)
+	p, _ := Look(name)
 	return p
 }
 

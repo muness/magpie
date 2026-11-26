@@ -4,12 +4,15 @@
 // (dongshanfengdongshizhcn on Discord). Each other profile comes as a field
 // keyed "profile:<name>": connected, the opened row has an Other profiles
 // section with one line per profile (its name, its model picker, the
-// command that runs it), and no square of the row's own. A click opens the
-// app's model picker with Default first, noted as putting back what the
-// profile had before magpie; a model picked is posted for that profile
-// alone. With one profile only there is no section. No click scrolls the
-// page. In every language, at a normal and a narrow width, in both engines.
-// No backend: the API is faked here.
+// command that runs it), and no square of the row's own. Hermes is one row
+// in the Agents list (geekbb on X), so this section is the only place a
+// profile's model is picked; v0.1.4022 drew it nowhere and the profiles
+// looked gone (Norethcy on X). A profile named in Chinese reads as its name
+// and its command says its id. A click opens the app's model picker with
+// Default first, noted as putting back what the profile had before magpie; a
+// model picked is posted for that profile alone. With one profile only there
+// is no section. No click scrolls the page. In every language, at a normal
+// and a narrow width, in both engines. No backend: the API is faked here.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -22,10 +25,10 @@ const hermes = (id, bots) => ({
   id, name: "Hermes", path: "/test/.hermes/config.yaml", icon: "hermes", wired: true,
   fields: [
     { key: "model", label: "model", value: "magpie/v/glm", options: models },
-    ...bots.map((b) => ({ key: "profile:" + b, label: b, value: b === "coder" ? "kimi-k3.5" : "magpie/v/glm", quiet: true, options: [{ value: "kimi-k3.5" }, ...models] })),
+    ...bots.map(([b, label = b]) => ({ key: "profile:" + b, label, value: b === "coder" ? "kimi-k3.5" : "magpie/v/glm", quiet: true, options: [{ value: "kimi-k3.5" }, ...models] })),
   ],
 });
-const fresh = () => ({ agents: [hermes("hermes", ["a-profile-with-a-long-name", "coder"]), hermes("hermes-one", [])], profiles: [] });
+const fresh = () => ({ agents: [hermes("hermes", [["a-profile-with-a-long-name"], ["coder"], ["u5c0f-u52a9-u624b", "小助手"]]), hermes("hermes-one", [])], profiles: [] });
 
 function server(lang, sets) {
   let cur = fresh();
@@ -99,7 +102,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.locator(`${row} .ag-exp`).waitFor();
         assert.ok((await page.locator(`${row} .ag-exp`).innerText()).includes(w.head));
         const keys = await page.locator(`${row} .ag-exp .field.ag-pick[data-key^="profile:"]`).evaluateAll((es) => es.map((e) => e.dataset.key));
-        assert.deepEqual(keys, ["profile:a-profile-with-a-long-name", "profile:coder"]);
+        assert.deepEqual(keys, ["profile:a-profile-with-a-long-name", "profile:coder", "profile:u5c0f-u52a9-u624b"]);
+        // a profile named in Chinese: its name, and the id hermes -p takes
+        const zh = page.locator(`${row} .ag-exp .field.ag-pick[data-key="profile:u5c0f-u52a9-u624b"]`).locator("xpath=..");
+        assert.equal(await zh.locator(".ag-tier").textContent(), "小助手");
+        assert.equal(await zh.locator(".ag-hint").textContent(), "hermes -p u5c0f-u52a9-u624b");
         const pick = page.locator(`${row} .ag-exp .field.ag-pick[data-key="profile:coder"]`);
         const line = pick.locator("xpath=..");
         assert.equal(await line.locator(".ag-tier").textContent(), "coder");

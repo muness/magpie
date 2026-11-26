@@ -14,25 +14,38 @@ import (
 
 // WindowHolds is a window's whole allowance reckoned from magpie's own
 // calls: Tokens of input and output (cache traffic aside, as the Usage
-// page counts tokens) and, when every call's model has an API list price,
+// page counts tokens unless its pick is With cache, when the card adds
+// Routed's cache over Used itself) and, when every call's model has an API list price,
 // Cost at those prices (cache reads and writes at the vendor's own rates).
 // Routed is what magpie routed through the account in the window so far,
 // up to when the share was read, and Used that share. A call made with the
 // account outside magpie is in Used but not in Routed, so the estimate is
 // then lower than the window really holds.
+//
+// BaseCost is Cost with every call at its model's base rates, no API
+// long-context premium (catalog.Price.Tiers) (#5861, NorethSea): a plan's
+// own use has none (OpenAI bills no long-context surcharge in Codex), so
+// two cycles whose calls' sizes differ compare by it. It is there only
+// when some call was over a tier's size, else it is Cost.
 type WindowHolds struct {
-	Tokens int64   `json:"tokens"`
-	Cost   float64 `json:"cost,omitempty"`
-	Priced bool    `json:"priced"`
-	Used   float64 `json:"used"`
-	Routed struct {
+	Tokens   int64   `json:"tokens"`
+	Cost     float64 `json:"cost,omitempty"`
+	BaseCost float64 `json:"baseCost,omitempty"`
+	Priced   bool    `json:"priced"`
+	Used     float64 `json:"used"`
+	Routed   struct {
 		Calls      int     `json:"calls"`
 		Tokens     int64   `json:"tokens"`
 		CacheRead  int64   `json:"cacheRead,omitempty"`
 		CacheWrite int64   `json:"cacheWrite,omitempty"`
 		Cost       float64 `json:"cost,omitempty"`
+		BaseCost   float64 `json:"baseCost,omitempty"`
 	} `json:"routed"`
 	Since time.Time `json:"since"`
+	// PrevAt is set when this is the last window's whole, carried over a
+	// reset until the new window has enough data (Musikrv77852 on X): the
+	// time that figure was last reckoned. Since is then that window's start.
+	PrevAt *time.Time `json:"prevAt,omitempty"`
 }
 
 // HoldsFloor is the least share used a window's whole is reckoned from:

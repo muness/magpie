@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -16,6 +15,8 @@ import (
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/ghtoken"
+	"github.com/yetone/magpie/internal/lazyre"
+	"github.com/yetone/magpie/internal/library"
 	"github.com/yetone/magpie/internal/middleware"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/provider"
@@ -23,7 +24,7 @@ import (
 )
 
 // OpenCode's provider plugins (internal/plugin): the providers they sign
-// in to are subscriptions in the add sheet, and Settings → Plugins adds,
+// in to are subscriptions in the add sheet, and the Plugins page adds,
 // updates and removes them.
 
 // pluginSubJSON is a plugin's provider as the add sheet lists it.
@@ -37,6 +38,11 @@ type pluginSubJSON struct {
 	SignedIn bool            `json:"signedIn"`
 	Single   bool            `json:"single,omitempty"`
 	Models   int             `json:"models"`
+	// Importable says its accounts can be brought in from a file
+	// (auth.import); ImportFrom(s) is which file, as the plugin says it
+	Importable  bool              `json:"importable,omitempty"`
+	ImportFrom  string            `json:"importFrom,omitempty"`
+	ImportFroms map[string]string `json:"importFroms,omitempty"`
 	// Options are the switches the plugin declares (auth.options, #2038),
 	// each with where it stands now
 	Options []pluginOptionJSON `json:"options,omitempty"`
@@ -50,7 +56,7 @@ type pluginOptionJSON struct {
 }
 
 // pluginOptionKey is the key an option may have, as the host checks it.
-var pluginOptionKey = regexp.MustCompile(`^[a-z0-9_-]{1,40}$`)
+var pluginOptionKey = lazyre.New(`^[a-z0-9_-]{1,40}$`)
 
 // pluginIcon is the vendor's icon: the one the plugin gives its provider,
 // else the one the plugin market gives the plugin or its provider, else
@@ -87,12 +93,13 @@ func pluginSubs() []pluginSubJSON {
 		out = append(out, pluginSubJSON{
 			ID: provider.PluginID(pp.ID), PID: pp.ID, Name: pp.Name, Icon: pluginIcon(pp), Spec: pp.Spec,
 			Methods: pp.Methods, SignedIn: pp.SignedIn, Single: pp.Single, Models: len(pp.Models), Options: opts,
+			Importable: pp.Importable, ImportFrom: pp.ImportFrom, ImportFroms: pp.ImportFroms,
 		})
 	}
 	return out
 }
 
-// pluginEntryJSON is a plugin as Settings → Plugins lists it.
+// pluginEntryJSON is a plugin as the Plugins page lists it.
 type pluginEntryJSON struct {
 	plugin.Entry
 	Error     string   `json:"error,omitempty"`   // why it didn't load
@@ -171,6 +178,9 @@ type pluginEntryJSON struct {
 	// offers every agent under MCP's name: with their descriptions while
 	// the host runs, by name alone from what it noted last when it doesn't
 	Tools []pluginToolJSON `json:"tools,omitempty"`
+	// ToolsServer is the Library's server of those tools, whose agents
+	// the row turns them off and on for (chengming0v0 on Discord)
+	ToolsServer *library.PluginServer `json:"toolsServer,omitempty"`
 }
 
 // pluginToolJSON is one tool a plugin gives, as its row lists it.
@@ -226,6 +236,14 @@ type pluginsJSON struct {
 	// Registry is the npm registry plugins are installed from and npm's
 	// answers asked of, and where it came from (plugin.Registry)
 	Registry plugin.RegistryInUse `json:"registry"`
+	// Leftovers are plugins/'s dependencies no plugin is installed as (a
+	// failed install's, from before magpie took them out), each with a
+	// Remove: Bun installs every one again at every install
+	Leftovers []plugin.Leftover `json:"leftovers"`
+	// JSRoutings: the routings JS gateway plugins serve now, as in the
+	// state, so one a plugin installed or switched on here serves is in
+	// every routing picker at once
+	JSRoutings []middleware.Routing `json:"jsRoutings"`
 }
 
 // registryJSON is plugin.Registry with its file's path as the page shows it.
@@ -238,7 +256,10 @@ func registryJSON() plugin.RegistryInUse {
 }
 
 func pluginsState(ctx context.Context, w Windows) pluginsJSON {
-	s := pluginsJSON{Plugins: []pluginEntryJSON{}, Bun: plugin.HasBun(), BunVer: plugin.BunInUse(), Movable: provider.MoveCandidates(), Picker: w != nil && !isWeb(w), Mirror: settings.Load().ChinaMirror, Registry: registryJSON()}
+	s := pluginsJSON{Plugins: []pluginEntryJSON{}, Bun: plugin.HasBun(), BunVer: plugin.BunInUse(), Movable: provider.MoveCandidates(), Picker: w != nil && !isWeb(w), Mirror: settings.Shared().ChinaMirror, Registry: registryJSON(), Leftovers: plugin.Leftovers(), JSRoutings: middleware.Routings()}
+	if s.Leftovers == nil {
+		s.Leftovers = []plugin.Leftover{}
+	}
 	l := plugin.Load()
 	errs := map[string]string{}
 	names := map[string][]string{}
@@ -272,6 +293,10 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 		}
 	}
 	toolNames := gateway.ToolNames(tools)
+	var servers map[string]library.PluginServer
+	if len(tools) > 0 {
+		servers = library.PluginServers()
+	}
 	// each plugin's subscriptions, by the names it gave last (plugin.Cached,
 	// which holds them without starting the host or asking anyone, and asks
 	// the plugins again in the background when a sign-in or the plugins
@@ -337,6 +362,15 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 		// one whose providers are known, as those are named in the
 		// background and the button would come and go with them
 		j.OptionsExample = plugin.OptionsExample(plugin.Target(e.Spec))
+		if p, _ := plugin.PrivacyModels(plugin.Target(e.Spec)); p != nil {
+			j.InMagpieOnly = plugin.InMagpieOnly(plugin.Target(e.Spec))
+			if j.InMagpieOnly {
+				j.Named = false
+			}
+			if j.OptionsExample == nil {
+				j.OptionsExample = map[string]any{"models": []any{}}
+			}
+		}
 		if file, _ := plugin.Agent(plugin.Target(e.Spec)); file != "" {
 			j.IsAgent = true
 			j.InMagpieOnly = plugin.InMagpieOnly(plugin.Target(e.Spec))
@@ -376,6 +410,9 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 			}
 			for _, x := range pt.Tools {
 				j.Tools = append(j.Tools, pluginToolJSON{Name: x.Name, Description: x.Description, MCP: toolNames[e.Spec][x.Name]})
+			}
+			if sv, ok := servers[plugin.Name(e.Spec)]; ok && len(j.Tools) > 0 {
+				j.ToolsServer = &sv
 			}
 		}
 		j.Moved = provider.MovedOnto(e.Spec)
@@ -577,9 +614,11 @@ var (
 	removePlugin  = provider.RemovePlugin
 	updatePlugins = plugin.Update
 	upgradePlugin = plugin.Upgrade
+	dropLeftover  = plugin.RemoveLeftover
 )
 
 func pluginRoutes(mux *http.ServeMux, w Windows) {
+	pluginCountRoutes(mux)
 	// the updates waiting for the reader, which put a dot on Plugins
 	mux.HandleFunc("GET /api/plugins/updates", func(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, plugin.PendingUpdates())
@@ -672,7 +711,7 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 		writeJSON(rw, map[string]any{"hits": hits})
 	})
 	mux.HandleFunc("GET /api/plugins/page", func(rw http.ResponseWriter, r *http.Request) {
-		p, err := plugin.Readme(r.Context(), r.URL.Query().Get("name"))
+		p, err := plugin.ReadmeIn(r.Context(), r.URL.Query().Get("name"), r.URL.Query().Get("lang"))
 		if err != nil {
 			fail(rw, err)
 			return
@@ -765,6 +804,8 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 			err = plugin.SetOptions(in.Spec, in.Options)
 		case "prefer":
 			err = plugin.Prefer(in.Spec, in.Provider)
+		case "leftover":
+			err = dropLeftover(ctx, in.Spec)
 		default:
 			http.NotFound(rw, r)
 			return
@@ -857,7 +898,7 @@ func pluginRoutes(mux *http.ServeMux, w Windows) {
 			fail(rw, err)
 			return
 		}
-		writeJSON(rw, openSignIn(w, st))
+		writeJSON(rw, openSignIn(w, st, false))
 	})
 }
 

@@ -179,8 +179,10 @@ type Active struct {
 	Agent   string `json:"agent"`
 	Cwd     string `json:"cwd"`
 	Seconds int64  `json:"seconds"`
-	// Hours is Seconds again by the local hour of the day (24, or none)
-	Hours []int64 `json:"hours,omitempty"`
+	// Hours is Seconds again by the local hour of the day (24 in JSON, or
+	// none), only the hours with time held: each range statsFor keeps has
+	// one for every day, agent and folder, ~4.5 MB of mostly zeros at 24
+	Hours hours `json:"hours,omitempty"`
 }
 
 // StatsFor reads the usage of the last days days up to today, today
@@ -208,14 +210,8 @@ func StatsAndNative(days int) (Stats, map[string]bool) {
 // are the same whatever the range, and the page keeps 7, 30 and every
 // day, each read again behind it (statsFor in internal/gui, #2278).
 func StatsAndNativeAll(days []int) ([]Stats, map[string]bool) {
-	alias := provider.UsageAlias()
-	out, native := statsKept(days, time.Now(), true)
-	if alias != nil {
-		for i := range out {
-			out[i] = aliasStats(out[i], alias)
-		}
-	}
-	return out, native
+	alias, names := provider.UsageAliasKeyed()
+	return statsKept(days, time.Now(), true, alias, names)
 }
 
 func statsAt(days int, now time.Time) Stats { return statsIn(days, now, nil) }
@@ -223,22 +219,19 @@ func statsAt(days int, now time.Time) Stats { return statsIn(days, now, nil) }
 // statsIn is statsAt, filling native as StatsAndNative says when not nil.
 func statsIn(days int, now time.Time, native map[string]bool) Stats {
 	// read before the locks: it reads settings.json
-	alias := provider.UsageAlias()
-	st := statsRead(days, now, native)
-	if alias != nil {
-		st = aliasStats(st, alias)
-	}
-	return st
+	alias, names := provider.UsageAliasKeyed()
+	return statsReadAll([]int{days}, now, native, alias, names)[0]
 }
 
 func statsRead(days int, now time.Time, native map[string]bool) Stats {
-	return statsReadAll([]int{days}, now, native)[0]
+	return statsReadAll([]int{days}, now, native, nil, "")[0]
 }
 
 // statsReadAll is statsRead for each of days, sharing what doesn't
-// depend on the range.
-func statsReadAll(ranges []int, now time.Time, native map[string]bool) []Stats {
-	out, listed := statsKept(ranges, now, native != nil)
+// depend on the range, with the models counted under alias's names (none
+// when nil), which names stands for (provider.UsageNamesKey).
+func statsReadAll(ranges []int, now time.Time, native map[string]bool, alias func(string) string, names string) []Stats {
+	out, listed := statsKept(ranges, now, native != nil, alias, names)
 	if native != nil {
 		maps.Copy(native, listed)
 	}
@@ -246,9 +239,9 @@ func statsReadAll(ranges []int, now time.Time, native map[string]bool) []Stats {
 }
 
 // statsKept is statsReadAll, and the agent|id of every session listed when
-// native is asked for. The ranges' Stats and the map are kept for the
-// next read (keptStats), so neither is written.
-func statsKept(ranges []int, now time.Time, wantNative bool) ([]Stats, map[string]bool) {
+// native is asked for. The ranges' Stats, aliased, and the map are kept for
+// the next read (keptStats), so neither is written.
+func statsKept(ranges []int, now time.Time, wantNative bool, alias func(string) string, names string) ([]Stats, map[string]bool) {
 	now = now.In(time.Local)
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
 
@@ -263,7 +256,10 @@ func statsKept(ranges []int, now time.Time, wantNative bool) ([]Stats, map[strin
 	// finds them read rather than starting another run
 	refresh(files, files)
 	price, titles := pricer(), codexTitleOf()
-	keptFor(files, today, price, titles)
+	if alias == nil {
+		names = "\x00none"
+	}
+	keptFor(files, today, names, price, titles)
 	out := make([]Stats, len(ranges))
 	var todo []int
 	for i, days := range ranges {
@@ -315,9 +311,13 @@ func statsKept(ranges []int, now time.Time, wantNative bool) ([]Stats, map[strin
 	for _, i := range todo {
 		st := statsOfRange(ranges[i], today, files, copies, copied, folder, listed, identities, taskTitles, price, titles)
 		keepDesktop(st)
+		if alias != nil {
+			aliasOwned(&st, alias)
+		}
 		keepRange(ranges[i], st, ranges)
 		out[i] = st
 	}
+	keptStats.titles.settle()
 	return out, keptStats.native
 }
 
@@ -353,7 +353,7 @@ func statsOfRange(days int, today time.Time, files []file, copies map[string]str
 	type ak struct{ date, agent, cwd string }
 	type act0 struct {
 		ms    int64
-		hours []int64
+		hours hours
 	}
 	use := map[uk]Tokens{}
 	act := map[ak]*act0{}
@@ -382,7 +382,7 @@ func statsOfRange(days int, today time.Time, files []file, copies map[string]str
 	shares := map[string]*share{}
 	apps := appsOf(files)
 	for _, f := range files {
-		if f.mod.Before(since) || (copies[f.key] != "" && copied[f.path] == nil) {
+		if f.mod.Before(modOf(since)) || (copies[f.key] != "" && copied[f.path] == nil) {
 			continue
 		}
 		st := cache[f.path]
@@ -422,12 +422,9 @@ func statsOfRange(days int, today time.Time, files []file, copies map[string]str
 					act[k] = a
 				}
 				a.ms += d.Active
-				if len(d.Hours) == 24 {
-					if a.hours == nil {
-						a.hours = make([]int64, 24)
-					}
-					for h, ms := range d.Hours {
-						a.hours[h] += ms
+				if d.Hours != nil {
+					for _, e := range d.Hours {
+						a.hours.add(hourOf(e), msOf(e))
 					}
 				}
 				dates[date] = true
@@ -494,9 +491,18 @@ func statsOfRange(days int, today time.Time, files []file, copies map[string]str
 		}
 	}
 
+	// each day's rows made to size: grown by append, every range kept
+	// held the slack of each doubling (#2278)
+	nUse, nAct := map[string]int{}, map[string]int{}
+	for k := range use {
+		nUse[k.date]++
+	}
+	for k := range act {
+		nAct[k.date]++
+	}
 	byDate := map[string]*Day{}
 	for date := range dates {
-		byDate[date] = &Day{Date: date, Usage: []Usage{}, Active: []Active{}}
+		byDate[date] = &Day{Date: date, Usage: make([]Usage, 0, nUse[date]), Active: make([]Active, 0, nAct[date])}
 	}
 	for k, t := range use {
 		u := Usage{Agent: k.agent, Cwd: k.cwd, Model: k.model, Tokens: t}
@@ -508,9 +514,9 @@ func statsOfRange(days int, today time.Time, files []file, copies map[string]str
 	for k, a := range act {
 		v := Active{Agent: k.agent, Cwd: k.cwd, Seconds: a.ms / 1000}
 		if a.hours != nil {
-			v.Hours = make([]int64, 24)
-			for h, ms := range a.hours {
-				v.Hours[h] = ms / 1000
+			v.Hours = make(hours, len(a.hours))
+			for i, e := range a.hours {
+				v.Hours[i] = hourEntry(hourOf(e), msOf(e)/1000)
 			}
 		}
 		byDate[k.date].Active = append(byDate[k.date].Active, v)

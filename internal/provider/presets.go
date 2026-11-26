@@ -74,6 +74,29 @@ type PresetDef struct {
 	// Hosts: a vendor serving other makers' models as well as its own
 	// (Groq, Ollama Cloud, Azure), whose list is no maker's word on theirs
 	Hosts bool `json:"-"`
+	// Embeddings and Rerankers are the models of a vendor of retrieval
+	// models alone (Voyage AI), which has no list to ask: served on
+	// /v1/embeddings and /v1/rerank, kept out of agents' model pickers.
+	// A Region's own lists stand over them.
+	Embeddings []string `json:"embeddings,omitempty"`
+	Rerankers  []string `json:"rerankers,omitempty"`
+	// Drawers, Videos, Speakers and Transcribers are the image, video,
+	// text-to-speech and speech-to-text models of a plan that names them
+	// beside its text models (Alibaba's Token Plans), for a preset with no
+	// regions: served on /v1/images, /v1/videos, /v1/audio/speech and
+	// /v1/audio/transcriptions, kept out of agents' model pickers.
+	Drawers      []string `json:"drawers,omitempty"`
+	Videos       []string `json:"videos,omitempty"`
+	Speakers     []string `json:"speakers,omitempty"`
+	Transcribers []string `json:"transcribers,omitempty"`
+	// Searches is the vendor's word that it answers a web search tool
+	// offered on its Anthropic and Responses APIs by itself
+	// (web_search_20250305, web_search), as Provider.Searches is the
+	// user's: a partner that runs them (CoreCode). A provider added from
+	// it searches so with nothing set (PresetSearches). Codex's web.run
+	// is not covered: it asks alpha/search, which only the user's
+	// Provider.Searches sends a relay.
+	Searches bool `json:"searches,omitempty"`
 }
 
 // Region is one base-URL option of a preset that offers several. The first
@@ -100,12 +123,17 @@ type Region struct {
 	Catalog string `json:"catalog,omitempty"`
 	// Models are a plan's text models, for a region that is one beside
 	// another plan or pay as you go (PresetDef.Models, for the region alone).
-	// Embeddings, Drawers and Videos are its non-chat models, kept apart from
+	// Embeddings, Rerankers, Drawers and Videos are its non-chat models, kept apart from
 	// agents' model pickers.
 	Models     []string `json:"models,omitempty"`
 	Embeddings []string `json:"embeddings,omitempty"`
+	Rerankers  []string `json:"rerankers,omitempty"`
 	Drawers    []string `json:"drawers,omitempty"`
 	Videos     []string `json:"videos,omitempty"`
+	// Speakers and Transcribers are its text-to-speech and speech-to-text
+	// models, as PresetDef's.
+	Speakers     []string `json:"speakers,omitempty"`
+	Transcribers []string `json:"transcribers,omitempty"`
 	// Images says which of Models take images, as the vendor's own list
 	// says, for a plan whose /models doesn't list its models: a model
 	// it leaves out is judged as before (models.dev, the user's say).
@@ -155,9 +183,25 @@ var arkPlanImages = map[string]bool{
 }
 
 // alibabaPlanModels are the text models of Alibaba's Token Plan, the same
-// on the Qwen AI platform's and on Bailian's, as their overviews list them.
-var alibabaPlanModels = []string{"auto", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-flash",
-	"deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "glm-5.3", "glm-5.2"}
+// on the Qwen AI platform's, on Bailian's, on Model Studio's and on Qwen
+// Cloud's, as their overviews list them (read 11-18).
+var alibabaPlanModels = []string{"auto", "qwen4-max", "qwen4-max-preview", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-flash",
+	"deepseek-v4.1-flash", "deepseek-v4.1-flash-1017", "deepseek-v4-pro", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731", "glm-5.3", "glm-5.2"}
+
+// The Token Plan's other models, the same on its four hosts, each asked on
+// DashScope's own API at the host's root (gateway: draw_dashscope.go,
+// speech_dashscope.go, video_dashscope.go): image generation on
+// multimodal-generation, video on video-synthesis polled at /api/v1/tasks,
+// speech on audio/tts/SpeechSynthesizer and transcription on
+// multimodal-generation. Its realtime model is on /api-ws/v1/realtime,
+// which /v1/realtime reaches (realtime.go). Qwen Cloud's plan also draws
+// with Qwen-Image 2.0.
+var (
+	alibabaPlanDrawers      = []string{"qwen-image-3.0-pro", "wan2.7-image", "wan2.7-image-pro"}
+	alibabaPlanVideos       = []string{"wan3.0-video", "happyhorse-1.1-t2v", "happyhorse-1.1-i2v", "happyhorse-1.1-r2v"}
+	alibabaPlanSpeakers     = []string{"qwen-audio-3.0-tts-plus"}
+	alibabaPlanTranscribers = []string{"qwen-audio-3.0-asr-flash"}
+)
 
 // presets are ordered as they appear in the picker.
 var presets = []PresetDef{
@@ -190,10 +234,10 @@ var presets = []PresetDef{
 		Website: "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models",
 		NoList:  true,
 		Models: []string{"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite",
-			"gemini-4-argon", "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
+			"gemini-4-neon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-4-argon", "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools", "gemini-3.1-flash-lite", "gemini-3-flash-preview",
 			"gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite",
 			"deepseek-ai/deepseek-v4.1-flash-maas", "zai-org/glm-5.2-maas", "openai/gpt-oss-120b-maas",
-			"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"},
+			"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2", "claude-fable-5-1"},
 		HeaderHints: []string{"X-Vertex-AI-LLM-Request-Type", "X-Vertex-AI-LLM-Shared-Request-Type"}},
 	{ID: "deepseek", Name: "DeepSeek", Icon: "deepseek-color", Kind: KindVendor, Catalog: "deepseek",
 		Chat: "https://api.deepseek.com/v1", Responses: "https://api.deepseek.com/v1", Anthropic: "https://api.deepseek.com/anthropic",
@@ -225,17 +269,23 @@ var presets = []PresetDef{
 		// a GLM Coding Plan is served at its own OpenAI endpoint: a plan's key
 		// sent to the pay-as-you-go one is told it has no balance. The plan
 		// serves the Responses API at /api/v1 as well: its tool pages give
-		// it for Codex, wire_api = "responses" (#306)
+		// it for Codex, wire_api = "responses" (#306). The plan's models are
+		// looked up in models.dev's catalog of the plan first: a model the
+		// plan has before pay as you go does (GLM-5.4, which takes images;
+		// ApocalypseYun on X) is listed there alone, and read as a text
+		// model of no known window. membershipCatalogs keeps its $0 out of
+		// prices.
 		RegionLabel: "Plan", KeyPlans: true, Regions: []Region{
-			{ID: "api", Name: "Pay as you go", Chat: "https://open.bigmodel.cn/api/paas/v4", Anthropic: "https://open.bigmodel.cn/api/anthropic"},
-			{ID: "coding", Name: "Coding Plan", Chat: "https://open.bigmodel.cn/api/coding/paas/v4", Responses: "https://open.bigmodel.cn/api/v1", Anthropic: "https://open.bigmodel.cn/api/anthropic"},
+			{ID: "api", Name: "Pay as you go", Chat: "https://open.bigmodel.cn/api/paas/v4", Anthropic: "https://open.bigmodel.cn/api/anthropic", Catalog: "zhipuai"},
+			{ID: "coding", Name: "Coding Plan", Chat: "https://open.bigmodel.cn/api/coding/paas/v4", Responses: "https://open.bigmodel.cn/api/v1", Anthropic: "https://open.bigmodel.cn/api/anthropic", Catalog: "zhipuai-coding-plan, zhipuai"},
 		}},
 	{ID: "zai", Name: "Z.ai", Icon: "zai", Kind: KindVendor, Catalog: "zhipuai",
 		Chat: "https://api.z.ai/api/paas/v4", Anthropic: "https://api.z.ai/api/anthropic",
 		Website: "https://z.ai", KeysURL: "https://z.ai/manage-apikey/apikey-list",
+		// the plan's models looked up in its own catalog first, as Zhipu's
 		RegionLabel: "Plan", KeyPlans: true, Regions: []Region{
-			{ID: "api", Name: "Pay as you go", Chat: "https://api.z.ai/api/paas/v4", Anthropic: "https://api.z.ai/api/anthropic"},
-			{ID: "coding", Name: "Coding Plan", Chat: "https://api.z.ai/api/coding/paas/v4", Responses: "https://api.z.ai/api/v1", Anthropic: "https://api.z.ai/api/anthropic"},
+			{ID: "api", Name: "Pay as you go", Chat: "https://api.z.ai/api/paas/v4", Anthropic: "https://api.z.ai/api/anthropic", Catalog: "zhipuai"},
+			{ID: "coding", Name: "Coding Plan", Chat: "https://api.z.ai/api/coding/paas/v4", Responses: "https://api.z.ai/api/v1", Anthropic: "https://api.z.ai/api/anthropic", Catalog: "zai-coding-plan, zhipuai"},
 		}},
 	{ID: "minimax", Name: "MiniMax", Icon: "minimax-color", Kind: KindVendor, Catalog: "minimax",
 		Chat: "https://api.minimax.io/v1", Anthropic: "https://api.minimax.io/anthropic",
@@ -245,14 +295,14 @@ var presets = []PresetDef{
 		Website: "https://platform.minimaxi.com", KeysURL: "https://platform.minimaxi.com/user-center/basic-information/interface-key"},
 	// a Step Plan is served at its own endpoints (step_plan/…), its key
 	// refused at the pay-as-you-go ones
-	{ID: "stepfun", Name: "StepFun", Icon: "stepfun-color", Kind: KindVendor, Catalog: "stepfun-ai-step-plan, stepfun-ai",
+	{ID: "stepfun", Name: "StepFun", Icon: "stepfun", Kind: KindVendor, Catalog: "stepfun-ai-step-plan, stepfun-ai",
 		Chat: "https://api.stepfun.ai/step_plan/v1", Anthropic: "https://api.stepfun.ai/step_plan",
 		Website: "https://platform.stepfun.ai", KeysURL: "https://platform.stepfun.ai/interface-key",
 		RegionLabel: "Plan", KeyPlans: true, Regions: []Region{
 			{ID: "plan", Name: "Step Plan", Chat: "https://api.stepfun.ai/step_plan/v1", Anthropic: "https://api.stepfun.ai/step_plan"},
 			{ID: "api", Name: "Pay as you go", Chat: "https://api.stepfun.ai/v1", Anthropic: "https://api.stepfun.ai"},
 		}},
-	{ID: "stepfun-cn", Name: "StepFun (China)", Icon: "stepfun-color", Kind: KindVendor, Catalog: "stepfun-step-plan, stepfun",
+	{ID: "stepfun-cn", Name: "StepFun (China)", Icon: "stepfun", Kind: KindVendor, Catalog: "stepfun-step-plan, stepfun",
 		Chat: "https://api.stepfun.com/step_plan/v1", Anthropic: "https://api.stepfun.com/step_plan",
 		Website: "https://platform.stepfun.com", KeysURL: "https://platform.stepfun.com/interface-key",
 		RegionLabel: "Plan", KeyPlans: true, Regions: []Region{
@@ -386,8 +436,8 @@ var presets = []PresetDef{
 			{ID: "agent", Name: "Agent Plan", Chat: "https://ark.cn-beijing.volces.com/api/plan/v3", Responses: "https://ark.cn-beijing.volces.com/api/plan/v3", Anthropic: "https://ark.cn-beijing.volces.com/api/plan",
 				Models: arkPlanModels, Images: arkPlanImages,
 				Embeddings: []string{"doubao-embedding-vision"},
-				Drawers:    []string{"doubao-seedream-5-0-pro", "doubao-seedream-5.0-flash"},
-				Videos:     []string{"doubao-seedance-2.0", "doubao-seedance-2.0-fast", "doubao-seedance-2.0-mini", "doubao-seedance-2.5"}},
+				Drawers:    []string{"doubao-seedream-5-0-pro", "doubao-seedream-5.0-flash", "doubao-seedream-5.5"},
+				Videos:     []string{"doubao-seedance-2.0", "doubao-seedance-2.0-fast", "doubao-seedance-2.0-mini", "doubao-seedance-2.5", "doubao-seedance-2.5-flash"}},
 			{ID: "api", Name: "Pay as you go", Chat: "https://ark.cn-beijing.volces.com/api/v3", Responses: "https://ark.cn-beijing.volces.com/api/v3", Lists: true},
 		},
 		NoList: true},
@@ -405,13 +455,16 @@ var presets = []PresetDef{
 	// token-plan.maas.qianwenaiapi.com, and on Alibaba Cloud Bailian
 	// (bailian.console.aliyun.com) at token-plan.cn-beijing.maas.aliyuncs.com
 	// (#1506). The models given are the plans' text models as their
-	// overviews list them, for when the host gives no list. Neither has an
-	// API for the plan's credits: its console's subscription page shows them.
+	// overviews list them, for when the host gives no list. The two at
+	// aliyuncs.com read the plan's credits with the account's AccessKey
+	// (alibaba_usage.go); the Qwen AI platform's with a sign-in to the
+	// platform, as its own QianWen CLI does (qianwen_plan.go).
 	{ID: "qwen-token-plan", Name: "Qwen Token Plan", Short: "Qwen Plan", Icon: "qwen-color", Kind: KindVendor,
 		Chat: "https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1", Anthropic: "https://token-plan.maas.qianwenaiapi.com/apps/anthropic",
 		Note:    "Qwen AI platform · subscription",
 		Website: "https://platform.qianwenai.com/docs/token-plan/overview", KeysURL: "https://platform.qianwenai.com/home/analytics/token-plan/individual",
-		Models: alibabaPlanModels},
+		Models:  alibabaPlanModels,
+		Drawers: alibabaPlanDrawers, Videos: alibabaPlanVideos, Speakers: alibabaPlanSpeakers, Transcribers: alibabaPlanTranscribers},
 	// Bailian's also answers its decision model, decision-model-preview, on
 	// System One at /compatible-mode/v1/systemone with the same key
 	// (token-plan-decision-model; the personal plan only), so a routing
@@ -421,7 +474,17 @@ var presets = []PresetDef{
 		Decide:  "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
 		Note:    "Alibaba Cloud Bailian · subscription",
 		Website: "https://help.aliyun.com/zh/model-studio/token-plan-overview", KeysURL: "https://bailian.console.aliyun.com/cn-beijing/subscription/token-plan/personal",
-		Models: alibabaPlanModels},
+		Models:  alibabaPlanModels,
+		Drawers: alibabaPlanDrawers, Videos: alibabaPlanVideos, Speakers: alibabaPlanSpeakers, Transcribers: alibabaPlanTranscribers},
+	// Alibaba Cloud's international Token Plan, the same plan at the
+	// Singapore host (sk-sp- keys, #2940). Its quota is read like Bailian's,
+	// with the account's AccessKey (alibaba_usage.go).
+	{ID: "alibaba-token-plan", Name: "Alibaba Cloud Token Plan", Short: "Alibaba Plan", Icon: "bailian-color", Kind: KindVendor,
+		Chat: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", Anthropic: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+		Note:    "Alibaba Cloud Model Studio · subscription",
+		Website: "https://www.alibabacloud.com/help/en/model-studio/token-plan-personal-quick-start", KeysURL: "https://modelstudio.console.alibabacloud.com/ap-southeast-1/?tab=globalset#/efm/token_plan",
+		Models:  alibabaPlanModels,
+		Drawers: alibabaPlanDrawers, Videos: alibabaPlanVideos, Speakers: alibabaPlanSpeakers, Transcribers: alibabaPlanTranscribers},
 	// Qwen Cloud (qwencloud.com) is Alibaba's international Qwen platform,
 	// on keys of its own made at home.qwencloud.com, at
 	// {region}.maas.qwencloudapi.com (docs.qwencloud.com, "Regions and
@@ -434,22 +497,40 @@ var presets = []PresetDef{
 		Chat: "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1", Anthropic: "https://token-plan.maas.qwencloudapi.com/apps/anthropic",
 		Note:    "Qwen Cloud · subscription",
 		Website: "https://docs.qwencloud.com/token-plan/overview", KeysURL: "https://home.qwencloud.com/analytics/token-plan/individual",
-		Models: []string{"auto", "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-flash",
-			"deepseek-v4.1-flash", "deepseek-v4.1-flash-1017", "deepseek-v4-pro", "deepseek-v4-pro-0813", "deepseek-v4-flash-0731",
-			"glm-5.3", "glm-5.2"}},
+		Models:  alibabaPlanModels,
+		Drawers: append(slices.Clone(alibabaPlanDrawers), "qwen-image-2.0-pro", "qwen-image-2.0"), Videos: alibabaPlanVideos,
+		Speakers: alibabaPlanSpeakers, Transcribers: alibabaPlanTranscribers},
 	{ID: "qwencloud", Name: "Qwen Cloud", Icon: "qwen-color", Kind: KindVendor, Catalog: "alibaba",
 		Chat: qwenCloudChat("ap-southeast-1"), Anthropic: qwenCloudAnthropic("ap-southeast-1"),
 		Note:    "Qwen Cloud · pay as you go",
 		Website: "https://docs.qwencloud.com/developer-guides/getting-started/regions", KeysURL: "https://home.qwencloud.com/api-keys",
 		Regions: qwenCloudRegions("ap-southeast-1", "us-east-1", "eu-central-1", "ap-northeast-1", "cn-hongkong", "cn-beijing")},
 	{ID: "mistral", Name: "Mistral", Icon: "mistral-color", Kind: KindVendor, Catalog: "mistral",
-		Chat:    "https://api.mistral.ai/v1",
+		Chat: "https://api.mistral.ai/v1",
+		// a Vibe plan's key too (Pro, Student, Team: jtbbtnt54249 on X), got
+		// from the editor's sign-in (mistral_signin.go)
+		Note:    "API key or Vibe plan",
 		Website: "https://console.mistral.ai", KeysURL: "https://console.mistral.ai/api-keys"},
+	// Voyage AI makes embedding and rerank models alone, at
+	// api.voyageai.com/v1/embeddings and /v1/rerank with a Bearer key
+	// (docs.voyageai.com/reference/embeddings-api, reranker-api, read
+	// 11-06). It has no /models, so its models are the docs' (pricing,
+	// embeddings, reranker): the current ones first, then the older ones
+	// it still serves. Its contextualized and multimodal embeddings are on
+	// APIs of their own, which magpie doesn't serve. heatonz on Discord.
+	{ID: "voyage", Name: "Voyage AI", Icon: "voyage-color", Kind: KindVendor,
+		Chat:    "https://api.voyageai.com/v1",
+		Website: "https://docs.voyageai.com", KeysURL: "https://dashboard.voyageai.com/organization/api-keys",
+		NoList: true,
+		Embeddings: []string{"voyage-4-large", "voyage-4", "voyage-4-lite", "voyage-code-4", "voyage-finance-2", "voyage-law-2",
+			"voyage-3-large", "voyage-3.5", "voyage-3.5-lite", "voyage-code-3", "voyage-code-2"},
+		Rerankers: []string{"rerank-3", "rerank-3-lite", "rerank-2.5", "rerank-2.5-lite"}},
 	{ID: "groq", Name: "Groq", Icon: "groq", Kind: KindVendor, Catalog: "groq", Hosts: true,
 		Chat: "https://api.groq.com/openai/v1", Responses: "https://api.groq.com/openai/v1",
 		Website: "https://console.groq.com", KeysURL: "https://console.groq.com/keys"},
 	// Amazon Bedrock (#176), with a Bedrock API key (AWS_BEARER_TOKEN_BEDROCK),
-	// no SigV4: its runtime serves Claude on Anthropic's messages at
+	// or an AWS access key in its place that signs each request with SigV4
+	// (#7687, SignsWithAccessKey): its runtime serves Claude on Anthropic's messages at
 	// /anthropic/v1/messages and the other models on chat completions at
 	// /openai/v1, and OpenAI's GPT models (not gpt-oss) on the Responses
 	// API there too, each in the region picked. It has no list to ask, so the
@@ -466,13 +547,13 @@ var presets = []PresetDef{
 			"ap-northeast-1", "ap-southeast-1", "ap-southeast-2", "ap-south-1"),
 		NoList: true,
 		Models: []string{"global.anthropic.claude-opus-5-5", "global.anthropic.claude-sonnet-5-5", "global.anthropic.claude-sonnet-5", "global.anthropic.claude-opus-5",
-			"global.anthropic.claude-fable-5-1", "global.anthropic.claude-opus-4-8", "global.anthropic.claude-opus-4-7",
+			"global.anthropic.claude-fable-5-2", "global.anthropic.claude-fable-5-1", "global.anthropic.claude-opus-4-8", "global.anthropic.claude-opus-4-7",
 			"global.anthropic.claude-haiku-4-5-20251001-v1:0",
 			"global.openai.gpt-6-astra", "global.openai.gpt-6-sol", "global.openai.gpt-6-luna",
 			"openai.gpt-oss-120b-1:0", "openai.gpt-oss-20b-1:0", "qwen.qwen3-coder-480b-a35b-v1:0", "deepseek.v3.2",
 			"moonshotai.kimi-k2.5", "zai.glm-5", "minimax.minimax-m2.5"}},
 	// Amazon Bedrock's Mantle endpoint (@marktoown on X), with the same
-	// Bedrock API key: OpenAI's chat completions and Responses at /v1 (some
+	// Bedrock API key or AWS access key (signed for "bedrock-mantle"): OpenAI's chat completions and Responses at /v1 (some
 	// models at /openai/v1, which the gateway picks per model: MantleBase)
 	// and Anthropic's Messages at /anthropic/v1/messages, in-region model
 	// ids alone (anthropic.claude-sonnet-5, openai.gpt-oss-120b; no
@@ -527,8 +608,23 @@ var presets = []PresetDef{
 		Website: "https://openrouter.ai", KeysURL: "https://openrouter.ai/keys",
 		// app attribution, for OpenRouter's rankings and analytics
 		HeaderHints: []string{"HTTP-Referer", "X-OpenRouter-Title"}},
+	// Vercel's AI Gateway (Archie627 on X): one key for every maker's
+	// models, as provider/model ids, on OpenAI's chat completions and
+	// Responses at /v1 and Anthropic's Messages at the root, each serving
+	// every model (vercel.com/docs/ai-gateway/sdks-and-apis); its /v1/models
+	// says each row's type (catalog.VercelGateway)
+	{ID: "vercel", Name: "Vercel AI Gateway", Icon: "vercel", Kind: KindRelay, Catalog: "vercel",
+		Chat: "https://ai-gateway.vercel.sh/v1", Responses: "https://ai-gateway.vercel.sh/v1", Anthropic: "https://ai-gateway.vercel.sh",
+		Website: "https://vercel.com/docs/ai-gateway", KeysURL: "https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai-gateway%2Fapi-keys"},
+	// GMI Cloud (aiandcloud on X): OpenAI-compatible chat completions at
+	// api.gmi-serving.com/v1, its model list at /v1/models, the key as Bearer
+	// (docs.gmicloud.ai quickstart and LLM API reference). Its docs name no
+	// Responses or Messages endpoint, so only Chat is set
+	{ID: "gmicloud", Name: "GMI Cloud", Icon: "gmicloud", Kind: KindRelay,
+		Chat:    "https://api.gmi-serving.com/v1",
+		Website: "https://www.gmicloud.ai", KeysURL: "https://console.gmicloud.ai"},
 	{ID: "opencode-go", Name: "OpenCode Go", Icon: "opencode", Kind: KindRelay, Catalog: "opencode-go",
-		Chat: "https://opencode.ai/zen/go/v1", Responses: "https://opencode.ai/zen/go/v1", Anthropic: "https://opencode.ai/zen/go",
+		Chat: OpenCodeGoChat, Responses: OpenCodeGoChat, Anthropic: OpenCodeGoAnthropic,
 		Note:    "open coding models, $10/month",
 		Website: "https://opencode.ai/docs/go", KeysURL: "https://opencode.ai/auth"},
 	// Cline's plan for open models, at the Cline API with a Cline key: the
@@ -573,6 +669,22 @@ var presets = []PresetDef{
 	{ID: "fireworks", Name: "Fireworks", Icon: "fireworks-color", Kind: KindRelay, Catalog: "fireworks-ai",
 		Chat:    "https://api.fireworks.ai/inference/v1",
 		Website: "https://fireworks.ai", KeysURL: "https://app.fireworks.ai/settings/users/api-keys"},
+	// Fireworks Nexus (CNSA0422 on X): an account and plan of its own at
+	// nexus.fireworks.ai, with keys made there, on the platform's
+	// /inference endpoints, which speak chat completions, Responses and
+	// messages alike (docs.fireworks.ai/nexus/apis-and-sdks). Pro and Team
+	// take only `auto`, Nexus Auto, and refuse an open model named directly
+	// with a 403 (nexus/open-models), so `auto` is the list; an Enterprise
+	// account's open models are typed in. Nexus Auto reaches Claude and GPT
+	// with the user's own keys in the two headers, or with Provider Keys
+	// set up on the account.
+	{ID: "fireworks-nexus", Name: "Fireworks Nexus", Short: "Nexus", Icon: "fireworks-color", Kind: KindRelay,
+		Chat: "https://api.fireworks.ai/inference/v1", Responses: "https://api.fireworks.ai/inference/v1", Anthropic: "https://api.fireworks.ai/inference",
+		Note:    "Nexus Auto · Pro, Team, Enterprise",
+		Website: "https://docs.fireworks.ai/nexus", KeysURL: "https://nexus.fireworks.ai/settings/api-keys",
+		NoList:      true,
+		Models:      []string{"auto"},
+		HeaderHints: []string{"x-anthropic-api-key", "x-openai-api-key"}},
 	{ID: "siliconflow", Name: "SiliconFlow", Icon: "siliconcloud-color", Kind: KindRelay, Catalog: "siliconflow",
 		Chat:    "https://api.siliconflow.cn/v1",
 		Website: "https://cloud.siliconflow.cn", KeysURL: "https://cloud.siliconflow.cn/account/ak",
@@ -617,6 +729,15 @@ var presets = []PresetDef{
 			{ID: "global", Name: "Global", Chat: "https://global.yylx.io/v1", Anthropic: "https://global.yylx.io"},
 			{ID: "cn", Name: "China Mainland", Chat: "https://cn.yylx.io/v1", Anthropic: "https://cn.yylx.io"},
 		}},
+	// a sub2api relay (MindfulReturn on X, 11-14): one root for every
+	// protocol, as its docs/api page gives it, Chat and Responses at /v1
+	// and Messages at the root; a key serves its group's models alone,
+	// which /v1/models lists, and its balance is sub2api's /v1/usage
+	// (balance_probe.go). Its site carries the invite AIGoCode sponsors
+	// magpie with, as Kimi's do.
+	{ID: "aigocode", Name: "AIGoCode", Icon: "aigocode", Kind: KindRelay,
+		Chat: "https://api.aigocode.dev/v1", Responses: "https://api.aigocode.dev/v1", Anthropic: "https://api.aigocode.dev",
+		Website: "https://www.aigocode.net/invite/MAGPIE?utm_source=magpie&utm_medium=app", KeysURL: "https://www.aigocode.net/dashboard/keys"},
 
 	// Jev answers no conversation: it decides which of a routing group's
 	// models takes a turn, and how hard it thinks
@@ -679,6 +800,14 @@ var presets = []PresetDef{
 		Chat: "http://localhost:8000/v1", Responses: "http://localhost:8000/v1", Anthropic: "http://localhost:8000",
 		Decide: "http://localhost:8000/v1",
 		Note:   "local server, port 8000 by default", Website: "https://omlx.ai"},
+	// GPUStack (github.com/gpustack/gpustack), a self-hosted model server:
+	// its OpenAI-compatible API is at <server>/v1 (/v1-openai is the legacy
+	// path), a Bearer API key from its UI, and GET /v1/models lists the
+	// ready models the key may use. The server is the user's own: port 80 by
+	// default, on this machine or another.
+	{ID: GPUStackPreset, Name: "GPUStack", Icon: "gpustack", Kind: KindLocal,
+		Chat: "http://localhost/v1",
+		Note: "your own server and API key", Website: "https://github.com/gpustack/gpustack"},
 	// its decision models (Clef, Clef-Flash, Kev, Laya, D1), served at
 	// /v1/systemone, are marked by capabilities in /v1/models (mlxserve_decide.go)
 	{ID: MLXServePreset, Name: "MLX-Serve", Icon: "mlx-serve", Kind: KindLocal, NoKey: true,
@@ -692,7 +821,7 @@ var presets = []PresetDef{
 	{ID: RemoteMagpiePreset, Name: "Remote magpie", Icon: "magpie", Kind: KindRemote,
 		Note:           "another computer's magpie, shared on its network",
 		Endpoint:       "http://192.168.1.20:3425",
-		EndpointHint:   "The address and API key the other computer's magpie shows in Settings → Network and sharing, under Share on local network. Its models and routing groups are listed here; each request goes on in the API the agent spoke.",
+		EndpointHint:   "The address and API key the other computer's magpie shows in Settings › Network and sharing, under Share on local network. Its models and routing groups are listed here; each request goes on in the API the agent spoke.",
 		EndpointNeeded: "The other magpie's address is needed"},
 }
 
@@ -856,6 +985,31 @@ func Preset(id string) *PresetDef {
 	return partnerPreset(id)
 }
 
+// PresetSearches is whether p, a key+URL provider, searches the web by
+// itself because its preset says so (PresetDef.Searches), at an address
+// of that preset's: one moved to another host by hand is the user's to
+// say. A partner's word holds while it is listed and after, as the
+// provider's other settings from it do (partnerPreset).
+func PresetSearches(p Provider) bool {
+	if p.Account != nil || p.IsPlugin() || p.Preset == "" {
+		return false
+	}
+	pr := Preset(p.Preset)
+	if pr == nil || !pr.Searches {
+		return false
+	}
+	hosts := []string{HostOf(pr.Anthropic), HostOf(pr.Responses)}
+	for _, r := range pr.Regions {
+		hosts = append(hosts, HostOf(r.Anthropic), HostOf(r.Responses))
+	}
+	for _, u := range []string{p.Anthropic, p.Responses} {
+		if h := HostOf(u); h != "" && slices.Contains(hosts, h) {
+			return true
+		}
+	}
+	return false
+}
+
 // builtinPreset is the preset of that id built into magpie, partners'
 // aside.
 func builtinPreset(id string) *PresetDef {
@@ -902,10 +1056,22 @@ func (p *Provider) atRegionOf(pr *PresetDef, r Region) {
 }
 
 // IconForCatalog names the logo of the vendor behind a models.dev
-// provider id, or "" when no preset covers it.
+// provider id, or "" when no preset covers it. A preset names several
+// catalogs ("stepfun-ai-step-plan, stepfun-ai"), so an id is also found in
+// that list; a preset whose catalog is exactly the id comes first, so
+// Azure's "azure, openai" never gives OpenAI's models Azure's logo.
 func IconForCatalog(catalogID string) string {
+	if catalogID == "" {
+		return ""
+	}
 	for _, p := range presets {
 		if p.Catalog == catalogID || slices.ContainsFunc(p.Regions, func(r Region) bool { return r.Catalog == catalogID }) {
+			return p.Icon
+		}
+	}
+	for _, p := range presets {
+		if slices.Contains(Provider{Catalog: p.Catalog}.Catalogs(), catalogID) ||
+			slices.ContainsFunc(p.Regions, func(r Region) bool { return slices.Contains(Provider{Catalog: r.Catalog}.Catalogs(), catalogID) }) {
 			return p.Icon
 		}
 	}

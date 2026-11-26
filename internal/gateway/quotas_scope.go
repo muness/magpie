@@ -61,7 +61,7 @@ func newQuotaScope(who access.Identity, catalog []provider.Entry) *quotaScope {
 		if seen && !ok {
 			continue
 		}
-		s.every[id] = modelAllowed(who, e.Provider, e.Model)
+		s.every[id] = modelAllowed(who, *e.Provider, e.Model)
 	}
 	return s
 }
@@ -143,7 +143,16 @@ func writeCards(w http.ResponseWriter, r *http.Request, s *quotaScope) {
 		refuseHeld(w, r, heldRefused)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"object": "list", "data": cs})
+	// each window's whole (Holds), reckoned here from the calls routed
+	// here, which the other magpie can't (linkaww on Discord: a Docker
+	// magpie's Codex card had none on the computer reading it). A held key
+	// is told none, as in quotas.
+	if s == nil && provider.ReckonHolds != nil {
+		cs = provider.ReckonHolds(cs, time.Now())
+	}
+	// with what routing reads of each window, so the other magpie can
+	// weigh this one by them (#6708)
+	writeJSON(w, 200, map[string]any{"object": "list", "data": provider.ToldRouting(cs)})
 }
 
 // quotas is qs as the key may be told them. A window's whole (Holds,

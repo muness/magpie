@@ -65,6 +65,9 @@ func recordConversation(w http.ResponseWriter, r *http.Request, proto provider.P
 		return w, func() {}
 	}
 	at := time.Now()
+	// pictures show as [image]: their base64 out first, so a turn of
+	// pictures isn't cut past conversationBodyMax (leanImages)
+	body = leanImages(body, false)
 	input := append([]byte(nil), body[:min(len(body), conversationBodyMax)]...)
 	sink := &conversationWriter{captureResponseWriter: &captureResponseWriter{
 		ResponseWriter: w, full: &spool{limit: conversationBodyMax, pattern: "magpie-conversation-*"},
@@ -158,7 +161,7 @@ func conversationOutput(proto provider.Protocol, output []byte) ([]sessions.Part
 	if json.Valid(trim) {
 		t.Output, err = conversationJSON(proto, trim)
 		t.Cut = t.Cut || err != nil
-	} else if bytes.Contains(trim, []byte("data:")) {
+	} else if bodyHas(trim, "data:") {
 		var c collector
 		var completedItems []json.RawMessage
 		decode := decoder(proto)

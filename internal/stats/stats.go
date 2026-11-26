@@ -3,7 +3,9 @@
 // version and system, and, unless the user turned that part off, which
 // agents, providers and models it is used with, by their built-in ids
 // (Usage): a provider of the user's own is only "custom". No names, URLs,
-// accounts, keys, prompts or usage go. Settings → Privacy turns it off,
+// accounts, keys, prompts or usage go. With that part, usemagpie.ai is
+// told which of the plugins Discover lists are installed here, for
+// Discover's counts (plugins.go). Settings → Privacy turns it off,
 // and so do DO_NOT_TRACK=1 and MAGPIE_NO_STATS=1; a build from source
 // never sends it.
 package stats
@@ -47,7 +49,7 @@ func Off() bool {
 			return true
 		}
 	}
-	return settings.Load().NoStats
+	return settings.Shared().NoStats
 }
 
 // Run sends the day's event while magpie runs, as what ("app", "serve"): at
@@ -94,7 +96,7 @@ func Send(ctx context.Context, version, what string, now time.Time) error {
 		"arch":    runtime.GOARCH,
 	}
 	var uses []map[string]any
-	if !settings.Load().NoUsageStats {
+	if !settings.Shared().NoUsageStats {
 		u := usage()
 		active["agents"] = len(u.Agents)
 		active["providers"] = len(u.Providers)
@@ -111,7 +113,13 @@ func Send(ctx context.Context, version, what string, now time.Time) error {
 		}
 		// a partner's counts of the days ended, each at its own day
 		for _, c := range provider.PartnerCounts(now) {
-			e := event("magpie partner", map[string]any{"id": c.ID, "what": c.What, "count": c.Count, "day": c.Day})
+			e := event("magpie partner", map[string]any{"id": c.ID, "what": c.What, "count": c.Count, "day": c.Day, "slot": c.Slot})
+			e["timestamp"] = c.Day + "T12:00:00Z"
+			uses = append(uses, e)
+		}
+		// how often the Plugins page, where its partners are, was opened
+		for _, c := range provider.PageCounts(now) {
+			e := event("magpie page", map[string]any{"page": c.Page, "count": c.Count, "day": c.Day})
 			e["timestamp"] = c.Day + "T12:00:00Z"
 			uses = append(uses, e)
 		}
@@ -135,8 +143,11 @@ func Send(ctx context.Context, version, what string, now time.Time) error {
 	if res.StatusCode/100 != 2 {
 		return fmt.Errorf("stats: %s", res.Status)
 	}
-	if !settings.Load().NoUsageStats {
+	if !settings.Shared().NoUsageStats {
 		provider.PartnerCountsSent(now)
+		// Discover's counts; the day's event went, so this isn't tried
+		// again till tomorrow when it fails
+		_ = sendPlugins(ctx, id)
 	}
 	return os.WriteFile(stamp, []byte(day+"\n"), 0o644)
 }

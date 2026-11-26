@@ -56,6 +56,13 @@ func emptyRetries(w http.ResponseWriter, ctx context.Context) int {
 	return streamRetries
 }
 
+// emptyAccounts is how many accounts of one model may answer a request
+// with a reply that said nothing before the rest of its accounts aren't
+// asked: the same conversation ends empty on whichever account it is sent
+// to, and each ask took minutes on a long one (vhjjkkhg on X: 8 to 9 tries
+// over 10+ minutes). The others of its group, and other providers, are.
+const emptyAccounts = 2
+
 // loopReasks is how many times a reply whose reasoning was stuck in a
 // loop (loopGuard) before it said anything is asked again in place, rather
 // than ended with the loop's error.
@@ -78,6 +85,43 @@ var errStreamCut = errors.New("stream cut mid-reply")
 // and be whole, so Chat is not one.
 var errEndedShort = errors.New("the reply ended before it was complete")
 
+// errDoneSaid ends a reply's read at the [DONE] a Chat upstream says its
+// reply over with: the reply is whole by its protocol, its usage in the
+// chunks before it, and a vendor that holds the connection after it — a
+// relay slow to hang up (#5936) — kept the client waiting on the
+// translated reply's end, said only when the reading gave up, until the
+// client gave up first.
+var errDoneSaid = errors.New("the stream said its reply over")
+
+// endsAtProbeCap says whether a reply that stopped short of its end, its
+// connection closed cleanly, is taken as one that ended at its length:
+// the request capped it at a short probe's worth (cutVoidTokens) and the
+// reply spent some of it, thinking or saying something. A vendor that
+// ends a reply at max_tokens with no closing event looks the same as one
+// that cut it, and a reply asked for 16 tokens that thought them all is
+// what such an ending most likely is: Open Design's glm-5.3-flash always
+// thinks, spent a model test's 16 tokens on it and ended after
+// content_block_stop, with no message_delta or message_stop, so every
+// plain test of it through a remote magpie was a 502 waited out through
+// the patience (plugins#827). A larger reply that ends so is still a cut,
+// and so is a Gemini or Code Assist one of any size: Gemini ends every
+// reply with its finishReason, MAX_TOKENS included, so one without it was
+// cut (vertexCut, asked for 256, TestGeminiUpstreamEndedShort).
+func endsAtProbeCap(proto provider.Protocol, capped int, spent bool) bool {
+	return (proto == provider.Anthropic || proto == provider.Responses) &&
+		spent && capped > 0 && capped <= cutVoidTokens
+}
+
+// spends says whether an event spent some of a reply's tokens: text,
+// a call, reasoning, a search or an image.
+func spends(ev Event) bool {
+	switch ev.Kind {
+	case KThink, KSealed:
+		return true
+	}
+	return saysSomething(ev)
+}
+
 // geminiEnds says whether a Gemini chunk ends the reply, as replyEnds
 // does for events that name their type. Gemini's and Code Assist's chunks
 // name none and there is no [DONE]: the last one is the one whose
@@ -89,7 +133,7 @@ var errEndedShort = errors.New("the reply ended before it was complete")
 // a reply said nothing, and is the empty reply's to answer (#667), not a
 // cut one's.
 func geminiEnds(data []byte) bool {
-	if !bytes.Contains(data, []byte(`"finishReason"`)) && bytes.Contains(data, []byte(`"candidates"`)) {
+	if !bodyHas(data, `"finishReason"`) && bodyHas(data, `"candidates"`) {
 		return false
 	}
 	type chunk struct {
@@ -154,7 +198,7 @@ func saysItsEnd(p provider.Provider, proto provider.Protocol, model string) bool
 	case proto == provider.Anthropic, proto == provider.Responses, geminiKin(proto):
 		return true
 	case proto == provider.Chat:
-		return geminiCompat(p.Host(), model) || p.Host() == commandCodeHost
+		return geminiCompat(p.VendorHost(), model) || p.VendorHost() == commandCodeHost
 	}
 	return false
 }
@@ -162,15 +206,21 @@ func saysItsEnd(p provider.Provider, proto provider.Protocol, model string) bool
 // chatTail follows a Chat stream's chunks for a Gemini OpenAI-compatible
 // reply that ended without its finish_reason (saysItsEnd): whether its
 // last chunk counted the usage and whether it made calls. A reply asked
-// whole is read through it too, for whether it said anything (said).
-type chatTail struct{ usage, calls, text bool }
+// whole is read through it too, for whether it said anything (said), and
+// a stream for whether it carried anything at all (void).
+type chatTail struct{ usage, calls, text, thought bool }
 
 func (t *chatTail) see(data []byte) {
 	var v struct {
 		Choices []struct {
 			Delta struct {
-				Content   string            `json:"content"`
-				ToolCalls []json.RawMessage `json:"tool_calls"`
+				Content          string            `json:"content"`
+				Refusal          string            `json:"refusal"`
+				ToolCalls        []json.RawMessage `json:"tool_calls"`
+				FunctionCall     json.RawMessage   `json:"function_call"`
+				ReasoningContent json.RawMessage   `json:"reasoning_content"`
+				Reasoning        json.RawMessage   `json:"reasoning"`
+				ReasoningDetails []json.RawMessage `json:"reasoning_details"`
 			} `json:"delta"`
 			Message struct {
 				Content   string            `json:"content"`
@@ -184,9 +234,27 @@ func (t *chatTail) see(data []byte) {
 	}
 	t.usage = v.Usage != nil && (v.Usage.PromptTokens > 0 || v.Usage.CompletionTokens > 0)
 	for _, c := range v.Choices {
-		t.calls = t.calls || len(c.Delta.ToolCalls) > 0 || len(c.Message.ToolCalls) > 0
-		t.text = t.text || c.Delta.Content != "" || c.Message.Content != ""
+		d := c.Delta
+		t.calls = t.calls || len(d.ToolCalls) > 0 || rawSays(d.FunctionCall) || len(c.Message.ToolCalls) > 0
+		t.text = t.text || d.Content != "" || d.Refusal != "" || c.Message.Content != ""
+		t.thought = t.thought || rawSays(d.ReasoningContent) || rawSays(d.Reasoning) || len(d.ReasoningDetails) > 0
 	}
+}
+
+// rawSays tells whether a JSON value carries something: not left out,
+// null or an empty string.
+func rawSays(raw json.RawMessage) bool {
+	s := string(bytes.TrimSpace(raw))
+	return s != "" && s != "null" && s != `""`
+}
+
+// void tells whether a stream carried nothing at all: no text, no call,
+// no reasoning. One that also never gave a finish_reason is no reply,
+// only its usage frame and [DONE] (Copilot's gemini-4-hydrogen,
+// @yuushabu_buyinn on X: dsh said "Stream ended without finish_reason"),
+// and fails as an empty reply (emptyReply), relayed as translated.
+func (t chatTail) void() bool {
+	return !t.text && !t.calls && !t.thought
 }
 
 // said tells whether the reply said anything an agent shows or acts on:
@@ -257,7 +325,7 @@ func prefillHow(p provider.Provider, to provider.Protocol, model string) string 
 	case provider.Anthropic:
 		return "anthropic"
 	case provider.Chat:
-		return chatPrefill(p.Host(), model)
+		return chatPrefill(p.VendorHost(), model)
 	}
 	return ""
 }
@@ -428,16 +496,26 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 	// said nothing and counted none fails too (repliesCounted, #2086)
 	var counts bool
 	// voids: a reply in this protocol cut at its length that says nothing
-	// fails at once, asked again nowhere (cutVoid, #2972)
+	// fails at once, asked again nowhere (cutVoid, #2972); one that said
+	// nothing and never gave a finish_reason fails as an empty reply
+	// (Copilot's gemini-4-carbon, now and then, answered 200 with only a
+	// usage frame, which went to Codex as a response.completed with
+	// nothing in it: codealc on X)
 	var voids bool
+	// named: the reply limit the client named, which a void's error
+	// names (a limit asked for in its place, voidRoom, isn't the agent's)
+	named := request.MaxTokens
 	empties := 0 // the times such a reply was asked again here
 	said, stop := false, ""
 	var kept []Event       // the reply's end, while nothing is said in it
 	var before, this Usage // what the tries before this one billed, and this try
+	tried := false         // a try began: the next one's prompt is the reply's (restart)
 	// spoke: the reply has said something, a text or a call; relooped: this
 	// try's reasoning was found stuck in a loop before it had, and it is
 	// let go to ask again (loopReasks)
 	var spoke, relooped bool
+	// spent: this try spent some of the reply's tokens (endsAtProbeCap)
+	var spent bool
 	var summaryUpstream bool
 	reasks := 0
 	if h, ok := w.(*holdWriter); ok {
@@ -445,7 +523,7 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 			// only reasoning nobody acts on: a text or a call the agent
 			// has would be said twice, and a continuation's prefill would
 			// be asked to go on with the loop
-			if !t.reasoning || spoke || cont.resume || reasks >= loopReasks || r.Context().Err() != nil {
+			if !t.reasoning || spoke || cont.resume || reasks >= loopReasks || r.Context().Err() != nil || p.PassesErrors() {
 				return false
 			}
 			reasks++
@@ -459,6 +537,7 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 			return // the rest of a try let go for its loop
 		}
 		spoke = spoke || saysSomething(ev)
+		spent = spent || spends(ev)
 		switch ev.Kind {
 		case KThink, KSealed:
 			if ev.Kind == KThink && !summaryUpstream {
@@ -467,6 +546,7 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 			if h, ok := w.(*holdWriter); ok {
 				h.mu.Lock()
 				h.first.hidden = true
+				h.first.summarized = h.first.summarized || ev.Kind == KThink
 				h.mu.Unlock()
 			}
 		case KError:
@@ -483,11 +563,14 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 			}
 			errSent = true
 		case KStart:
-			// the tries are each billed, so their usages are summed into
-			// the reply's — the client's and the ledger's (a cut try's is
+			// the tries are each billed: the earlier ones' prompts as the
+			// reply's Deferred, their output with this one's (after); the
+			// client is told this try's prompt (a cut try's counts are
 			// only what it said before the cut)
 			this = ev.Usage
-			ev.Usage = ev.Usage.plus(before, false)
+			ev.Usage = ev.Usage.after(before, false)
+			ev.Usage.restart = tried
+			tried = true
 			u.add(ev.Usage)
 			u.add(Usage{Served: ev.Model}) // the model the vendor says answered
 		case KUsage:
@@ -522,7 +605,7 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 		// continuation's prefill away
 		cutBy, cutCode, cutErr := failed, failedCode, serr
 		failed, failedCode, failedStatus, cut, serr = "", "", 0, false, nil
-		errNamed = 0
+		errNamed, spent = 0, false
 		var held func() // what a textCallSee of this try holds back
 		req := request
 		if cont.resume {
@@ -540,6 +623,11 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 			summaryUpstream = actual == provider.Responses || actual == provider.Gemini || actual == provider.CodeAssist
 			empty, counts = emptyFails(actual), repliesCounted(actual)
 			voids = cutVoidAt(actual)
+		}
+		if err == nil && res.StatusCode >= 400 && !cont.resume && p.PassesErrors() {
+			// the user leaves its errors to the client (errors=pass)
+			defer res.Body.Close()
+			return passError(w, p, from, actual, res, u)
 		}
 		if err == nil && res.StatusCode >= 400 {
 			b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
@@ -563,7 +651,7 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 				if turnedAway {
 					markAntigravityTurnsAway(w, request.System)
 				}
-				if p.Preset == "openrouter" && openRouterSharedPool(b) {
+				if p.VendorPreset() == "openrouter" && openRouterSharedPool(b) {
 					markOpenRouterSharedPool(w)
 				}
 				keepRetry(w.Header(), res.Header, b)
@@ -571,7 +659,7 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 				if turnedAway {
 					u.ErrType = turnedAwayErrType
 				}
-				return writeVendorError(w, from, res.StatusCode, failed, b), failed
+				return writeVendorErrorFrom(w, from, actual, p, res, failed, b), failed
 			}
 		}
 		if err == nil && res.StatusCode < 400 {
@@ -600,7 +688,7 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 				// upstream's 200 is in, and a holdWriter holds what is
 				// written for another candidate to answer still
 				var wmu sync.Mutex
-				heard, stopKeep := keepThroughSilence(&wmu, func() {
+				heard, stopKeep := keepThroughSilence(keepaliveEvery, &wmu, func() {
 					if failed == "" && !cut && !relooped && sw.quiet() >= keepaliveEvery/2 {
 						enc.keepalive()
 					}
@@ -620,6 +708,11 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 					if cut || relooped {
 						return errStreamCut
 					}
+					if saidOver(actual, data) {
+						// the upstream's own end: what the reply has is
+						// whole, hold or not (#5936)
+						return errDoneSaid
+					}
 					return nil
 				}, func() {
 					wmu.Lock()
@@ -629,10 +722,16 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 				})
 				stopKeep()
 				res.Body.Close()
-				if errors.Is(serr, errStreamCut) {
+				if errors.Is(serr, errStreamCut) || errors.Is(serr, errDoneSaid) {
+					// a cut's error event is in hand; a [DONE] said
+					// the reply over: neither is the read's to fail on
 					serr = nil
 				}
+				// a Chat reply that carried nothing at all but counted
+				// its usage is an empty one (chatTail.void), told below,
+				// not a cut nor one whose finish_reason alone was lost
 				if serr == nil && failed == "" && !ended && !relooped &&
+					!(actual == provider.Chat && tail.void() && tail.usage) &&
 					saysItsEnd(p, actual, model) && r.Context().Err() == nil {
 					// an Anthropic stream that just stopped — no
 					// stop_reason, no message_stop — or a Responses one
@@ -648,6 +747,14 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 						// finish_reason after its generation was done
 						u.add(Usage{Stop: fin})
 						serr = dec(string(finishChunk(fin)), attemptSee)
+					} else if endsAtProbeCap(actual, req.MaxTokens, spent) {
+						// a short probe's reply that stopped at its own
+						// small limit with no end said (plugins#827):
+						// ended at its length, as the vendor should have
+						// said
+						u.add(Usage{Stop: "length"})
+						serr = nil
+						attemptSee(Event{Kind: KStop, Stop: "length"})
 					}
 				}
 			}
@@ -673,8 +780,8 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 			if held != nil {
 				held()
 			}
-			if (empty || counts && uncounted(this)) && !said && answersNothing(stop) {
-				if empties < emptyRetries(w, r.Context()) && r.Context().Err() == nil {
+			if (empty || counts && uncounted(this) || voids && stop == "") && !said && answersNothing(stop) {
+				if empties < emptyRetries(w, r.Context()) && r.Context().Err() == nil && !p.PassesErrors() {
 					// asked again here first, for the agent to have the
 					// answer rather than the error: Gemini on a long
 					// conversation now and then ends with only its
@@ -695,7 +802,7 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 				// and an agent told it tries again rather than end its
 				// turn (#667); a reply that said nothing has nothing to
 				// go on from, so it isn't continued
-				failed = p.Name + ": " + emptyReply
+				failed = emptyReplyFailed(p.Name, this)
 				break
 			}
 			if voids && replyCheck(r.Context()) == nil && cutVoid(stop, !said, this.Output, request.MaxTokens) {
@@ -703,7 +810,21 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 				// nowhere: its budget is spent, and a second ask at the
 				// same max_tokens would mostly spend it twice over before
 				// the error (#2972, its review)
-				failed = cutVoidFailed(p.Name)
+				if request.MaxTokens <= 0 && s.noteVoid(p, model, this.Output) && r.Context().Err() == nil {
+					// the request named no limit, and the API's own
+					// default cut it: asked again here, once, for the
+					// room the model has (voidRoom), the reasoning the
+					// client has staying and the next try's following it
+					if n := roomedOutput(s.voidRoomOf(p.ID, model), contextOf(p, model), estimate(request)); n > 0 {
+						roomed := *request
+						roomed.MaxTokens, request = n, &roomed
+						before, this = before.plus(this, false), Usage{}
+						kept, stop = nil, ""
+						enc.keepalive()
+						continue
+					}
+				}
+				failed = cutVoidFailed(p.Name, named)
 				break
 			}
 			for _, ev := range kept {
@@ -718,7 +839,7 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 		// an error the client already has ends the reply: nothing of it
 		// goes on after it (a group member's mid-reply error fails the
 		// try at once, for the group's next member, #733)
-		if errSent || !cont.again(failedStatus, failedCode, again, r.Context()) {
+		if errSent || p.PassesErrors() || !cont.again(failedStatus, failedCode, again, r.Context()) {
 			if held != nil {
 				// what was held goes as the text it is, as it used to;
 				// a reply that goes on reads it again instead
@@ -759,4 +880,23 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 		enc.event(Event{Kind: KError, Text: failed, Code: failedCode})
 	}
 	return 200, failed
+}
+
+// saidOver reports whether an upstream event is its protocol's own last
+// word on a reply that went well: Chat's [DONE], Anthropic's message_stop,
+// Responses' completed, incomplete or failed. A relay that holds the
+// connection after it must not hold the translated reply's end (#5936).
+func saidOver(proto provider.Protocol, data string) bool {
+	switch proto {
+	case provider.Chat:
+		return strings.TrimSpace(data) == "[DONE]"
+	case provider.Anthropic:
+		return eventType(data) == "message_stop"
+	case provider.Responses:
+		switch eventType(data) {
+		case "response.completed", "response.incomplete", "response.failed":
+			return true
+		}
+	}
+	return false
 }

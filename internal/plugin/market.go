@@ -21,6 +21,7 @@ import (
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/ghtoken"
+	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/source"
 	"github.com/yetone/magpie/internal/update"
 )
@@ -284,6 +285,8 @@ func fetchJSONFaithful(ctx context.Context, u string, limit int64) ([]byte, erro
 }
 
 func fetchJSONFrom(ctx context.Context, u string, limit int64, do func(*http.Client, *http.Request) (*http.Response, error)) ([]byte, error) {
+	// through plugin downloads' proxy, where Settings sets one
+	ctx = netproxy.Downloads(ctx)
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
 		return nil, err
@@ -637,6 +640,9 @@ func searchNPM(ctx context.Context, text string, keep func(string, []string) boo
 	if err := json.Unmarshal(b, &r); err != nil {
 		return nil, err
 	}
+	if plain := PlainKeywords(text); len(r.Objects) == 0 && plain != text {
+		return searchNPM(ctx, plain, keep)
+	}
 	var out []Hit
 	for _, o := range r.Objects {
 		p := o.Package
@@ -651,6 +657,24 @@ func searchNPM(ctx context.Context, text string, keep func(string, []string) boo
 	return out, nil
 }
 
+// PlainKeywords is a search's text with each keywords: qualifier as the
+// plain word it names: "keywords:pi-package rename" is "pi-package
+// rename". npmmirror (the 「国内镜像」 switch, or a user's own registry
+// pointed at it) knows no qualifier and answers {"objects":[],"total":0}
+// to any text that has one, while its plain search finds the packages
+// with the keyword (eachg0 on X: pi-rename not found), so a search that
+// came back empty is asked again in plain words and the keyword is
+// checked here.
+func PlainKeywords(text string) string {
+	f := strings.Fields(text)
+	for i, w := range f {
+		if k, ok := strings.CutPrefix(w, "keywords:"); ok && k != "" {
+			f[i] = strings.ReplaceAll(k, ",", " ")
+		}
+	}
+	return strings.Join(f, " ")
+}
+
 // Page is a package's page: its README and when it last changed.
 type Page struct {
 	Readme  string    `json:"readme"`
@@ -660,17 +684,33 @@ type Page struct {
 // Readme is the package's README, as npm has it, or — for a plugin added
 // from a folder on this computer or a git repository — the one its folder
 // carries.
-func Readme(ctx context.Context, name string) (Page, error) {
+func Readme(ctx context.Context, name string) (Page, error) { return ReadmeIn(ctx, name, "") }
+
+// ReadmeIn is Readme in the reader's language (the UI's, "zh-CN", "ja"):
+// the README a package carries named for it (README.zh-CN.md, README_zh.md
+// and the like) in place of its README.md, from its folder where it is
+// installed and from npm's or GitHub's copy where it isn't. Without one,
+// or with lang "" or English, the README.md.
+func ReadmeIn(ctx context.Context, name, lang string) (Page, error) {
 	if IsGit(name) {
 		// one not installed yet (a repository tagged magpie-plugin): its
 		// README as GitHub has it
 		if _, err := os.Stat(Target(name)); err != nil {
 			if repo := githubRepo(name); repo != "" {
+				if r, ok := cachedReadme(ctx, name); ok {
+					return Page{Readme: r}, nil
+				}
+				if r, ok := githubLangReadme(ctx, repo, lang); ok {
+					return Page{Readme: r}, nil
+				}
 				return githubReadme(ctx, repo)
 			}
 		}
 	}
 	if IsPath(name) || IsGit(name) {
+		if p, ok := folderLangReadme(Target(name), lang); ok {
+			return p, nil
+		}
 		return folderReadme(Target(name))
 	}
 	if !pkgName.MatchString(name) {
@@ -678,6 +718,14 @@ func Readme(ctx context.Context, name string) (Page, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
+	if p, ok := folderLangReadme(Target(name), lang); ok {
+		return p, nil // installed: its own file, as it was installed
+	}
+	// the copy the community repo keeps, before npm, which a human check
+	// can stand in front of
+	if r, ok := cachedReadme(ctx, name); ok {
+		return Page{Readme: r}, nil
+	}
 	b, err := fetchNPM(ctx, name, "/"+npmPath(name), 32<<20)
 	if err != nil {
 		// one npm doesn't have (yet): the README the community repo's
@@ -692,15 +740,25 @@ func Readme(ctx context.Context, name string) (Page, error) {
 		return Page{}, err
 	}
 	var d struct {
-		Readme string               `json:"readme"`
-		Time   map[string]time.Time `json:"time"`
+		Readme   string               `json:"readme"`
+		Time     map[string]time.Time `json:"time"`
+		DistTags map[string]string    `json:"dist-tags"`
 	}
 	if err := json.Unmarshal(b, &d); err != nil {
-		return Page{}, err
+		// a page that isn't npm's entry (a human check, a portal)
+		return Page{}, errors.New("the answer isn't the package's page; npm may be asking for a human check")
 	}
 	const most = 200 << 10
 	if len(d.Readme) > most {
 		d.Readme = d.Readme[:most]
+	}
+	// the registry's entry holds the README.md alone; one named for the
+	// reader's language is in the package's files, which only the public
+	// registry's copy is asked of jsDelivr for
+	if _, _, official := npmBase(name); official {
+		if r, ok := npmLangReadme(ctx, name, d.DistTags["latest"], lang); ok {
+			d.Readme = r
+		}
 	}
 	return Page{Readme: d.Readme, Updated: d.Time["modified"]}, nil
 }

@@ -2,10 +2,11 @@ package provider
 
 import (
 	"maps"
-	"regexp"
+
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
-var secretHeader = regexp.MustCompile(`(?i)auth|key|token|secret|cookie|session|password`)
+var secretHeader = lazyre.New(`(?i)auth|key|token|secret|cookie|session|password`)
 
 // SecretHeader reports whether a header or an environment variable by that
 // name looks like it holds a key: what a backup without keys leaves empty.
@@ -40,6 +41,12 @@ func KeepSecrets(in, here Provider, keyless bool) Provider {
 			in.Headers[k] = v
 		}
 	}
+	// an AWS access key's session token, with the key here has, that in
+	// hasn't: a magpie from before tokens (#7687). A temporary key is
+	// refused without its token, and a lasting one never has one.
+	if in.SessionToken == "" && in.AccessKeyID != "" && in.AccessKeyID == here.AccessKeyID && in.SecretAccessKey == here.SecretAccessKey {
+		in.SessionToken = here.SessionToken
+	}
 	if !keyless && (in.Key == "" || in.Key != here.Key) {
 		return in
 	}
@@ -47,7 +54,7 @@ func KeepSecrets(in, here Provider, keyless bool) Provider {
 		in.BalanceToken = here.BalanceToken
 	}
 	if in.AccessKeyID == "" && in.SecretAccessKey == "" {
-		in.AccessKeyID, in.SecretAccessKey = here.AccessKeyID, here.SecretAccessKey
+		in.AccessKeyID, in.SecretAccessKey, in.SessionToken = here.AccessKeyID, here.SecretAccessKey, here.SessionToken
 	}
 	return in
 }

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/autostart"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/proc"
 )
 
@@ -111,6 +113,20 @@ func Install(o Options) error {
 	return nil
 }
 
+// Mend brings a service written by an older magpie up to what Install
+// writes now, where that can be done in place: on a Mac, a launch agent
+// that ran the gateway as Background runs it as Standard (#2961) from the
+// next login, or `magpie daemon restart`. The service calls it as it
+// starts, so no user has to install it again.
+func Mend() {
+	if goos != "darwin" {
+		return
+	}
+	if (launchd{}).mended() {
+		log.Print("daemon: the launch agent runs the gateway as Standard, not Background, from the next login or `magpie daemon restart` (#2961)")
+	}
+}
+
 // removedMark is there once the user removed the service (Uninstall): what
 // magpie puts in place by itself (the terminal's keepGateway, as it quits) is put there
 // no more.
@@ -161,10 +177,10 @@ func Web() (addr, key string) {
 }
 
 var (
-	webArgRe = regexp.MustCompile(`(?:"|<string>)` + regexp.QuoteMeta(webFlag) + `([^"<\s]+)(?:"|</string>)`)
+	webArgRe = lazyre.New(`(?:"|<string>)` + regexp.QuoteMeta(webFlag) + `([^"<\s]+)(?:"|</string>)`)
 	// a unit's Environment="MAGPIE_WEB_KEY=…", a plist's
 	// <key>MAGPIE_WEB_KEY</key><string>…</string>
-	webKeyRe = regexp.MustCompile(webKeyVar + `(?:=|</key><string>)([A-Za-z0-9._~-]+)`)
+	webKeyRe = lazyre.New(webKeyVar + `(?:=|</key><string>)([A-Za-z0-9._~-]+)`)
 )
 
 // TLS is the certificate and key files the installed service serves
@@ -182,21 +198,70 @@ func TLS() (cert, key string) {
 	return tlsOf(string(b))
 }
 
+// Addr is the gateway address the installed service was installed with
+// (its MAGPIE_ADDR), "" when it has none or isn't installed: where a
+// magpie from before gateway.json ran, which `magpie update` looks at.
+func Addr() string {
+	m, err := current()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(m.file())
+	if err != nil {
+		return ""
+	}
+	return envOf(string(b), "MAGPIE_ADDR")
+}
+
+// Program is the program the installed service runs, "" when it isn't
+// installed: from the service's own file, the first word of a unit's
+// ExecStart or a launch agent's ProgramArguments.
+func Program() string {
+	m, err := current()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(m.file())
+	if err != nil {
+		return ""
+	}
+	return programOf(string(b))
+}
+
+var (
+	programPlistRe = lazyre.New(`<key>ProgramArguments</key>\s*<array>\s*<string>([^<]*)</string>`)
+	programUnitRe  = lazyre.New(`(?m)^ExecStart="((?:[^"\\]|\\.)*)"`)
+)
+
+// programOf is Program from a unit's or a launch agent's text.
+func programOf(text string) string {
+	if m := programPlistRe.FindStringSubmatch(text); m != nil {
+		return html.UnescapeString(m[1])
+	}
+	if m := programUnitRe.FindStringSubmatch(text); m != nil {
+		return strings.NewReplacer(`\\`, `\`, `\"`, `"`, "%%", "%").Replace(m[1])
+	}
+	return ""
+}
+
+// envOf is the value of NAME in a unit's or a launch agent's text, "" when
+// it has none.
+func envOf(text, name string) string {
+	// a unit's Environment="NAME=…", quoted by unitQuote
+	if m := regexp.MustCompile(`Environment="` + name + `=((?:[^"\\]|\\.)*)"`).FindStringSubmatch(text); m != nil {
+		return strings.NewReplacer(`\\`, `\`, `\"`, `"`, "%%", "%").Replace(m[1])
+	}
+	// a plist's <key>NAME</key><string>…</string>
+	if m := regexp.MustCompile(`<key>` + name + `</key><string>([^<]*)</string>`).FindStringSubmatch(text); m != nil {
+		return html.UnescapeString(m[1])
+	}
+	return ""
+}
+
 // tlsOf is TLS from a unit's or a launch agent's text: both files or
 // neither.
 func tlsOf(text string) (cert, key string) {
-	val := func(name string) string {
-		// a unit's Environment="NAME=…", quoted by unitQuote
-		if m := regexp.MustCompile(`Environment="` + name + `=((?:[^"\\]|\\.)*)"`).FindStringSubmatch(text); m != nil {
-			return strings.NewReplacer(`\\`, `\`, `\"`, `"`, "%%", "%").Replace(m[1])
-		}
-		// a plist's <key>NAME</key><string>…</string>
-		if m := regexp.MustCompile(`<key>` + name + `</key><string>([^<]*)</string>`).FindStringSubmatch(text); m != nil {
-			return html.UnescapeString(m[1])
-		}
-		return ""
-	}
-	cert, key = val("MAGPIE_TLS_CERT"), val("MAGPIE_TLS_KEY")
+	cert, key = envOf(text, "MAGPIE_TLS_CERT"), envOf(text, "MAGPIE_TLS_KEY")
 	if cert == "" || key == "" {
 		return "", ""
 	}
@@ -317,6 +382,10 @@ var autostartEnabled = func() bool { return autostart.Enabled() != autostart.Off
 // var for the tests, whose binary is a build Go deletes.
 var self = func() (string, error) {
 	if p := os.Getenv("APPIMAGE"); p != "" {
+		return p, nil
+	}
+	// a Nix or Guix package: its wrapper, by the profile's link
+	if p := appdir.Launcher(); p != "" {
 		return p, nil
 	}
 	exe, err := os.Executable()

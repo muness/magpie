@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -116,10 +118,16 @@ type pluginPanel struct {
 	Titles map[string]string `json:"titles,omitempty"`
 	URL    string            `json:"url"`   // the panel, under pluginPagePrefix
 	Reads  []string          `json:"reads"` // what it may read, of plugin.PageReads
-	token  string
-	dir    string
-	file   string
-	hosted bool
+	// Providers are, for a provider panel of a plugin that gives
+	// providers, the ids magpie knows them by: its panels are in their
+	// editors only. A plugin that gives none has its panels in every
+	// provider's editor. Marvis's first-line panel was in every provider's
+	// editor, Kimi's among them, and in none of Marvis's own (11-21).
+	Providers []string `json:"providers,omitempty"`
+	token     string
+	dir       string
+	file      string
+	hosted    bool
 }
 
 // pageKeyChars are what a window page's key can't have
@@ -131,6 +139,19 @@ var pageKeyChars = strings.NewReplacer("@", "", "/", "-", ".", "-", "_", "-", " 
 func windowParts() (pages []pluginPage, panels []pluginPanel) {
 	seen := map[string]bool{}
 	replaced := map[string]bool{}
+	// the providers each plugin gave when last listed, read once and only
+	// when a panel is a provider's
+	var gives map[string][]string
+	providersOf := func(spec string) []string {
+		if gives == nil {
+			gives = map[string][]string{}
+			ps, _ := plugin.Listed()
+			for _, pp := range ps {
+				gives[pp.Spec] = append(gives[pp.Spec], provider.PluginID(pp.ID))
+			}
+		}
+		return gives[spec]
+	}
 	for _, e := range plugin.Load().Plugins {
 		if e.Off {
 			continue
@@ -191,6 +212,9 @@ func windowParts() (pages []pluginPage, panels []pluginPanel) {
 			if p.Title == "" {
 				p.Title = cmp.Or(plugin.InstalledName(e.Spec), plugin.ShortName(name))
 			}
+			if p.Slot == "provider" {
+				p.Providers = providersOf(e.Spec)
+			}
 			panels = append(panels, p)
 		}
 	}
@@ -224,7 +248,7 @@ func windowOf(spec string) (name string, reads []string, ok bool) {
 // inline styles, data: pictures, and nothing over the network. sandbox
 // keeps a page opened by itself (not in the window's frame) as shut in as
 // the frame keeps it.
-func pagePolicy(r *http.Request, tok string) string {
+func pagePolicy(r *http.Request, tok string, hashes ...string) string {
 	own := "'self'"
 	if r.Host != "" {
 		// the page's own folder: not the window's files, nor /api
@@ -233,7 +257,7 @@ func pagePolicy(r *http.Request, tok string) string {
 	return strings.Join([]string{
 		"sandbox allow-scripts",
 		"default-src 'none'",
-		"script-src " + own,
+		"script-src " + strings.Join(append([]string{own}, hashes...), " "),
 		"style-src " + own + " 'unsafe-inline'",
 		"img-src " + own + " data:",
 		"font-src " + own,
@@ -266,7 +290,39 @@ func ownSources(r *http.Request, path string) []string {
 	if scheme, _ := r.Context().Value(windowSchemeKey{}).(string); scheme != "" {
 		return []string{scheme + "://" + r.Host + path}
 	}
-	return []string{"https://" + r.Host + path, "http://" + r.Host + path}
+	own := []string{"https://" + r.Host + path, "http://" + r.Host + path}
+	// A reverse proxy that doesn't pass the browser's Host on (nginx's
+	// proxy_pass does not) leaves r.Host as magpie's own address, which
+	// names nothing the browser asked for: every script and style of the
+	// page was refused and it drew as bare HTML (xuanwo on X, Day card).
+	// The window that framed the page is on the address the browser used,
+	// and says so in the frame's address (pageOriginParam): the frame
+	// sends no Referer.
+	if o := browserOrigin(r); o != "" && o != "https://"+r.Host && o != "http://"+r.Host {
+		own = append(own, o+path)
+	}
+	return own
+}
+
+// pageOriginParam is the query a window adds to its frame's address: the
+// origin the window itself is on (pluginpages.js).
+const pageOriginParam = "_o"
+
+// browserOrigin is the scheme and host the browser reached this server
+// at, from the frame's address, or "" when it names none
+// (or anything but a plain http(s) host and port, which a policy can't be
+// trusted to carry).
+func browserOrigin(r *http.Request) string {
+	u, err := url.Parse(r.URL.Query().Get(pageOriginParam))
+	if err != nil || u.Host == "" || u.User != nil || u.Scheme != "http" && u.Scheme != "https" {
+		return ""
+	}
+	for _, c := range u.Host {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune(".-:[]", c)) {
+			return ""
+		}
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // pageHostWait is how long a page's HTML waits for its plugin's host,
@@ -355,6 +411,26 @@ func servePluginPage(rw http.ResponseWriter, r *http.Request, web bool) {
 		pageHost(r.Context())
 	}
 	h := rw.Header()
+	// A page in a browser comes as one document (pageinline.go): its
+	// sandboxed frame sends no cookie for its files, which a proxy that
+	// signs readers in by cookie turns away.
+	if web && rel == entry && isHTML(rel) {
+		if file, ok := plugin.FileIn(dir, rel); ok {
+			b, err := os.ReadFile(file)
+			if err != nil {
+				http.NotFound(rw, r)
+				return
+			}
+			doc, hashes := inlinePage(b, dir)
+			h.Set("Content-Security-Policy", pagePolicy(r, tok, append(hashes, "data:")...))
+			h.Set("X-Content-Type-Options", "nosniff")
+			h.Set("Referrer-Policy", "no-referrer")
+			h.Set("Cache-Control", "no-cache")
+			h.Set("Content-Type", "text/html; charset=utf-8")
+			http.ServeContent(rw, r, "index.html", time.Time{}, strings.NewReader(string(doc)))
+			return
+		}
+	}
 	h.Set("Content-Security-Policy", pagePolicy(r, tok))
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
@@ -385,6 +461,7 @@ func servePluginPage(rw http.ResponseWriter, r *http.Request, web bool) {
 		http.NotFound(rw, r)
 		return
 	}
+	servedAs(rw, file)
 	http.ServeContent(rw, r, filepath.Base(file), st.ModTime(), f)
 }
 
@@ -413,17 +490,52 @@ func apiFramed(r *http.Request) bool {
 // can 127.0.0.1 be another computer than this one.
 func pluginPageRoutes(mux *http.ServeMux, web bool) {
 	mux.HandleFunc(pluginPagePrefix, func(rw http.ResponseWriter, r *http.Request) { servePluginPage(rw, r, web) })
+	// a picture a page drew, to the clipboard or to Downloads (pageimage.go)
+	pageImageRoutes(mux)
 	mux.HandleFunc("GET /api/plugin-pages", func(rw http.ResponseWriter, r *http.Request) {
 		out := pluginPages()
 		if out == nil {
 			out = []pluginPage{}
 		}
+		rank := map[string]int{}
+		for i, k := range settings.Load().PluginPageOrder {
+			rank[k] = i + 1
+		}
+		// the sidebar order the reader dragged; a page it doesn't name follows
+		slices.SortStableFunc(out, func(a, b pluginPage) int {
+			ra, rb := rank[a.Key], rank[b.Key]
+			if ra == 0 {
+				ra = len(rank) + 1
+			}
+			if rb == 0 {
+				rb = len(rank) + 1
+			}
+			return ra - rb
+		})
 		for i := range out {
 			if web && out[i].servicePort() > 0 {
 				out[i].Service = strings.Repeat("../", strings.Count(out[i].file, "/")) + pageServicePath
 			}
 		}
 		writeJSON(rw, out)
+	})
+	mux.HandleFunc("POST /api/plugin-pages/arrange", func(rw http.ResponseWriter, r *http.Request) {
+		var in struct{ Order []string }
+		if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 64<<10)).Decode(&in); err != nil {
+			fail(rw, err)
+			return
+		}
+		s, err := settings.LoadChecked()
+		if err != nil {
+			fail(rw, err)
+			return
+		}
+		s.PluginPageOrder = in.Order
+		if err := settings.Save(s); err != nil {
+			fail(rw, err)
+			return
+		}
+		writeJSON(rw, settingsState())
 	})
 	mux.HandleFunc("GET /api/plugin-panels", func(rw http.ResponseWriter, r *http.Request) {
 		_, out := windowParts()
@@ -539,6 +651,9 @@ func pageRead(read string, params map[string]any) (any, error) {
 			out = append(out, prov{ID: p.ID, Name: p.Name})
 		}
 		return out, nil
+	case "usage:day":
+		// one day, or a span of them, by agent and model (pageday.go)
+		return pageDay(params)
 	case "usage:summary":
 		period := usage.Today
 		if s, _ := params["period"].(string); s != "" {
@@ -581,4 +696,9 @@ func pageRead(read string, params map[string]any) (any, error) {
 		return out, nil
 	}
 	return nil, fmt.Errorf("no read %q", read)
+}
+
+func isHTML(rel string) bool {
+	ext := strings.ToLower(filepath.Ext(rel))
+	return ext == ".html" || ext == ".htm"
 }

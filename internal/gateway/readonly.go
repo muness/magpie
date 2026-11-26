@@ -31,6 +31,7 @@ var readOnlyRoutes = map[string]bool{
 	"GET /v1/{$}":                     true,
 	"GET /v1/magpie/quotas":           true,
 	"GET /v1/magpie/quotas/history":   true,
+	"GET " + AccountsPath:             true,
 	"GET " + StatuslinePath:           true,
 	"POST " + StatuslinePath:          true,
 	"GET " + provider.RemoteCardsPath: true,
@@ -42,7 +43,18 @@ var readOnlyRoutes = map[string]bool{
 	"GET " + routeEventsPath:          true,
 	"GET " + OwnMCPPath:               true,
 	"GET " + KeyPagePath:              true,
-	"GET " + keyPageData:              true,
+	// the chat page's own files, answered without a key (chatpage.go)
+	"GET " + ChatPagePath:                true,
+	"GET " + ChatPagePath + "/{path...}": true,
+	"GET " + keyPageData:                 true,
+	// the join carries a password, not a key (join.go)
+	"GET " + JoinPagePath: true,
+	"GET " + joinData:     true,
+	"POST " + joinData:    true,
+	// magpie's CA, answered without a key (https.go caFileOpen)
+	"GET " + CAPath: true,
+	// a proof carries no key, and answers none (remote_prove.go)
+	"POST " + provider.RemoteProvePath: true,
 }
 
 // ReadOnlyCode is the error code a read-only key is refused a route with.
@@ -59,18 +71,44 @@ func (m *routeMux) HandleFunc(pattern string, h func(http.ResponseWriter, *http.
 	m.ServeMux.HandleFunc(pattern, h)
 }
 
+// BrowserKeyCode is the error code the Magpie Browser extension's key
+// (access.Key.Browser) is refused a route with.
+const BrowserKeyCode = "gateway_key_browser_only"
+
+// browserKeyRoute is the one route the extension's key is answered: the
+// extension's WebSocket. Its key is written into a zip that lands in
+// Downloads (gui's browserKey), so whoever reads the zip has it; it must
+// spend nothing, read nothing and reach no MCP server, the browser's own
+// included (TestBrowserKeyEveryRoute).
+const browserKeyRoute = "GET " + BrowserExtensionPath
+
 // readOnlyGuard refuses a read-only key every route of mux but
-// readOnlyRoutes, before anything is read, reserved or sent.
+// readOnlyRoutes, and the Magpie Browser extension's key every route but
+// browserKeyRoute, before anything is read, reserved or sent. Both are
+// judged here, after the key is known (callerGuard, lanGuard's
+// identifyCaller) and by the pattern the request is routed to, so no
+// route is left out, one added later included.
 func readOnlyGuard(mux *routeMux, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		who := access.Caller(r.Context())
+		if who.Browser {
+			if _, pattern := mux.Handler(r); pattern != browserKeyRoute {
+				log.Printf("refused %s %s: gateway key %q is Magpie Browser's", r.Method, r.URL.Path, who.KeyName)
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{
+					"message": "this gateway key is the Magpie Browser extension's: it connects the extension and nothing else, no model, MCP server, stats or write. Use another gateway key for those (Gateway → Gateway keys)",
+					"type":    "permission_error", "code": BrowserKeyCode}})
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
 		if who.ReadOnly {
 			// a path that isn't clean is routed to a redirect under the
 			// pattern of where it goes, and judged again when it gets there
 			if _, pattern := mux.Handler(r); !readOnlyRoutes[pattern] {
 				log.Printf("refused %s %s: gateway key %q is read-only", r.Method, r.URL.Path, who.KeyName)
 				writeJSON(w, http.StatusForbidden, map[string]any{"error": map[string]any{
-					"message": "this gateway key is read-only: it may read magpie's quotas and usage (GET /v1/magpie/quotas, /v1/magpie/quotas/history, /v1/magpie/usage, /v1/magpie/usage/requests, /v1/magpie/limit, /v1/magpie/route-events) and use no model, MCP server or write. Use a key with full access for that (Gateway → Gateway keys, or magpie gateway-key access <id> full)",
+					"message": "this gateway key is read-only: it may read magpie's quotas and usage (GET /v1/magpie/quotas, /v1/magpie/quotas/history, /v1/magpie/accounts, /v1/magpie/usage, /v1/magpie/usage/requests, /v1/magpie/limit, /v1/magpie/route-events) and use no model, MCP server or write. Use a key with full access for that (Gateway → Gateway keys, or magpie gateway-key access <id> full)",
 					"type":    "permission_error", "code": ReadOnlyCode}})
 				return
 			}

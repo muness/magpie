@@ -3,6 +3,7 @@ package claudetui
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -10,6 +11,8 @@ import (
 
 	"golang.org/x/sys/windows"
 
+	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/conptypair"
 	"github.com/yetone/magpie/internal/proc"
 )
 
@@ -27,9 +30,83 @@ type child struct {
 // remove (dropLeft).
 var endSignals = []os.Signal{os.Interrupt, syscall.SIGTERM}
 
+// pseudoConsole is where CreatePseudoConsole and ClosePseudoConsole come
+// from. Windows 10's own (conhost 10.0.19041) drops a paste's bracketed
+// paste marks and loses 1024-byte blocks of a long write, so Claude Code
+// takes a long message as many pastes and gets a part of it
+// (yetone/magpie#5205); the ConPTY Windows Terminal ships (conpty.dll,
+// which runs the OpenConsole.exe beside it) keeps them. In order:
+//   - dsh-cross: a conpty folder beside magpie's executable holding both,
+//     the user's own;
+//   - on Windows 10, the pair a release carries (internal/conptypair),
+//     written to magpie's cache and checked against its pins there;
+//   - the system's.
+type pseudoConsole struct {
+	create, close *windows.LazyProc
+	// system: Windows' own, kernel32's
+	system bool
+}
+
+var console = sync.OnceValue(func() pseudoConsole {
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Join(filepath.Dir(exe), "conpty")
+		if _, err := os.Stat(filepath.Join(dir, "OpenConsole.exe")); err == nil {
+			if c, ok := conptyIn(dir); ok {
+				return c
+			}
+		}
+	}
+	if windows.RtlGetVersion().BuildNumber < win11 && conptypair.Bundled() {
+		if cache, err := appdir.SystemCache(); err == nil {
+			if dir, err := conptypair.Ready(cache); err == nil {
+				if c, ok := conptyIn(dir); ok {
+					return c
+				}
+			}
+		}
+	}
+	k := windows.NewLazySystemDLL("kernel32.dll")
+	return pseudoConsole{k.NewProc("CreatePseudoConsole"), k.NewProc("ClosePseudoConsole"), true}
+})
+
+// win11 is Windows 11's first build: the ConPTY of every one since keeps
+// a paste's marks and every block of it.
+const win11 = 22000
+
+// conptyIn is the ConPTY of a folder's conpty.dll, ok when it has both.
+func conptyIn(dir string) (pseudoConsole, bool) {
+	dll := windows.NewLazyDLL(filepath.Join(dir, "conpty.dll"))
+	create, closePC := dll.NewProc("CreatePseudoConsole"), dll.NewProc("ClosePseudoConsole")
+	if create.Find() != nil || closePC.Find() != nil {
+		return pseudoConsole{}, false
+	}
+	return pseudoConsole{create, closePC, false}, true
+}
+
+// cutHint is what a message Claude Code didn't get whole (whole.go) is
+// told of where it was lost: on Windows 10's own ConPTY, how to use
+// another (#5205).
+func cutHint() string {
+	if !console().system || windows.RtlGetVersion().BuildNumber >= win11 {
+		return ""
+	}
+	// short, for the bridge's log line to hold it whole
+	return "; on Windows 10, a conpty folder beside magpie.exe fixes it (#5205)"
+}
+
+func createPseudoConsole(size windows.Coord, in, out windows.Handle, h *windows.Handle) error {
+	r, _, _ := console().create.Call(uintptr(*(*uint32)(unsafe.Pointer(&size))), uintptr(in), uintptr(out), 0, uintptr(unsafe.Pointer(h)))
+	if r != 0 {
+		return syscall.Errno(r)
+	}
+	return nil
+}
+
+func closePseudoConsole(h windows.Handle) { _, _, _ = console().close.Call(uintptr(h)) }
+
 func (s *shim) start(path string, args []string) error {
 	// Windows 10 before 1809 has none, and x/sys panics calling it there
-	if err := windows.NewLazySystemDLL("kernel32.dll").NewProc("CreatePseudoConsole").Find(); err != nil {
+	if err := console().create.Find(); err != nil {
 		return fmt.Errorf("no pseudo console on this Windows: %w", err)
 	}
 	// a .cmd (npm's shim) is run by cmd.exe, its arguments quoted as
@@ -53,9 +130,9 @@ func (s *shim) start(path string, args []string) error {
 		windows.CloseHandle(inW)
 		return err
 	}
-	var console windows.Handle
+	var pc windows.Handle
 	// wide, so a line of Claude Code's screen is a line
-	err := windows.CreatePseudoConsole(windows.Coord{X: screenCols, Y: screenRows}, inR, outW, 0, &console)
+	err := createPseudoConsole(windows.Coord{X: screenCols, Y: screenRows}, inR, outW, &pc)
 	// the console has its own of these
 	windows.CloseHandle(inR)
 	windows.CloseHandle(outW)
@@ -65,15 +142,15 @@ func (s *shim) start(path string, args []string) error {
 		out.Close()
 		return fmt.Errorf("a pseudo console: %w", err)
 	}
-	h, err := startIn(console, cmd.Path, line, childEnv(s.env...))
+	h, err := startIn(pc, cmd.Path, line, childEnv(s.env...))
 	if err != nil {
-		windows.ClosePseudoConsole(console)
+		closePseudoConsole(pc)
 		in.Close()
 		out.Close()
 		return err
 	}
 	s.pty = conpty{in: in, out: out}
-	s.proc, s.console = h, console
+	s.proc, s.console = h, pc
 	go func() {
 		_, _ = windows.WaitForSingleObject(h, windows.INFINITE)
 		var code uint32
@@ -153,7 +230,7 @@ func (c conpty) Write(p []byte) (int, error) { return c.in.Write(p) }
 // Windows 11 24H2, ClosePseudoConsole waits for its output to be read.
 func (s *shim) closeConsole() {
 	s.closeOnce.Do(func() {
-		go windows.ClosePseudoConsole(s.console)
+		go closePseudoConsole(s.console)
 	})
 }
 
@@ -169,3 +246,9 @@ func (s *shim) stop() {
 		_ = windows.TerminateProcess(s.proc, 1)
 	}
 }
+
+// imagePadOS: a pseudo console may drop the bracketed-paste marks, so an
+// image's path is sent as a read long enough to be a paste, over 800
+// characters and under the 1024 bytes Windows 10's conhost can lose
+// (imagePad).
+const imagePadOS = 900

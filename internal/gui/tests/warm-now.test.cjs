@@ -1,22 +1,25 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
-// Warm up now (a Windows user on Discord): the last row of Settings › Usage's
-// Codex and Claude Code warm-up tabs sends one account the warm-up's request
-// at once (POST /api/warm-now {agent, user}). One account goes at a press;
-// with more the press opens the app's menu of them (no <select>). What it
-// came to stays on the row's line: done, or failed with the vendor's reason,
-// in red. The row is hidden with no account; a click never moves the page;
-// nothing runs off the side at 440px. en, zh, zh-TW, ja, de; the API is faked here.
+// Warm up now (a Windows user on Discord): the last row of Codex's,
+// Claude Code's and the agy CLI's warm-ups, in each one's provider editor (they were tabs in
+// Settings › Usage until the owner moved them on 11-07), sends one account
+// the warm-up's request at once (POST /api/warm-now {agent, user}). One
+// account goes at a press; with more the press opens the app's menu of
+// them (no <select>). What it came to stays on the row's line: done, or
+// failed with the vendor's reason, in red. The row is hidden with no
+// account; a click never moves the page; nothing runs off the side at
+// 440px. en, zh, zh-TW, ja, de; the API is faked here.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { test } = require("node:test");
 const { chromium, webkit } = require("playwright");
+const { provPrefsProviders, openProvPrefs, inEditor } = require("./reader.cjs");
 
 const assets = path.resolve(__dirname, "../assets");
 const WHY = "429 Too Many Requests: {\"detail\":\"usage limit reached\"} https://chatgpt.com/backend-api/codex/responses-with-a-very-long-unbroken-reason";
 
-function serve(lang, asked, codexUsers, claudeUsers) {
-  const settings = { theme: "light", lang, currency: "usd", codexWarmup: "", codexUsers, claudeUsers };
+function serve(lang, asked, codexUsers, claudeUsers, agyUsers) {
+  const settings = { theme: "light", lang, currency: "usd", codexWarmup: "", codexUsers, claudeUsers, agyUsers };
   return async (route) => {
     const url = new URL(route.request().url());
     const json = (data, status = 200) => route.fulfill({ status, json: data });
@@ -29,7 +32,11 @@ function serve(lang, asked, codexUsers, claudeUsers) {
       asked.push([b.agent, b.user]);
       return b.user === "a@example.com" ? json({ error: WHY }, 400) : json({ ok: true });
     }
-    if (url.pathname === "/api/providers") return json({ providers: [], presets: [], excluded: [], gateway: { running: true, window: true } });
+    if (url.pathname === "/api/warm-all") {
+      asked.push([route.request().postDataJSON().agent, "all"]);
+      return json({ results: ALL });
+    }
+    if (url.pathname === "/api/providers") return json(provPrefsProviders(["codex", "claude", "agy-cli"], { codex: "Codex", claude: "Claude Code", "agy-cli": "Antigravity CLI" }));
     if (url.pathname === "/api/groups") return json({ groups: [], models: [] });
     if (url.pathname === "/api/plugins") return json({ plugins: [] });
     if (url.pathname.startsWith("/api/")) return json({});
@@ -39,12 +46,17 @@ function serve(lang, asked, codexUsers, claudeUsers) {
   };
 }
 
+// what POST /api/warm-all says of each account: two warmed, one in its
+// windows already, one turned off (unsaid), one refused
+const ALL = [{ user: "one@example.com" }, { user: "busy@example.com", skip: "running" }, { user: "off@example.com", skip: "off" },
+  { user: "two@example.com" }, { user: "a@example.com", error: WHY }];
+
 const W = {
-  en: { name: "Warm up now", go: "Warm up", pick: "Warm up…", head: "Warm up which account", done: "Warmed up B@Example.com at ", failed: "Couldn't warm up a@example.com: ", own: "Warmed up own@example.com at " },
-  zh: { name: "现在预热", go: "预热", pick: "预热…", head: "预热哪个账号", done: "已预热 B@Example.com，", failed: "a@example.com 预热失败：", own: "已预热 own@example.com，" },
-  "zh-TW": { name: "現在預熱", go: "預熱", pick: "預熱…", head: "預熱哪個帳號", done: "已預熱 B@Example.com，", failed: "a@example.com 預熱失敗：", own: "已預熱 own@example.com，" },
-  ja: { name: "今すぐウォームアップ", go: "ウォームアップ", pick: "ウォームアップ…", head: "ウォームアップするアカウント", done: "B@Example.com をウォームアップしました（", failed: "a@example.com をウォームアップできませんでした: ", own: "own@example.com をウォームアップしました（" },
-  de: { name: "Jetzt vorwärmen", go: "Vorwärmen", pick: "Vorwärmen…", head: "Welches Konto vorwärmen", done: "B@Example.com vorgewärmt, ", failed: "a@example.com konnte nicht vorgewärmt werden: ", own: "own@example.com vorgewärmt, " },
+  en: { name: "Warm up now", go: "Warm up", pick: "Warm up…", head: "Warm up which account", done: "Warmed up B@Example.com at ", failed: "Couldn't warm up a@example.com: ", own: "Warmed up own@example.com at ", all: "All accounts", running: "Already in a window: " },
+  zh: { name: "现在预热", go: "预热", pick: "预热…", head: "预热哪个账号", done: "已预热 B@Example.com，", failed: "a@example.com 预热失败：", own: "已预热 own@example.com，", all: "全部账号", running: "窗口已在计时：" },
+  "zh-TW": { name: "現在預熱", go: "預熱", pick: "預熱…", head: "預熱哪個帳號", done: "已預熱 B@Example.com，", failed: "a@example.com 預熱失敗：", own: "已預熱 own@example.com，", all: "全部帳號", running: "時段已在計時：" },
+  ja: { name: "今すぐウォームアップ", go: "ウォームアップ", pick: "ウォームアップ…", head: "ウォームアップするアカウント", done: "B@Example.com をウォームアップしました（", failed: "a@example.com をウォームアップできませんでした: ", own: "own@example.com をウォームアップしました（", all: "すべてのアカウント", running: "期間はすでに開始済み: " },
+  de: { name: "Jetzt vorwärmen", go: "Vorwärmen", pick: "Vorwärmen…", head: "Welches Konto vorwärmen", done: "B@Example.com vorgewärmt, ", failed: "a@example.com konnte nicht vorgewärmt werden: ", own: "own@example.com vorgewärmt, ", all: "Alle Konten", running: "Zeitfenster läuft bereits: " },
 };
 
 // where the button the reader pressed is on the screen: it stays there while
@@ -53,7 +65,7 @@ const W = {
 const at = (loc) => loc.evaluate((b) => Math.round(b.getBoundingClientRect().top));
 const sideways = (page) => page.evaluate(() => {
   const out = [];
-  const de = document.documentElement, v = document.querySelector("#view-settings");
+  const de = document.documentElement, v = document.querySelector(".editor .ebody") || document.querySelector(".editor");
   if (de.scrollWidth > de.clientWidth) out.push("page");
   if (v.scrollWidth > v.clientWidth) out.push("view");
   for (const r of document.querySelectorAll(".row.warm-now:not([hidden])")) {
@@ -78,13 +90,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         page.setDefaultTimeout(5000);
         page.setDefaultNavigationTimeout(60000);
         const errors = [], asked = [];
-        page.on("pageerror", (e) => errors.push(e.message));
-        await page.route("**/*", serve(lang, asked, ["a@example.com", "B@Example.com"], ["own@example.com"]));
-        await page.goto("http://magpie.test/?view=settings&tab=usage");
-        const row = page.locator("#warmNowRow");
+        page.on("pageerror", (e) => { if (engine === "webkit" && /due to access control checks/.test(e.message)) return; errors.push(e.message); }); // a goto in WebKit can cut off a fetch (#1350)
+        await page.route("**/*", serve(lang, asked, ["a@example.com", "B@Example.com"], ["own@example.com"], ["own@example.com"]));
+        await openProvPrefs(page, "codex");
+        const row = page.locator(".editor .prov-prefs #warmNowRow");
         await row.locator("button").waitFor();
         assert.equal((await row.locator(".name").innerText()).trim(), w.name);
-        // last in the tab, under each account's own daily row
+        // last of Codex's warm-ups, under each account's own daily row
         assert.equal(await page.evaluate(() => document.querySelector("#codexWarmList").lastElementChild.id), "warmNowRow");
         assert.equal(await page.locator("#codexWarmList .warm-own").count(), 2);
         const go = row.locator("button");
@@ -92,17 +104,16 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await go.getAttribute("aria-haspopup"), "menu");
         assert.deepEqual(await sideways(page), []);
 
-        await page.mouse.move(220, 400);
-        for (let i = 0; i < 12; i++) { await page.mouse.wheel(0, 400); await page.waitForTimeout(20); }
+        await inEditor(page, go);
         const y = await at(go);
         // two accounts: the press asks which, in the app's menu
         await go.click();
         const menu = page.locator(".proto-menu");
         await menu.waitFor();
         assert.equal((await menu.locator(".pm-head").innerText()).trim(), w.head);
-        assert.deepEqual((await menu.locator(".pm-name").allInnerTexts()).map((s) => s.trim()), ["a@example.com", "B@Example.com"]);
+        assert.deepEqual((await menu.locator(".pm-name").allInnerTexts()).map((s) => s.trim()), [w.all, "a@example.com", "B@Example.com"]);
         assert.deepEqual(asked, [], "the menu opening sent nothing");
-        await menu.locator(".pm-item").nth(1).click();
+        await menu.locator(".pm-item").nth(2).click();
         await page.waitForFunction((s) => document.querySelector("#warmNowSub")?.textContent.startsWith(s), w.done);
         assert.deepEqual(asked, [["codex", "B@Example.com"]], "that account alone, by its name as it is");
         assert.equal(await page.locator("#warmNowSub.err").count(), 0);
@@ -110,7 +121,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
         // refused: the vendor's reason, in red, on the line and in the status
         await go.click();
-        await menu.locator(".pm-item").nth(0).click();
+        await menu.locator(".pm-item").nth(1).click();
         await page.waitForFunction(() => document.querySelector("#warmNowSub.err"));
         assert.equal((await page.locator("#warmNowSub").innerText()).trim(), w.failed + WHY);
         assert.ok((await page.locator("#status").textContent()).includes("usage limit reached"));
@@ -124,10 +135,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.ok(Math.abs(await at(go) - y) <= 1, `a click moved the page: the button went from ${y} to ${await at(go)}`);
         assert.deepEqual(await sideways(page), []);
 
-        // Claude Code's tab: one account, sent at a press
-        await page.locator("#warmTab-claude").click();
-        const crow = page.locator("#claudeWarmNowRow");
+        // Claude Code's editor: one account, sent at a press
+        await openProvPrefs(page, "claude");
+        const crow = page.locator(".editor .prov-prefs #claudeWarmNowRow");
         await crow.locator("button").waitFor();
+        await inEditor(page, crow.locator("button"));
         assert.equal((await crow.locator("button").innerText()).trim(), w.go);
         assert.equal(await crow.locator("button").getAttribute("aria-haspopup"), null);
         await crow.locator("button").click();
@@ -135,6 +147,63 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.deepEqual(asked.at(-1), ["claude", "own@example.com"]);
         assert.equal(asked.length, 3);
         assert.deepEqual(await sideways(page), []);
+
+        // the agy CLI's editor (0Block0_o on X): its account's pools, at a press
+        await openProvPrefs(page, "agy-cli");
+        const arow = page.locator(".editor .prov-prefs #agyWarmNowRow");
+        await arow.locator("button").waitFor();
+        await inEditor(page, arow.locator("button"));
+        assert.equal((await arow.locator("button").innerText()).trim(), w.go);
+        await arow.locator("button").click();
+        await page.waitForFunction((s) => document.querySelector("#agyWarmNowSub")?.textContent.startsWith(s), w.own);
+        assert.deepEqual(asked.at(-1), ["agy-cli", "own@example.com"]);
+        assert.equal(asked.length, 4);
+        assert.deepEqual(await sideways(page), []);
+        assert.equal(await page.locator("select").count(), 0);
+        assert.deepEqual(errors, []);
+      });
+    }
+  }
+
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    const w = W[lang];
+    for (const width of [900, 440]) {
+      // Warm up all (CoderMaurice on X): the menu's first item warms every
+      // Claude account in one press (POST /api/warm-all {agent}), and the
+      // row's line says what each came to: the ones warmed, the ones in a
+      // window already, each refusal with its reason, in red; one turned
+      // off goes unsaid
+      test(`${engine} ${lang} ${width}px: Warm up all warms every account at one press`, async (t) => {
+        const browser = await launch(engine);
+        t.after(() => browser.close());
+        const page = await (await browser.newContext({ viewport: { width, height: 800 }, reducedMotion: "reduce" })).newPage();
+        page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
+        const errors = [], asked = [];
+        page.on("pageerror", (e) => { if (engine === "webkit" && /due to access control checks/.test(e.message)) return; errors.push(e.message); }); // a goto in WebKit can cut off a fetch (#1350)
+        await page.route("**/*", serve(lang, asked, undefined, ALL.map((r) => r.user)));
+        await openProvPrefs(page, "claude");
+        const row = page.locator(".editor .prov-prefs #claudeWarmNowRow"), go = row.locator("button");
+        await go.waitFor();
+        await inEditor(page, go);
+        assert.equal((await go.innerText()).trim(), w.pick);
+        await go.click();
+        const menu = page.locator(".proto-menu");
+        await menu.waitFor();
+        assert.deepEqual((await menu.locator(".pm-name").allInnerTexts()).map((s) => s.trim()), [w.all, ...ALL.map((r) => r.user)]);
+        await menu.locator(".pm-item").first().click();
+        await page.waitForFunction(() => document.querySelector("#claudeWarmNowSub.err"));
+        assert.deepEqual(asked, [["claude", "all"]], "one request for them all, none one by one");
+        const said = (await page.locator("#claudeWarmNowSub").innerText()).trim();
+        const parts = said.split(" · ");
+        assert.equal(parts.length, 3, said);
+        assert.ok(parts[0].startsWith(w.done.replace("B@Example.com", "one@example.com, two@example.com")), said);
+        assert.equal(parts[1], w.running + "busy@example.com");
+        assert.equal(parts[2], w.failed + WHY);
+        assert.ok(!said.includes("off@example.com"), "an account turned off goes unsaid");
+        assert.equal(await go.isDisabled(), false, "pressable again");
+        assert.deepEqual(await sideways(page), []);
+        if (process.env.ARTIFACT_DIR) await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `warm-all-${engine}-${lang}-${width}.png`) });
         assert.equal(await page.locator("select").count(), 0);
         assert.deepEqual(errors, []);
       });
@@ -148,11 +217,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     page.setDefaultTimeout(5000);
     page.setDefaultNavigationTimeout(60000);
     const errors = [];
-    page.on("pageerror", (e) => errors.push(e.message));
+    page.on("pageerror", (e) => { if (engine === "webkit" && /due to access control checks/.test(e.message)) return; errors.push(e.message); }); // a goto in WebKit can cut off a fetch (#1350)
     await page.route("**/*", serve("en", [], undefined, undefined));
-    await page.goto("http://magpie.test/?view=settings&tab=usage");
-    await page.locator("#warmAtSegs .opt").first().waitFor();
+    await openProvPrefs(page, "codex");
+    await page.locator(".editor .prov-prefs #warmAtSegs .opt").first().waitFor();
     assert.equal(await page.locator("#warmNowRow").isHidden(), true);
+    await openProvPrefs(page, "claude");
+    await page.locator(".editor .prov-prefs #claudeWarmAtSegs .opt").first().waitFor();
     assert.equal(await page.locator("#claudeWarmNowRow").isHidden(), true);
     assert.deepEqual(errors, []);
   });

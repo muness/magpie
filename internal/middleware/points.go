@@ -26,7 +26,6 @@ import (
 	"log"
 	"math"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -37,6 +36,7 @@ import (
 
 	"github.com/yetone/magpie/internal/beat"
 	"github.com/yetone/magpie/internal/filememo"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/routes"
 	"github.com/yetone/magpie/internal/usage"
@@ -52,7 +52,7 @@ var (
 	usageQueue = 1024
 )
 
-var strategyName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var strategyName = lazyre.New(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // strat is one strategy a module exports.
 type strat struct {
@@ -195,7 +195,7 @@ func (m *mw) routing(n string) string {
 	return short + "/" + n
 }
 
-var badPrefix = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+var badPrefix = lazyre.New(`[^A-Za-z0-9._-]+`)
 
 // seatJSON is a routes.Seat as a strategy is given it.
 type seatJSON struct {
@@ -362,8 +362,8 @@ func Points() usage.Observer { return &observer{} }
 
 type observer struct {
 	mu      sync.Mutex
-	queue   chan usage.Record
-	using   atomic.Bool // the set served has an onUsage
+	queue   chan *usage.Record // a pointer each: a 1024-row queue of Records held ~1 MB from the start, for every user, with or without an onUsage
+	using   atomic.Bool        // the set served has an onUsage
 	serving *set
 	removes []func()
 }
@@ -384,7 +384,7 @@ func (o *observer) Ledger(r usage.Record) {
 		return
 	}
 	select {
-	case q <- r:
+	case q <- &r:
 	default:
 		for _, m := range s.list {
 			if m.hasUse {
@@ -400,12 +400,13 @@ func (o *observer) Ledger(r usage.Record) {
 // Serve registers the strategies of the modules loaded and keeps them as
 // the modules load again, and gives onUsage its rows, until stop.
 func (o *observer) Serve() (stop func()) {
-	q := make(chan usage.Record, usageQueue)
+	q := make(chan *usage.Record, usageQueue)
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	o.mu.Lock()
 	o.queue = q
 	o.mu.Unlock()
+	live.Store(o)
 	written := filememo.Written() // before the look, so a write made during it isn't missed
 	o.refresh()
 	wg.Add(2)
@@ -443,7 +444,7 @@ func (o *observer) Serve() (stop func()) {
 				if time.Since(priced) > 5*time.Minute {
 					cost, priced = usage.NewCoster(), time.Now()
 				}
-				b, err := json.Marshal(rowOf(r, cost))
+				b, err := json.Marshal(rowOf(*r, cost))
 				if err != nil {
 					continue
 				}
@@ -458,6 +459,7 @@ func (o *observer) Serve() (stop func()) {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
+			live.CompareAndSwap(o, nil)
 			close(done)
 			wg.Wait()
 			o.mu.Lock()
@@ -467,6 +469,10 @@ func (o *observer) Serve() (stop func()) {
 		})
 	}
 }
+
+// live is the observer serving now, which Routings brings up to date
+// before it answers.
+var live atomic.Pointer[observer]
 
 // refresh serves the set in force now, when it isn't served yet.
 func (o *observer) refresh() {
@@ -507,8 +513,14 @@ type Routing struct {
 
 // Routings are the strategies of the modules loaded that this process's
 // router serves now: none while plugins/middleware is off or the gateway
-// isn't served here.
+// isn't served here. The set in force is served first: the observer
+// serves it once it hears the write, so a picker drawn just after a
+// plugin was installed or switched on left its routings out until the
+// page was read again (guhailin3 on X).
 func Routings() []Routing {
+	if o := live.Load(); o != nil {
+		o.refresh()
+	}
 	out := []Routing{}
 	for _, m := range current().list {
 		for _, st := range m.strats {

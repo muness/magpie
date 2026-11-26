@@ -2,6 +2,7 @@ package claudetui
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -117,5 +118,191 @@ func TestTapPutsTheGuardFilesSafeguards(t *testing.T) {
 	}
 	if !ran {
 		t.Skip("neither Bun nor Node is here to run tap.js")
+	}
+}
+
+// effortMain makes requests as Claude Code does in a run started at
+// effort medium, the bridge's guard file rewritten as a turn asks
+// another (#5584).
+const effortMain = `const fs = require("fs");
+const guard = process.argv[process.argv.length - 1];
+const url = "https://api.anthropic.com/v1/messages?beta=true";
+const main = { "x-claude-code-request-class": "main" };
+const body = (extra) => JSON.stringify({ model: "claude-haiku-5-5", messages: [{ role: "user", content: "hi" }], thinking: { type: "adaptive" }, output_config: { effort: "medium" }, ...extra, stream: true });
+(async () => {
+  const s = new Bun.FetchSession();
+  const ask = (headers, b) => s.fetch(url, { method: "POST", headers, body: b });
+  // the run's first turn: as Claude Code made it
+  await ask(main, body({}));
+  // the next turn asks high
+  fs.writeFileSync(guard, JSON.stringify({ effort: "high" }));
+  await ask(main, body({}));
+  // what Claude Code asks beside the turn keeps its own
+  await ask({ "x-claude-code-request-class": "title" }, body({}));
+  // with safeguards beside it, the variable is the extra body alone
+  fs.writeFileSync(guard, JSON.stringify({ effort: "high", safeguards: [{ c: "b" }] }));
+  await ask(main, body({ safeguards: [{ c: "a" }] }));
+  console.log(JSON.stringify({ env: process.env.CLAUDE_CODE_EXTRA_BODY }));
+})();
+`
+
+// #5584: the interactive mode takes another effort only from a person
+// typing /effort, which saves it as the user's default. tap.js asks each
+// of the main turn's requests at the guard file's effort, in
+// output_config.effort, and leaves Claude Code's other requests, and a
+// run whose file has none, as Claude Code made them.
+func TestTapAsksTheGuardFilesEffort(t *testing.T) {
+	ran := false
+	for _, rt := range []string{"bun", "node"} {
+		path, err := exec.LookPath(rt)
+		if err != nil {
+			continue
+		}
+		ran = true
+		t.Run(rt, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, js := range map[string]string{"stub.js": guardStub, "main.js": effortMain, "tap.js": string(tapJS)} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(js), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			guard := filepath.Join(dir, "guard.json")
+			if err := os.WriteFile(guard, []byte(`{}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			pre := "--preload"
+			if rt == "node" {
+				pre = "-r"
+			}
+			cmd := exec.Command(path, pre, filepath.Join(dir, "stub.js"), pre, filepath.Join(dir, "tap.js"), filepath.Join(dir, "main.js"), guard)
+			cmd.Env = append(os.Environ(), tapEnv+"="+filepath.Join(dir, "tap.jsonl"), GuardEnv+"="+guard)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%v: %s", err, out)
+			}
+			var got []map[string]any
+			for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				var m map[string]any
+				if json.Unmarshal([]byte(l), &m) != nil {
+					t.Fatalf("not a line of the stub's: %q\n%s", l, out)
+				}
+				got = append(got, m)
+			}
+			body := func(effort, sg string) string {
+				b := `{"model":"claude-haiku-5-5","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"` + effort + `"}`
+				if sg != "" {
+					b += `,"safeguards":` + sg
+				}
+				return b + `,"stream":true}`
+			}
+			want := []string{body("medium", ""), body("high", ""), body("medium", ""), body("high", `[{"c":"b"}]`)}
+			if len(got) != len(want)+1 {
+				t.Fatalf("told %s", out)
+			}
+			for i, w := range want {
+				if got[i]["body"] != w {
+					t.Fatalf("request %d was sent\n%v\nwant\n%v", i, got[i]["body"], w)
+				}
+			}
+			if env := got[len(got)-1]["env"]; env != `{"safeguards":[{"c":"b"}]}` {
+				t.Fatalf("Claude Code's extra body after: %v", env)
+			}
+			if _, err := os.Stat(guard + ".live"); err != nil {
+				t.Fatalf("the tap never said it asks them: %v", err)
+			}
+		})
+	}
+	if !ran {
+		t.Skip("neither Bun nor Node is here to run tap.js")
+	}
+}
+
+// bigMain makes requests as Claude Code does in a run started with a
+// stand-in for safeguards too large for its environment, then starts a
+// program, as Claude Code starts its MCP servers and tools.
+const bigMain = `const url = "https://api.anthropic.com/v1/messages?beta=true";
+const headers = { "x-claude-code-request-class": "main" };
+const body = (sg) => JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }], safeguards: sg, stream: true });
+(async () => {
+  const s = new Bun.FetchSession();
+  await s.fetch(url, { method: "POST", headers, body: body(JSON.parse(process.env.CLAUDE_CODE_EXTRA_BODY).safeguards) });
+  await s.fetch(url, { method: "POST", headers, body: body(JSON.parse(process.env.CLAUDE_CODE_EXTRA_BODY).safeguards) });
+  let started = "ok";
+  try {
+    require("child_process").execFileSync(process.execPath, ["-e", "0"], { stdio: "ignore" });
+  } catch (e) {
+    started = String(e.code || e.message);
+  }
+  console.log(JSON.stringify({ env: process.env.CLAUDE_CODE_EXTRA_BODY.length, started }));
+})();
+`
+
+// #6848: a long conversation's safeguards grew past what Linux starts a
+// program with (128KiB a variable), and every run given them in
+// CLAUDE_CODE_EXTRA_BODY failed "argument list too long". The run is
+// started with a stand-in; tap.js puts the guard file's whole in each
+// request, and leaves the variable, which whatever Claude Code starts
+// inherits, at StartValueMax or under: the program it starts after
+// starts.
+func TestTapPutsSafeguardsTooLargeForTheEnvironment(t *testing.T) {
+	ran := false
+	for _, rt := range []string{"bun", "node"} {
+		path, err := exec.LookPath(rt)
+		if err != nil {
+			continue
+		}
+		ran = true
+		t.Run(rt, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, js := range map[string]string{"stub.js": guardStub, "main.js": bigMain, "tap.js": string(tapJS)} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(js), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			big := `[{"type":"dangerous_tool_use","classifier_context":"` + strings.Repeat("x", 200<<10) + `"}]`
+			guard := filepath.Join(dir, "guard.json")
+			if err := os.WriteFile(guard, []byte(`{"safeguards":`+big+`}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			pre := "--preload"
+			if rt == "node" {
+				pre = "-r"
+			}
+			cmd := exec.Command(path, pre, filepath.Join(dir, "stub.js"), pre, filepath.Join(dir, "tap.js"), filepath.Join(dir, "main.js"), guard)
+			cmd.Env = append(os.Environ(), tapEnv+"="+filepath.Join(dir, "tap.jsonl"), GuardEnv+"="+guard, `CLAUDE_CODE_EXTRA_BODY={"safeguards":[]}`)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%v: %.2000s", err, out)
+			}
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			if len(lines) != 3 {
+				t.Fatalf("told %.2000s", out)
+			}
+			want := `{"model":"m","messages":[{"role":"user","content":"hi"}],"safeguards":` + big + `,"stream":true}`
+			for i, l := range lines[:2] {
+				var m map[string]any
+				if json.Unmarshal([]byte(l), &m) != nil || m["body"] != want {
+					t.Fatalf("request %d wasn't given the guard file's safeguards: %.300s", i, l)
+				}
+			}
+			var end struct {
+				Env     int
+				Started string
+			}
+			if json.Unmarshal([]byte(lines[2]), &end) != nil || end.Env > StartValueMax || end.Started != "ok" {
+				t.Fatalf("Claude Code's environment after: %s", lines[2])
+			}
+		})
+	}
+	if !ran {
+		t.Skip("neither Bun nor Node is here to run tap.js")
+	}
+}
+
+// tap.js holds the variable it sets to the bound the gateway starts runs
+// with.
+func TestTapHoldsTheStartBound(t *testing.T) {
+	if want := fmt.Sprintf("const envValueMax = %d;", StartValueMax); !strings.Contains(string(tapJS), want) {
+		t.Fatalf("tap.js has no %q", want)
 	}
 }

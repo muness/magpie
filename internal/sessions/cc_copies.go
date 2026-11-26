@@ -73,14 +73,14 @@ func ccFamily(files []file) (copies, branches map[string]string) {
 			continue
 		}
 		st := cache[f.path]
-		if st == nil || st.Root == "" || st.Leaf == "" {
+		if st == nil || st.more().Root == "" || st.more().Leaf == "" {
 			continue
 		}
 		i := len(all)
 		all = append(all, ccOne{f, st})
 		up = append(up, i)
 		in := f.agent + "\x00" + f.m().wsl + "\x00"
-		for _, u := range append([]string{st.Root}, st.Compacts...) {
+		for _, u := range append([]string{st.more().Root}, st.more().Compacts...) {
 			if j, ok := at[in+u]; ok {
 				up[find(i)] = find(j)
 			} else {
@@ -103,13 +103,38 @@ func ccFamily(files []file) (copies, branches map[string]string) {
 	}
 	var out map[string]string
 	used := map[string]bool{}
+	ccFamiliesLoad()
 	for _, g := range groups {
 		if len(g) < 2 {
 			continue
 		}
+		sig := ccGroupSig(g)
+		if kept := ccFamilyKept(sig); kept != nil {
+			// its files still start alike: the uuids read of them stay,
+			// so when one grows the group is judged on what it added,
+			// not on every file of it read whole again (a long session
+			// resumed into copies, each ~100 MB, took seconds a change)
+			for _, o := range g {
+				used[o.f.path] = true
+			}
+			if len(kept.Copies) > 0 {
+				if out == nil {
+					out = map[string]string{}
+				}
+				maps.Copy(out, kept.Copies)
+			}
+			if len(kept.Branches) > 0 {
+				if branches == nil {
+					branches = map[string]string{}
+				}
+				maps.Copy(branches, kept.Branches)
+			}
+			continue
+		}
+		var gc, gb map[string]string // what this group comes to
 		holds := func(b ccOne, uuid string) bool {
 			used[b.f.path] = true
-			return b.st.Leaf == uuid || ccUUIDsOf(*b.f)[uuid]
+			return b.st.more().Leaf == uuid || ccUUIDsOf(*b.f).has(uuid)
 		}
 		// before reports whether b is kept over a: the one that holds
 		// the other's first message too (a copy made after a compaction
@@ -117,7 +142,7 @@ func ccFamily(files []file) (copies, branches map[string]string) {
 		// before), then the newer file, then the later key, so of two
 		// files that hold each other one stays
 		before := func(b, a ccOne) bool {
-			if ab, ba := holds(a, b.st.Root), holds(b, a.st.Root); ab != ba {
+			if ab, ba := holds(a, b.st.more().Root), holds(b, a.st.more().Root); ab != ba {
 				return ba
 			}
 			if c := b.f.mod.Compare(a.f.mod); c != 0 {
@@ -131,10 +156,10 @@ func ccFamily(files []file) (copies, branches map[string]string) {
 				// a file that holds what came before the other's start (a
 				// compaction the fork started after) is not that one's
 				// copy: the conversation's file a fork went on from
-				if i == j || a.f.key == b.f.key || !holds(b, a.st.Leaf) || !holds(b, a.st.Root) {
+				if i == j || a.f.key == b.f.key || !holds(b, a.st.more().Leaf) || !holds(b, a.st.more().Root) {
 					continue
 				}
-				if !holds(a, b.st.Leaf) || before(b, a) {
+				if !holds(a, b.st.more().Leaf) || before(b, a) {
 					hidden[i] = true
 					break
 				}
@@ -147,11 +172,11 @@ func ccFamily(files []file) (copies, branches map[string]string) {
 			// the file it is kept in: one that is not a copy itself and
 			// holds its last message, as the longest of them does
 			for j, b := range g {
-				if !hidden[j] && i != j && holds(b, a.st.Leaf) {
-					if out == nil {
-						out = map[string]string{}
+				if !hidden[j] && i != j && holds(b, a.st.more().Leaf) {
+					if gc == nil {
+						gc = map[string]string{}
 					}
-					out[a.f.key] = b.f.key
+					gc[a.f.key] = b.f.key
 					break
 				}
 			}
@@ -171,12 +196,28 @@ func ccFamily(files []file) (copies, branches map[string]string) {
 			if hidden[i] || i == head || a.f.key == g[head].f.key {
 				continue
 			}
+			if gb == nil {
+				gb = map[string]string{}
+			}
+			gb[a.f.key] = g[head].f.key
+		}
+		ccFamilyKeepOut(sig, gc, gb)
+		if len(gc) > 0 {
+			if out == nil {
+				out = map[string]string{}
+			}
+			maps.Copy(out, gc)
+		}
+		if len(gb) > 0 {
 			if branches == nil {
 				branches = map[string]string{}
 			}
-			branches[a.f.key] = g[head].f.key
+			maps.Copy(branches, gb)
 		}
 	}
+	ccFamiliesSave()
+	ccUUIDSave()
+	ccUUIDPrune()
 	// a file judged here that no longer starts like another lets its
 	// uuids go; another caller's files are left as they are
 	for _, o := range all {
@@ -196,7 +237,7 @@ type ccOne struct {
 // headFirst reports whether a, not b, is the conversation two files that
 // went on apart are of (ccFamily).
 func headFirst(a, b ccOne, holds func(ccOne, string) bool) bool {
-	if ab, ba := holds(a, b.st.Root), holds(b, a.st.Root); ab != ba {
+	if ab, ba := holds(a, b.st.more().Root), holds(b, a.st.more().Root); ab != ba {
 		return ab
 	}
 	ida, idb := strings.TrimPrefix(a.f.key, a.f.agent+":"), strings.TrimPrefix(b.f.key, b.f.agent+":")
@@ -215,7 +256,8 @@ var ccUUIDMemo = map[string]*ccUUIDs{}
 
 type ccUUIDs struct {
 	size, mod, off int64
-	set            map[string]bool
+	set            uuidSet
+	hash           digest // prefixHash of the file up to off
 	// forked is the session its messages say they were copied from
 	// (forkedFrom, which /branch writes on each), "" for none
 	forked string
@@ -235,10 +277,16 @@ var ccForked = []byte(`"forkedFrom":{`)
 
 // ccUUIDsOf is the uuids of the messages in f, read on from where the last
 // read stopped while the file only grew.
-func ccUUIDsOf(f file) map[string]bool {
+func ccUUIDsOf(f file) uuidSet {
 	m := ccUUIDMemo[f.path]
+	if m == nil {
+		// what an earlier start read of it, read on from there
+		if m = ccUUIDKept(f); m != nil {
+			ccUUIDMemo[f.path] = m
+		}
+	}
 	if m == nil || f.size < m.size || f.size == m.size && f.mod.UnixNano() != m.mod {
-		m = &ccUUIDs{set: map[string]bool{}}
+		m = &ccUUIDs{set: uuidSet{}}
 		ccUUIDMemo[f.path] = m
 	}
 	if m.size == f.size && m.mod == f.mod.UnixNano() {
@@ -250,7 +298,7 @@ func ccUUIDsOf(f file) map[string]bool {
 		}
 		r := gjson.GetManyBytes(b, "type", "uuid")
 		if t := r[0].String(); (t == "user" || t == "assistant") && r[1].Type == gjson.String {
-			m.set[r[1].String()] = true
+			m.set.add(r[1].Str)
 			if m.forked == "" && bytes.Contains(b, ccForked) {
 				m.forked = gjson.GetBytes(b, "forkedFrom.sessionId").String()
 			}
@@ -259,6 +307,8 @@ func ccUUIDsOf(f file) map[string]bool {
 	})
 	if err == nil {
 		m.off = off
+		m.hash = prefixHash(f.path, off)
+		ccUUIDDirty[f.path] = true
 	}
 	m.size, m.mod = f.size, f.mod.UnixNano()
 	return m.set
@@ -302,6 +352,11 @@ type ccRestOf struct {
 	keeper      string
 	ksize, kmod int64
 	st          *state
+	// ids is the uuids of the messages st was read from (uuidKey), nil
+	// when not known: while the copy stays as it is and the keeper only
+	// grows, st stands as long as the keeper holds none of them. Kept on
+	// disk with st (cc-rest-ids.bin).
+	ids [][16]byte
 }
 
 // ccRest is the copy's file read for its messages the keeper's file
@@ -317,16 +372,29 @@ func ccRest(copyFile, keeper file) *state {
 		return m.st
 	}
 	held := ccUUIDsOf(keeper)
+	// the keeper only grew (a live session the copies were made of): what
+	// it added is new messages, so the copy's rest is what it was unless
+	// the keeper now holds one of them, and the copy, as large as the
+	// session, is not read again on each turn
+	if m != nil && m.ids != nil && m.size == copyFile.size && m.mod == copyFile.mod.UnixNano() &&
+		m.keeper == keeper.path && keeper.size > m.ksize &&
+		!slices.ContainsFunc(m.ids, func(k [16]byte) bool { _, ok := held[k]; return ok }) {
+		m.ksize, m.kmod = keeper.size, keeper.mod.UnixNano()
+		ccRestKept.dirty = true
+		return m.st
+	}
 	line := parserFor(copyFile.agent).line
 	s := &state{}
+	ids := [][16]byte{}
 	_, err := scanThin(copyFile.path, 0, nil, thinClaude, func(b []byte, _, _ int64) bool {
 		if !bytes.Contains(b, ccUser) && !bytes.Contains(b, ccAssistant) {
 			return true
 		}
 		r := gjson.GetManyBytes(b, "type", "uuid")
-		if t := r[0].String(); t != "user" && t != "assistant" || r[1].Type != gjson.String || held[r[1].String()] {
+		if t := r[0].String(); t != "user" && t != "assistant" || r[1].Type != gjson.String || held.has(r[1].Str) {
 			return true
 		}
+		ids = append(ids, uuidKey(r[1].Str))
 		line(s, b, copyFile.main)
 		return true
 	})
@@ -335,7 +403,8 @@ func ccRest(copyFile, keeper file) *state {
 		// known to be one, until it reads
 		return cache[copyFile.path]
 	}
-	ccRestMemo[copyFile.path] = &ccRestOf{copyFile.size, copyFile.mod.UnixNano(), keeper.path, keeper.size, keeper.mod.UnixNano(), s}
+	ccRestMemo[copyFile.path] = &ccRestOf{copyFile.size, copyFile.mod.UnixNano(), keeper.path, keeper.size, keeper.mod.UnixNano(), s, ids}
+	ccRestKept.dirty = true
 	return s
 }
 
@@ -344,8 +413,13 @@ func ccRest(copyFile, keeper file) *state {
 // the session it ran in and copies none of it, and the copy's own file for
 // what the keeper doesn't hold (ccRest). By the file's path.
 func ccCopyStates(files []file, copies map[string]string) map[string]*state {
+	ccRestLoad()
+	defer ccRestSave()
 	if len(copies) == 0 {
-		clear(ccRestMemo)
+		if len(ccRestMemo) > 0 {
+			clear(ccRestMemo)
+			ccRestKept.dirty = true
+		}
 		return nil
 	}
 	mains := map[string]file{}
@@ -377,6 +451,7 @@ func ccCopyStates(files []file, copies map[string]string) map[string]*state {
 	for p := range ccRestMemo {
 		if out[p] == nil {
 			delete(ccRestMemo, p)
+			ccRestKept.dirty = true
 		}
 	}
 	return out

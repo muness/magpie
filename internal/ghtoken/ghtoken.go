@@ -44,7 +44,7 @@ var Env = []string{"GITHUB_TOKEN", "GH_TOKEN"}
 // set in Settings, none: the user chose that one over the environment's,
 // and the page says requests go without a token till it is replaced.
 func Token() (token, from string) {
-	if t := strings.TrimSpace(settings.Load().GitHubToken); t != "" {
+	if t := strings.TrimSpace(settings.Shared().GitHubToken); t != "" {
 		if isRefused(t) {
 			return "", ""
 		}
@@ -98,7 +98,7 @@ func markSettingsRefused(t string) {
 // that field is changed or magpie restarts, so a stale token costs the user
 // the 5,000 an hour it was for and not every check (#3926).
 func SettingsRefused() (time.Time, bool) {
-	now := strings.TrimSpace(settings.Load().GitHubToken)
+	now := strings.TrimSpace(settings.Shared().GitHubToken)
 	settingsRefused.Lock()
 	defer settingsRefused.Unlock()
 	if settingsRefused.t == "" || now != settingsRefused.t {
@@ -177,9 +177,9 @@ func authorize(req *http.Request, api string) (token, from string) {
 // token: which token it was, never the token itself.
 func Refused() error {
 	_, from := Token()
-	where := "the GitHub token in Settings → Network and sharing"
+	where := "the GitHub token in Settings › Network and sharing"
 	if _, ok := SettingsRefused(); !ok && from != "settings" {
-		where = from + " (no GitHub token is set in Settings → Network and sharing)"
+		where = from + " (no GitHub token is set in Settings › Network and sharing)"
 	}
 	return fmt.Errorf("GitHub refused %s: it may have expired or been revoked", where)
 }
@@ -200,7 +200,7 @@ func (e Limited) Error() string {
 		return "GitHub's rate limit for your GitHub token is used up " + when + "; try again then"
 	}
 	return "GitHub's rate limit for requests without a token (60 an hour) is used up " + when +
-		". Add a GitHub token in Settings → Network and sharing to raise it to 5,000 an hour"
+		". Add a GitHub token in Settings › Network and sharing to raise it to 5,000 an hour"
 }
 
 // LimitedBy is the Limited a refusal of GitHub's says, or false when it

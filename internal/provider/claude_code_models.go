@@ -12,7 +12,9 @@ package provider
 // account is or isn't entitled to; additionalModelCostsCache, their
 // prices. magpie reads them back, as it reads the account's identity from
 // the same file: nothing is asked of Anthropic in Claude Code's name
-// (iebb on Discord: "最好以 claude code 返回为准").
+// (iebb on Discord: "最好以 claude code 返回为准"). Claude Code 2.1.323
+// and later keep the models in a catalog file too (claude_code_catalog.go),
+// read with the .claude.json of the account it names.
 
 import (
 	"encoding/json"
@@ -22,7 +24,6 @@ import (
 	"strings"
 
 	"github.com/yetone/magpie/internal/catalog"
-	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -38,9 +39,20 @@ type claudeCodeModels struct {
 	entitled map[string]bool
 	// prices are Anthropic's, by API id, USD per million tokens
 	prices map[string]catalog.Price
+	// org and account are the oauthAccount's organizationUuid and
+	// accountUuid: whose catalog file goes with this one
+	org, account string
 }
 
-type claudeExtra struct{ id, name string }
+// claudeExtra is a model Claude Code offers; context, output, efforts and
+// images are its catalog's runtime, when the catalog has it, for a model
+// models.dev doesn't describe.
+type claudeExtra struct {
+	id, name        string
+	context, output int
+	efforts         []string
+	images          bool
+}
 
 func parseClaudeCodeModels(b []byte) (claudeCodeModels, error) {
 	var raw struct {
@@ -61,11 +73,15 @@ func parseClaudeCodeModels(b []byte) (claudeCodeModels, error) {
 			Write1h   *float64 `json:"promptCacheWrite1hTokens"`
 			CacheRead float64  `json:"promptCacheReadTokens"`
 		} `json:"additionalModelCostsCache"`
+		Account struct {
+			Org     string `json:"organizationUuid"`
+			Account string `json:"accountUuid"`
+		} `json:"oauthAccount"`
 	}
 	if err := json.Unmarshal(b, &raw); err != nil {
 		return claudeCodeModels{}, err
 	}
-	out := claudeCodeModels{at: raw.At}
+	out := claudeCodeModels{at: raw.At, org: strings.TrimSpace(raw.Account.Org), account: strings.TrimSpace(raw.Account.Account)}
 	seen := map[string]bool{}
 	for _, o := range raw.Options {
 		if o.Value == nil || o.Disabled {
@@ -76,7 +92,7 @@ func parseClaudeCodeModels(b []byte) (claudeCodeModels, error) {
 			continue
 		}
 		seen[id] = true
-		out.extra = append(out.extra, claudeExtra{id, strings.TrimSpace(o.Label)})
+		out.extra = append(out.extra, claudeExtra{id: id, name: strings.TrimSpace(o.Label)})
 	}
 	for _, a := range raw.Access {
 		if id := claudeAPIID(a.APIName); id != "" && a.Entitled != nil {
@@ -122,15 +138,30 @@ func claudeAPIID(v string) string {
 	return v
 }
 
+// readClaudeCodeModels is what the .claude.json at path and its
+// account's model catalog say: a file that doesn't parse now is what it
+// said last.
 func readClaudeCodeModels(path string) (claudeCodeModels, bool) {
-	m, err := filememo.Read("claude models", path, parseClaudeCodeModels)
-	return m, err == nil
+	m, ok := readKeepingGood("claude models", path, parseClaudeCodeModels)
+	if !ok {
+		return m, false
+	}
+	if c, ok := claudeCatalogOf(path, m.org, m.account); ok {
+		m = m.withCatalog(c)
+	}
+	return m, true
 }
 
 // claudeCodeFiles are the state files of every Claude Code magpie knows of
 // an account in: the one Claude Code itself is signed in to, then each
-// saved account's own config directory (claude_dirs.go).
+// saved account's own config directory (claude_dirs.go). Listed once
+// while a request holds the catalog: each Claude model's price asked for
+// them, so a build of an agent's models read the folder once per model.
 func claudeCodeFiles() []string {
+	return slices.Clip(heldOf("claude code files", listClaudeCodeFiles))
+}
+
+func listClaudeCodeFiles() []string {
 	if settings.AccountDiscoveryOff() {
 		return nil
 	}
@@ -191,6 +222,16 @@ func claudeModels() []catalog.Model {
 			have[x.id] = true
 			m := catalog.Describe(x.id, x.name)
 			m.Provider = "anthropic"
+			if m.Context == 0 {
+				m.Context = x.context
+			}
+			if m.Output == 0 {
+				m.Output = x.output
+			}
+			if len(m.Efforts) == 0 && len(x.efforts) > 0 {
+				m.Efforts, m.Reasoning = slices.Clone(x.efforts), true
+			}
+			m.Images = m.Images || x.images
 			if p, ok := cm.prices[x.id]; ok {
 				m.Price = &p
 			}
@@ -208,8 +249,16 @@ func claudeModels() []catalog.Model {
 
 // claudeLists says whether the Claude account user has model, as its
 // Claude Code was told: a model it isn't entitled to is left out, and one
-// it offers or models.dev lists for every account is in. ok is false when
-// no Claude Code of the account has said.
+// it offers or models.dev lists for every account is in. A gated model
+// models.dev doesn't list for every account (Claude Mythos 5.2), which
+// another account's Claude Code offers, is the accounts' whose Claude Code
+// offers it: Claude Code names only the gated models an account has,
+// never the ones it lacks, so an account saying nothing of it is one
+// without it, asked only after the ones that have it (AccountsFor), not
+// first, to answer 404 "may not have access to it" (ZacharyZhang on X).
+// A model no account's Claude Code offers, nor models.dev lists (its list
+// not read yet), is unknown, and taken to be listed. ok is false when no
+// Claude Code of the account has said.
 func claudeLists(user, model string) (has, ok bool) {
 	cm, found := claudeModelsOf(user)
 	if !found {
@@ -221,6 +270,19 @@ func claudeLists(user, model string) (has, ok bool) {
 	}
 	if e, said := cm.entitled[id]; said {
 		return e, true
+	}
+	offers := func(cm claudeCodeModels) bool {
+		return slices.ContainsFunc(cm.extra, func(x claudeExtra) bool { return x.id == id })
+	}
+	if offers(cm) || slices.ContainsFunc(catalog.ProviderShared("anthropic"), func(m catalog.Model) bool {
+		return strings.EqualFold(m.ID, id)
+	}) {
+		return true, true
+	}
+	for _, f := range claudeCodeFiles() {
+		if other, ok := readClaudeCodeModels(f); ok && offers(other) {
+			return false, true
+		}
 	}
 	return true, true
 }

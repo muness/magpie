@@ -43,6 +43,15 @@ func WithRoute(ctx context.Context, route string) context.Context {
 	return context.WithValue(ctx, routeKey{}, route)
 }
 
+type forcedKey struct{}
+
+// WithForced is ctx for masking a request a gateway key holds to masking
+// (access.RedactOn) whatever the settings say: where they mask nothing it
+// is masked for secrets and personal data by the defaults.
+func WithForced(ctx context.Context) context.Context {
+	return context.WithValue(ctx, forcedKey{}, true)
+}
+
 // optionsCtx is options with the model's wait ending with ctx, for the
 // route ctx has (WithRoute).
 func optionsCtx(ctx context.Context) redact.Options {
@@ -50,14 +59,22 @@ func optionsCtx(ctx context.Context) redact.Options {
 	o := redact.Options{Secrets: st.Redact, Personal: st.RedactPersonal, Kinds: st.RedactKinds, Words: st.RedactWords, WordsAnyCase: st.RedactWordsAnyCase, WordsWhole: st.RedactWordsWhole, Rules: st.RedactRules,
 		Actions: st.RedactActions, Allow: st.RedactAllow, Shape: st.RedactShape}
 	o.Route, _ = ctx.Value(routeKey{}).(string)
+	if forced, _ := ctx.Value(forcedKey{}).(bool); forced && !Wanted(st) {
+		o.Secrets, o.Personal = true, true
+		st.Redact, st.RedactPersonal = true, true
+	}
 	if (st.Redact || st.RedactPersonal) && ModelWanted(st) {
 		// until the model is on disk the rules mask alone, and nothing is
-		// held back for a download (it is started here)
-		if m := picked(st); m.Installed() {
+		// held back for a download (it is started here); a plugin's model
+		// whose plugin is off or whose files are gone is the same, with
+		// nothing to download (Settings → Privacy says so)
+		m := picked(st)
+		if m.Installed() {
 			o.MinScore = pii.Threshold(st.RedactModelScore, m)
 			o.Model = model(ctx, m, o.MinScore, st.RedactModel)
+			o.ModelGeneration = m.Generation()
 			o.NamesByModel = m.ID() == pii.AstrLinkGuard
-		} else {
+		} else if m.ManagesWeights() {
 			fetch(m, st.RedactModel)
 		}
 	}
@@ -80,14 +97,7 @@ func ModelWanted(st settings.Settings) bool {
 }
 
 // onDisk says a local model is downloaded; a var for tests.
-var onDisk = func() bool {
-	for _, m := range pii.Models() {
-		if m.Installed() {
-			return true
-		}
-	}
-	return false
-}
+var onDisk = pii.ManagedModelInstalled
 
 // fetched is when fetch last started each model's download, by id, so a
 // failed one is tried again an hour later rather than on every request.
@@ -147,7 +157,7 @@ func toGuard() {
 	}
 	g := pii.Of(pii.AstrLinkGuard)
 	g.Download(func() {
-		if settings.Load().RedactModelName == "" && settings.UseRedactModel(pii.AstrLinkGuard) == nil {
+		if settings.Shared().RedactModelName == "" && settings.UseRedactModel(pii.AstrLinkGuard) == nil {
 			pii.Of(pii.PrivacyFilter).Stop()
 			g.Warm()
 		}
@@ -179,11 +189,38 @@ var defaultWait = 2 * time.Second
 // the same history, finds it. A var for tests.
 var strictWait = 15 * time.Second
 
+// behind is when a request last ran out its strictWait with text of its
+// own the model hadn't read (0: none since one was read in full). The
+// model is behind then, on a CPU too slow for what the agents send, and
+// every request waited all of strictWait for it: on Windows, with
+// AstrLink Guard turned on, each request sat 15s, one after another
+// (vsoullai on X, #4856). For behindAge after, or until a request is read
+// in full, a request waits defaultWait, as the model on by default does:
+// what it read is masked with its finds and the rest by the rules, so
+// nothing the rules mask goes as written, and what it reads meanwhile is
+// kept for the next turn.
+var behind atomic.Int64
+
+const behindAge = time.Minute
+
+// waitFor is how long a request waits for the model: strictWait when the
+// user turned it on, unless it is behind.
+func waitFor(strict bool) time.Duration {
+	if !strict {
+		return defaultWait
+	}
+	if t := behind.Load(); t != 0 && time.Since(time.Unix(0, t)) < behindAge {
+		return min(defaultWait, strictWait)
+	}
+	return strictWait
+}
+
 // model is the local model m (internal/pii) as redact's Model, keeping
 // what it is at least min sure of, waited for until ctx ends or the wait
 // runs out: defaultWait for the model on by default, strictWait for one
-// the user turned on (strict), from now. A wait that runs out, or a ctx
-// that ends, keeps what the model had read of the texts by then (a
+// the user turned on (strict) unless it is behind (waitFor), from now. A
+// wait that runs out, or a ctx that ends, keeps what the model had read
+// of the texts by then (a
 // pii.Partial), and the rules mask the rest alone. A model that fails
 // (didn't load, isn't on disk, held back after a failure) panics where
 // the user turned it on, and the request is held back (gwmw.Safely)
@@ -191,10 +228,7 @@ var strictWait = 15 * time.Second
 // model's, and it is broken, not busy. On by default, it finds nothing
 // then: the rules mask alone.
 func model(ctx context.Context, m pii.Model, min float64, strict bool) redact.Model {
-	wait := defaultWait
-	if strict {
-		wait = strictWait
-	}
+	wait := waitFor(strict)
 	by := time.Now().Add(wait)
 	return func(texts []string) [][]redact.Found {
 		if !strict {
@@ -208,6 +242,11 @@ func model(ctx context.Context, m pii.Model, min float64, strict bool) redact.Mo
 		switch {
 		case errors.As(err, &p):
 			notePartial(p, wait)
+			if strict && p.Missing > 0 && errors.Is(p.Err, context.DeadlineExceeded) {
+				// its own text wasn't read in time (not only a backlog
+				// sent before, nor a client that went away)
+				behind.Store(time.Now().UnixNano())
+			}
 			if len(got) != len(texts) {
 				got = make([][]redact.Found, len(texts))
 			}
@@ -215,6 +254,10 @@ func model(ctx context.Context, m pii.Model, min float64, strict bool) redact.Mo
 			panic(err)
 		case err != nil:
 			return make([][]redact.Found, len(texts))
+		default:
+			if strict {
+				behind.Store(0)
+			}
 		}
 		out := make([][]redact.Found, len(got))
 		for i, fs := range got {

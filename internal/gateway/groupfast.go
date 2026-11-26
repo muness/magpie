@@ -45,7 +45,7 @@ func fastPick(cands []candidate, pl planned, providerID, model string, ultra boo
 	for _, ws := range [][]Weighed{pl.order, pl.left} {
 		for i, w := range ws {
 			if w.Provider == providerID && w.Model == model {
-				ws[i].Fast = true
+				ws[i].Fast, ws[i].Ultra = true, ultra
 			}
 		}
 	}
@@ -65,6 +65,21 @@ func withOwnFast(ctx context.Context) context.Context {
 func isOwnFast(ctx context.Context) bool {
 	v, _ := ctx.Value(ownFastKey{}).(bool)
 	return v
+}
+
+// extraUltra reports whether p's extra body asks for Ultrafast itself
+// (provider.ExtraTier), which a member or pick sent fast on it is sent at.
+func extraUltra(p provider.Provider) bool {
+	tier, _ := p.ExtraTier()
+	return tier == "ultrafast"
+}
+
+// chatNoUltra reports whether a Chat Completions request goes to p on
+// OpenAI's own API, which answers service_tier "ultrafast" there with 400
+// "Invalid service_tier argument" (11-18), on every model; its Responses
+// take it (provider.OpenAIUltra).
+func chatNoUltra(p provider.Provider) bool {
+	return p.Chat != "" && provider.HostOf(p.Chat) == "api.openai.com"
 }
 
 // ultraKey marks a try of a pick sent Ultrafast (#1954) from an agent on

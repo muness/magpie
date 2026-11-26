@@ -63,6 +63,7 @@ func newPrefixHarness(t *testing.T) *prefixHarness {
 if [ "$1" = auth ]; then echo '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","email":"lead@example.com","subscriptionType":"max"}'; exit 0; fi
 log=`+logs+`/$$
 echo "args $*" > $log
+echo "ttl ${CLAUDE_CODE_PROMPT_CACHE_TTL-unset}" >> $log
 helper=$(printf '%s\n' "$@" | grep -o '"claude-mcp-helper","[^"]*","[^"]*"' | head -1)
 cb=$(cat "$(printf '%s' "$helper" | sed 's/^"claude-mcp-helper","//; s/",".*//')")
 cp "$(printf '%s' "$helper" | sed 's/.*","//; s/"$//')" `+logs+`/$$.tools
@@ -327,6 +328,7 @@ exec "$claude" "$@"
 func TestClaudeInteractiveSideQuestionBranchesBeforeIt(t *testing.T) {
 	h := newPrefixHarness(t)
 	h.interactive()
+	pickFiveMinutes(t)
 	tools := `"tools":` + prefixTools + `,`
 	first, _ := h.ask(tools, `[`+rmsg("user", "fix the bug")+`]`)
 	pid := answerPID(t, first)
@@ -354,6 +356,8 @@ func TestClaudeInteractiveSideQuestionBranchesBeforeIt(t *testing.T) {
 	if got, _ := h.ask(tools, `[`+conv+`,`+rmsg("user", "push it")+`]`); got != "pid "+branch+" had 4 turn 2" {
 		t.Fatalf("the turn after: %q", got)
 	}
+	// the branch keeps the 5m cache its run had (everyRunKept5m)
+	everyRunKept5m(t, h.logs)
 }
 
 // sleepy_shibe (magpie 0.1.2906, Claude Code 2.1.318): the interactive
@@ -584,6 +588,14 @@ func TestClaudeCutReplyKeepsTheWholeReply(t *testing.T) {
 		`{"parentUuid":"u2","isSidechain":false,"userType":"external","cwd":"/w","sessionId":"S","version":"2.1.318","message":{"id":"msg_01C","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"run the tests"}],"stop_reason":"end_turn"},"requestId":"req_3","type":"assistant","uuid":"a4","timestamp":"2026-11-03T10:00:08.000Z"}`,
 	}
 	lines := strings.Join(rows, "\n") + "\n"
+	partial := strings.Join(rows[:5], "\n") + "\n"
+	if end := cutAfterReply([]byte(partial), "msg_01B", true); end >= 0 {
+		t.Fatalf("accepted an incomplete reply at %d", end)
+	}
+	complete := partial + rows[5] + "\n"
+	if end := cutAfterReply([]byte(lines), "msg_01B", true); end != len(complete) {
+		t.Fatalf("completed reply ends at %d, want %d", end, len(complete))
+	}
 	if err := os.WriteFile(filepath.Join(dir, "S.jsonl"), []byte(lines), 0o600); err != nil {
 		t.Fatal(err)
 	}

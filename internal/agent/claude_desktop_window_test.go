@@ -147,12 +147,15 @@ func TestClaudeDesktopContextWindow(t *testing.T) {
 	if err := a.Sync(); err != nil || budget("w/small.v2") != "" || !strings.Contains(readFile(path), ids["v/grok"]) {
 		t.Fatalf("after w/small.v2 went: %v %s", err, readFile(path))
 	}
-	// the user's own entry for a model, and a window of their own past the
-	// model's, which holds the largest to it
+	// the user's own entry for a model is theirs. Grok's 256K is listed by
+	// its "[1m]" id (Desktop's 200K held it otherwise, RQuantum198888 on
+	// X), which runs at 1M whatever the largest says, so "auto" past its
+	// window doesn't hold the largest to it (claudePlan does for a model
+	// listed by its plain id: TestClaudePlan)
 	if err := edit.SetJSON(path, edit.KV{Path: budgetPath(ids["v/grok"]), Value: "auto"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Sync(); err != nil || window() != "256000" || budget("v/grok") != "auto" {
+	if err := a.Sync(); err != nil || window() != "1000000" || budget("v/grok") != "auto" {
 		t.Fatalf("the user's grok entry: window %q grok %q %v", window(), budget("v/grok"), err)
 	}
 	if err := edit.SetJSON(path, edit.KV{Path: budgetPath(ids["v/grok"]), Value: 100000}); err != nil {
@@ -486,5 +489,85 @@ func TestClaudeDesktopWSLContextWindow(t *testing.T) {
 	}
 	if window() != "" || get("env."+claudeCapsEnv) != "" || get("modelSettings") != "" || get("theme") != "light" {
 		t.Fatalf("Desktop off: %s", readFile(distroSettings))
+	}
+}
+
+// TestClaudeDesktopLongestRunsTo1M (henglu486729 on X, Windows Desktop
+// 5.1231.2): Only each model's largest window lists a 1M model by its 1M
+// id, and Full window off held it to the working window (272K) under
+// modelSettings' top-level autoCompactWindow, so the 1M entry compacted and
+// showed 272K. It runs to its 1M; a model beside it listed plain, and one
+// whose threshold the user typed, keep theirs.
+func TestClaudeDesktopLongestRunsTo1M(t *testing.T) {
+	home, path := desktopWindowSandbox(t)
+	if err := provider.SetHiddenModels("claude-desktop", []string{"v/grok", "v/plain", "v/claude-opus-4-6"}); err != nil {
+		t.Fatal(err)
+	}
+	s := settings.Load()
+	s.DesktopLongest = true
+	if err := settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	a := claude(home)
+	if err := a.Field("model").Set("v/plain"); err != nil {
+		t.Fatal(err)
+	}
+	if err := claudeDesktop(home).Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]string{}
+	for _, e := range provider.Catalog() {
+		ids[e.ID] = gateway.DesktopID(e)
+	}
+	budget := func(ref string) string { v, _ := edit.GetJSON(path, budgetPath(ids[ref])); return v }
+	if budget("v/glm") != "1000000" || budget("v/gpt") != "" {
+		t.Fatalf("glm %q gpt %q: %s", budget("v/glm"), budget("v/gpt"), readFile(path))
+	}
+	if v, _ := edit.GetJSON(path, "autoCompactWindow"); v != "272000" {
+		t.Fatalf("top-level %q: a model without an entry keeps the working window", v)
+	}
+	// a threshold typed for every model is theirs
+	s.CompactAt = 400000
+	if err := settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if top, _ := edit.GetJSON(path, "autoCompactWindow"); budget("v/glm") != "" || top != "400000" {
+		t.Fatalf("typed 400K: glm %q top %q: %s", budget("v/glm"), top, readFile(path))
+	}
+}
+
+// RQuantum198888 on X: a GPT set to its most, 872K, still showed 200K in
+// Claude. Claude Desktop 5.11492 starts its Code tab's Claude Code with
+// CLAUDE_CODE_MAX_CONTEXT_TOKENS=200000 in flag settings, before the
+// 872000 magpie writes, so a model listed by its plain id runs at 200K.
+// Claude Code takes a "[1m]" id for 1M over that, so the model is listed
+// by it (DesktopListed1M), with Only each model's largest window off too,
+// and compacts at the 872K the user set through its own autoCompactWindow.
+func TestClaudeDesktopMidWindowRunsPast200K(t *testing.T) {
+	home, path := desktopWindowSandbox(t)
+	if err := provider.Save(provider.Provider{ID: "w", Name: "W", Key: "k", Chat: "http://127.0.0.1:1/v1",
+		Models: []string{"gpt-6"}, Contexts: map[string]int{"gpt-6": 872000}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.SaveLive("w", "http://127.0.0.1:1/v1", []catalog.Model{{ID: "gpt-6", Context: 272000}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := claudeDesktop(home).Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	var e provider.Entry
+	for _, x := range provider.Catalog() {
+		if x.ID == "w/gpt-6" {
+			e = x
+		}
+	}
+	if e.Context != 872000 || !gateway.DesktopListed1M(e) {
+		t.Fatalf("w/gpt-6 at %d, listed by its [1m] id: %v", e.Context, gateway.DesktopListed1M(e))
+	}
+	if v, _ := edit.GetJSON(path, budgetPath(gateway.DesktopID(e))); v != "872000" {
+		t.Fatalf("w/gpt-6 (%s) compacts at %q, want 872000: %s", gateway.DesktopID(e), v, readFile(path))
 	}
 }

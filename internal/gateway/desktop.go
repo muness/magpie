@@ -1,14 +1,12 @@
 package gateway
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,6 +16,7 @@ import (
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/desktopdir"
 	"github.com/yetone/magpie/internal/lastgood"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -34,8 +33,8 @@ import (
 // Anthropic model") and on the model a session is started with, so
 // anthropic/deepseek/deepseek-flash is turned away for its "deepseek".
 var (
-	desktopDenied = regexp.MustCompile(`ark-code|astron|command-r|deepseek|doubao|gemini|gemma|glm|gpt|grok|hermes|hy3|kimi|lfm|\bling\b|llama|longcat|mimo|minimax|mistral|mixtral|moonshot|nemotron|openai|phi-|qianfan|qwen|tc-code|\bunic\b|yi-|stepfun|step-3|seed-|bytedance|hunyuan|granite|amazon\.nova|nova-|devstral|ministral|ernie|codex|arcee|trinity|abab|phi\d|\bk2\.|\bm2\.|jamba|arctic|solar|mercury|zamba|kat-coder|\bds-|dpsk`)
-	desktopTier   = regexp.MustCompile(`^(sonnet|opus|haiku|fable|mythos)(-[\d.]+)?$`)
+	desktopDenied = lazyre.New(`ark-code|astron|command-r|deepseek|doubao|gemini|gemma|glm|gpt|grok|hermes|hy3|kimi|lfm|\bling\b|llama|longcat|mimo|minimax|mistral|mixtral|moonshot|nemotron|openai|phi-|qianfan|qwen|tc-code|\bunic\b|yi-|stepfun|step-3|seed-|bytedance|hunyuan|granite|amazon\.nova|nova-|devstral|ministral|ernie|codex|arcee|trinity|abab|phi\d|\bk2\.|\bm2\.|jamba|arctic|solar|mercury|zamba|kat-coder|\bds-|dpsk`)
+	desktopTier   = lazyre.New(`^(sonnet|opus|haiku|fable|mythos)(-[\d.]+)?$`)
 	desktopWords  = []string{"claude", "sonnet", "opus", "haiku", "fable", "mythos", "anthropic"}
 )
 
@@ -70,7 +69,7 @@ func desktopAccepts(id string) bool {
 // request that names no build at all, as the Code tab's Claude Code
 // ("claude-cli/… (external, claude-desktop)", known by its key) whose
 // ids are mythos-magpie-<n> already.
-var desktopUAVersion = regexp.MustCompile(` Claude/(\d+)`)
+var desktopUAVersion = lazyre.New(` Claude/(\d+)`)
 
 func desktopKnowsMythos(ua string) bool {
 	m := desktopUAVersion.FindStringSubmatch(ua)
@@ -123,8 +122,8 @@ const (
 // desktopClaude is a model id that is Anthropic's own Claude model, as tIt
 // knows it: claude-<tier>-<version>, a date taken off.
 var (
-	desktopClaude = regexp.MustCompile(`^claude-(?:opus|sonnet|haiku|fable|mythos)-\d+(?:-\d+)?$`)
-	desktopDated  = regexp.MustCompile(`-\d{8}$`)
+	desktopClaude = lazyre.New(`^claude-(?:opus|sonnet|haiku|fable|mythos)-\d+(?:-\d+)?$`)
+	desktopDated  = lazyre.New(`-\d{8}$`)
 )
 
 func aliasNumber(id string) string {
@@ -218,7 +217,7 @@ func DesktopNumber(e provider.Entry) string {
 // shown a reasoning-level model by its plain alias instead of the picker
 // one, which such a build would drop whole (#2426).
 func desktopModels(entries []provider.Entry, knowsMythos bool) []map[string]any {
-	names := desktopNames(entries)
+	names := desktopNames("claude-desktop", entries)
 	// the tier each model stands in for: the user's pick only (a model
 	// picked for two is tagged with the first, desktopTierTurn sends the
 	// other). A Claude model is never tagged with its own tier unasked:
@@ -228,8 +227,8 @@ func desktopModels(entries []provider.Entry, knowsMythos bool) []map[string]any 
 	// Untagged, Claude Code asks for its own id of the tier, which
 	// desktopTurn keeps on the chat's provider (servedBeside).
 	tierOf := desktopTierOf(DesktopTiers())
-	longest := settings.Load().DesktopLongest
-	labels := provider.Labels(entries)
+	longest := settings.Shared().DesktopLongest
+	labels := provider.LabelsFor("claude-desktop", entries)
 	data := make([]map[string]any, 0, len(entries))
 	for i, e := range entries {
 		m := modelObject(e)
@@ -242,7 +241,7 @@ func desktopModels(entries []provider.Entry, knowsMythos bool) []map[string]any 
 		var said []string
 		if desktopListed1M(e, longest) {
 			m["id"] = m["id"].(string) + "[1m]"
-			said = append(said, desktop1MSaid)
+			said = append(said, desktopWindowSaid(e))
 		}
 		if by := desktopSaidBy(e, labels[i]); by != "" {
 			said = append(said, by)
@@ -278,13 +277,45 @@ func desktopModels(entries []provider.Entry, knowsMythos bool) []map[string]any 
 const desktop1M = 1_000_000
 
 // desktopListed1M says e is listed to Claude Desktop by its "[1m]" id,
-// longest being settings.DesktopLongest.
-func desktopListed1M(e provider.Entry, longest bool) bool { return longest && e.Context >= desktop1M }
+// longest being settings.DesktopLongest: a model of 1M or more under
+// it, and one past 200K and under 1M that isn't Claude's always
+// (desktopMidWindow).
+func desktopListed1M(e provider.Entry, longest bool) bool {
+	return longest && e.Context >= desktop1M || desktopMidWindow(e)
+}
+
+// desktop200K is the window Claude Desktop 5.11492 starts its Code tab's
+// Claude Code with (CLAUDE_CODE_MAX_CONTEXT_TOKENS=200000 in its
+// --settings file, Fcn in its app.asar), which comes before the one magpie
+// writes to ~/.claude/settings.json.
+const desktop200K = 200_000
+
+// desktopMidWindow says e's window is past Desktop's 200K and under 1M,
+// so by its plain id it ran at 200K whatever the user set (872K on a GPT,
+// RQuantum198888 on X), and Desktop offers no 1M entry for it. Claude
+// Code 2.1.326 takes a "[1m]" id for 1M over that 200K (peo in aV), so it
+// is listed by that id and compacts within its own window, the
+// modelSettings.<id>.autoCompactWindow magpie writes for it (claudePlan),
+// described by its real size (desktopWindowSaid). A Claude model has its
+// own window in Claude Code and keeps its id.
+func desktopMidWindow(e provider.Entry) bool {
+	return e.Context > desktop200K && e.Context < desktop1M && claudeModel(e) == ""
+}
+
+// desktopWindowSaid is the description of a row listed by its "[1m]" id:
+// Desktop's own for its 1M entry (desktop1MSaid), or the model's real
+// window, "872K context window", for one under 1M.
+func desktopWindowSaid(e provider.Entry) string {
+	if e.Context >= desktop1M {
+		return desktop1MSaid
+	}
+	return strconv.Itoa((e.Context+500)/1000) + "K context window"
+}
 
 // DesktopListed1M says Claude Desktop is shown e by its "[1m]" id, which
 // its Code tab hands Claude Code, so a session on it has the 1M window.
 func DesktopListed1M(e provider.Entry) bool {
-	return desktopListed1M(e, settings.Load().DesktopLongest)
+	return desktopListed1M(e, settings.Shared().DesktopLongest)
 }
 
 // desktop1MSaid is the description Claude Desktop gives the 1M entry it
@@ -396,15 +427,36 @@ func claudeTier(id string) string {
 // Desktop's Claude Code asked for by Claude Code's own id, which magpie
 // doesn't serve: a subagent on a tier no model is tagged for, or on one a
 // model picked for two tiers isn't tagged with. "" when there is none.
+//
+// magpie's own id for a Claude model it listed Desktop that names no model
+// now (aliased: its provider removed, or its list without the model, and
+// the model no tier's pick) still says which Claude model the session is
+// on, and so its tier (aliasClaude). It went to the model the last turn of
+// any Desktop session ran on (movedGone): another provider's model for a
+// chat on Copilot's Opus, while another chat ran on that model (mdwsk88).
 func desktopTierTurn(asked string) string {
 	if !unserved(asked) || strings.Contains(asked, "/") {
 		return ""
 	}
 	t := claudeTier(asked)
 	if t == "" {
+		t = claudeTier(aliasClaude(asked))
+	}
+	if t == "" {
 		return ""
 	}
 	return DesktopTiers()[t]
+}
+
+// aliasClaude is the Claude model magpie's own id for one names
+// (claudeLooking: magpie-<n>.anthropic.claude-opus-5-5, with or without
+// Claude Code's "[1m]"), as Desktop's IC reads it; "" for any other id.
+func aliasClaude(id string) string {
+	if !magpieAliasAsked(id) || !strings.HasPrefix(id, "magpie-") {
+		return ""
+	}
+	_, m, _ := strings.Cut(strings.TrimSuffix(id, "[1m]"), desktopClaudeInfix)
+	return m
 }
 
 // desktopTierAsked says asked is the model the user picked for one of
@@ -424,25 +476,43 @@ func desktopTierAsked(asked string) bool {
 	return false
 }
 
-// desktopNames are the names Claude Desktop is shown entries by, in order:
+// desktopNames are the names Claude Desktop (or Claude Science, agent) is
+// shown entries by, in order:
 // as the agents' lists name them (provider.Labels, the Provider in model
 // names setting: on, every name with its provider's after it; own, a name
 // the user gave just as they wrote it; off, names plain — but two of one
 // name keep their provider's, so they stay apart), and where that still
-// leaves two alike (one provider's models named alike) the whole catalog id
-// after it, for Desktop's menu shows the name alone.
-func desktopNames(entries []provider.Entry) []string {
-	out := provider.Labels(entries)
-	same := map[string]int{}
-	for _, s := range out {
-		same[strings.ToLower(s)]++
+// leaves two alike (one provider's models named alike) the model's own id
+// after it, short as the name already says the provider, or the whole
+// catalog id where that is still not enough (two providers of one name),
+// for Desktop's menu shows the name alone.
+func desktopNames(agent string, entries []provider.Entry) []string {
+	out := provider.LabelsFor(agent, entries)
+	count := func(names []string) map[string]int {
+		same := map[string]int{}
+		for _, s := range names {
+			same[strings.ToLower(s)]++
+		}
+		return same
 	}
+	same := count(out)
+	short := slices.Clone(out)
 	for i, e := range entries {
 		if same[strings.ToLower(out[i])] > 1 {
-			out[i] += " (" + e.ID + ")"
+			model := e.ID
+			if e.Provider != nil {
+				model = strings.TrimPrefix(e.ID, e.Provider.ID+"/")
+			}
+			short[i] = out[i] + " (" + model + ")"
 		}
 	}
-	return out
+	still := count(short)
+	for i, e := range entries {
+		if short[i] != out[i] && still[strings.ToLower(short[i])] > 1 {
+			short[i] = out[i] + " (" + e.ID + ")"
+		}
+	}
+	return short
 }
 
 // aliased is the catalog id an alias Claude Desktop was given stands for:
@@ -459,6 +529,40 @@ func aliased(id string) (string, bool) {
 	for _, e := range provider.CatalogOf("claude-desktop") {
 		if aliasNumber(e.ID) == number {
 			return e.ID, true
+		}
+	}
+	// a model listed once more for a tier after the first it is picked
+	// for (desktopTierAlias), by whichever tier, so a session saved on it
+	// is served after the picks change too
+	for _, e := range provider.CatalogOf("claude-desktop") {
+		for _, t := range DesktopTierNames {
+			if aliasNumber(desktopTierKey(e.ID, t)) == number {
+				return e.ID, true
+			}
+		}
+	}
+	// a model picked for one of Desktop's tiers that the catalog leaves
+	// out for now: its provider's list came back without it (Copilot's
+	// /models answered without its Claude models for an hour, mdwsk88),
+	// it was refused a while (copilotRefuses), or its picks wait for it.
+	// A session on it still names it, and it is still the user's pick: it
+	// is that model, sent to its provider as asked, not a model magpie
+	// doesn't serve, which went to the model another Desktop session ran
+	// on last (desktopMoveTo's movedGone). A group is listed while it is
+	// there, and one deleted goes nowhere (#6719), so a group's id is no
+	// pick here. A later tier's number is read by whichever tier, as the
+	// catalog's is above.
+	for _, id := range DesktopTiers() {
+		if id == "" || provider.IsGroupRef(id) {
+			continue
+		}
+		if aliasNumber(id) == number {
+			return id, true
+		}
+		for _, t := range DesktopTierNames {
+			if aliasNumber(desktopTierKey(id, t)) == number {
+				return id, true
+			}
 		}
 	}
 	return "", false
@@ -576,6 +680,7 @@ func desktopTurn(asked string, body []byte, byClaudeCode, bySubagent bool) strin
 // answered by AgentRouter's GPT, read as magpie swapping the model).
 const (
 	movedTier       = "desktop-tier"        // Claude Code's own id of a tier: the model picked for it
+	movedSearch     = "desktop-search"      // Claude Code's WebSearch call: the model picked for haiku
 	movedCheck      = "desktop-check"       // Desktop's check that the gateway answers: its menu's model
 	movedCheckFirst = "desktop-check-first" // …or, with none chosen, the first model it lists
 	movedTitle      = "desktop-title"       // a short call without tools Desktop names a model for: the chat's
@@ -600,19 +705,26 @@ func desktopMoveTo(asked string, body []byte, byClaudeCode, bySubagent bool) (st
 	if asked == "" {
 		return asked, ""
 	}
+	if byClaudeCode && desktopSearchCall(body) {
+		if m := desktopSearchTier(); m != "" && m != asked {
+			return m, movedSearch
+		}
+	}
 	if m := desktopTierTurn(asked); m != "" {
 		return m, movedTier
 	}
 	if desktopProbe(body) {
 		// Desktop's check that the gateway answers, as it starts and from
-		// Test connection: on the model the user chose in Desktop's own
-		// menu (desktopChosen), else its default model; never the model
+		// Test connection: as asked when it asks for a model the user
+		// chose in Desktop's own menus, else on that choice
+		// (desktopChosen), else on its default model; never the model
 		// of whichever session last ran (desktopPicked) on its own,
-		// which may be days old and on another provider
-		if m := desktopChosen(); m != "" {
+		// which may be days old and on another provider, nor on one
+		// magpie can't serve now (desktopServes)
+		if m := desktopChosen(asked); m != "" {
 			return m, movedCheck
 		}
-		if m := desktopDefault(asked); m != "" {
+		if m := desktopDefault(asked); m != "" && desktopServes(m) {
 			return m, movedCheckFirst
 		}
 		return asked, ""
@@ -635,6 +747,13 @@ func desktopMoveTo(asked string, body []byte, byClaudeCode, bySubagent bool) (st
 	}
 	title := !tools && aside && desktopAccepts(asked) && !desktopTierAsked(asked)
 	gone := unserved(asked)
+	if picked != "" && (gone || title || ((!tools || bySubagent) && claudeOwnID(asked))) && !desktopServes(picked) {
+		// the session's model is gone since, a routing group deleted or a
+		// model its provider no longer lists (#6719): no model of a
+		// session to put this on, as before any turn, rather than a 404
+		// or the vendor's 400 for a call that would have been answered
+		picked = ""
+	}
 	// Claude Code's own id of a Claude model (claude-haiku-5-5), asked for
 	// a background call or a subagent, that some provider serves under
 	// that model while the chat is on another: it stays with the chat's
@@ -818,11 +937,17 @@ func desktopDefault(asked string) string {
 }
 
 // desktopSelectorRoots are the Claude-3p folders Desktop keeps its model
-// menus' choices in (desktopChosen): every set desktopdir finds. A test
-// sets its own.
+// menus' choices in (desktopChosen): every set desktopdir finds, and the
+// isolated Desktop's folder (#5671) when it is there (the newest choice
+// counts). A test sets its own.
 var desktopSelectorRoots = func() []string {
 	home, _ := os.UserHomeDir()
 	var out []string
+	if iso := desktopdir.Isolated(desktopdir.OS, home); iso != "" {
+		if fi, err := os.Stat(iso); err == nil && fi.IsDir() {
+			out = append(out, iso)
+		}
+	}
 	for _, d := range desktopdir.Sets(desktopdir.OS, home, appdir.Getenv) {
 		if d.ThreeP != "" {
 			out = append(out, d.ThreeP)
@@ -859,7 +984,17 @@ var desktopSurfaces = []string{"code", "cowork", "chat"}
 // Desktop starts and from Test connection; a file not read or not parsed
 // is no choice (desktopDefault), and a turn alone is not one either,
 // since it can be days old.
-func desktopChosen() string {
+//
+// A check that asks for the first menu's choice itself goes as asked:
+// CyberCaius (Discord, 11-20) had MiniMax in the menu, Desktop checked
+// MiniMax, and magpie sent it to a GLM model on another provider that a
+// turn had run on since. Each choice, and the turn's model, has to be one
+// magpie really serves now (desktopServes): a routing group since deleted
+// (#6719) or a model its provider no longer lists (SivanCola on #6719,
+// opencode-go/deepseek-flash, which OpenCode Go turned away with a 400)
+// is no choice, where before any id of a group or of a provider that is
+// on was taken.
+func desktopChosen(asked string) string {
 	var path string
 	var newest time.Time
 	for _, root := range desktopSelectorRoots() {
@@ -889,12 +1024,19 @@ func desktopChosen() string {
 	for _, s := range desktopSurfaces {
 		// Desktop's id for it (claudeLooking), as magpie serves it
 		m := unprefixed(strings.TrimSpace(v.State[s].Model))
-		if m != "" && !unserved(m) && !slices.Contains(chosen, m) {
+		if m != "" && desktopServes(m) && !slices.Contains(chosen, m) {
 			chosen = append(chosen, m)
 		}
 	}
 	if len(chosen) == 0 {
 		return ""
+	}
+	// the check asks for the menu's choice itself: answered there, though
+	// a turn ran on another model since. Only the first menu's: the
+	// others hold Desktop's default (the first listed) unless the user
+	// changed them, and that is the model the check is moved off
+	if strings.TrimSuffix(unprefixed(asked), "[1m]") == strings.TrimSuffix(chosen[0], "[1m]") {
+		return asked
 	}
 	desktopPicked.Lock()
 	loadPicked()
@@ -904,11 +1046,41 @@ func desktopChosen() string {
 	// on now: a session switched to another model, or a menu still on the
 	// one it left
 	if picked != "" && at.After(newest) {
-		if m := unprefixed(picked); !unserved(m) {
+		if m := unprefixed(picked); desktopServes(m) {
 			return m
 		}
 	}
 	return chosen[0]
+}
+
+// desktopServes: magpie can send a request for m somewhere now. Stricter
+// than !unserved, which takes any "group/" id and any id under a provider
+// that is on: a group deleted or renamed since (#6719), or a model its
+// provider no longer lists (opencode-go/deepseek-flash, SivanCola on
+// #6719), is not served. A provider whose list magpie doesn't have is
+// taken at its word: not knowing its models is not knowing m is gone.
+func desktopServes(m string) bool {
+	if m == "" || unserved(m) {
+		return false
+	}
+	if _, off := idOff(m); off {
+		return false
+	}
+	if _, ok := provider.GroupFor(m); ok {
+		return true
+	}
+	p, model, ok := provider.Resolve(m)
+	if !ok {
+		return false
+	}
+	id := strings.TrimSuffix(m, "[1m]")
+	if provider.IsGroupRef(id) || catalogNames.get(struct{}{}, namesInCatalog)[id] {
+		return true
+	}
+	if len(p.Available()) == 0 && len(p.Exposed()) == 0 {
+		return true
+	}
+	return provider.ServesModel(p, model)
 }
 
 // desktopProbe: the request is Claude Desktop's check that a gateway
@@ -961,7 +1133,7 @@ const desktopTitlePrompt = "You write short session titles."
 // desktopTitle: the request's system prompt is Desktop's title prompt, as a
 // string (Desktop's client) or one of its text blocks (Claude Code's).
 func desktopTitle(body []byte) bool {
-	if !bytes.Contains(body, []byte(desktopTitlePrompt)) {
+	if !bodyHas(body, desktopTitlePrompt) {
 		return false
 	}
 	var v struct {
@@ -997,10 +1169,61 @@ func small(body []byte) bool {
 	return json.Unmarshal(body, &v) == nil && v.MaxTokens > 0 && v.MaxTokens <= 4096
 }
 
+// desktopSearchHelper is a Desktop search taken by its served haiku pick,
+// so it is not a subagent's tool turn.
+func desktopSearchHelper(agent string, body []byte) bool {
+	return agent == "claude-desktop" && desktopSearchCall(body) && desktopSearchTier() != ""
+}
+
+// desktopSearchTier is the served pick for Desktop's haiku tier, or ""
+// when WebSearch keeps its existing routing.
+func desktopSearchTier() string {
+	m := DesktopTiers()["haiku"]
+	if m == "" || unserved(m) {
+		return ""
+	}
+	return m
+}
+
+// desktopSearchCall is Claude Code's WebSearch subrequest: only the server
+// search tool, named web_search, with a tool_choice that lets it be called.
+// Claude Code's option names the tool, but the request it sends (2.1.317 to
+// 2.1.330) carries tool_choice auto, so auto, any and the tool by name are
+// all the search; none, or another tool by name, is not. The request always
+// has a tool_choice, which keeps the decode off every other body. Desktop's
+// gateway mode disables GrowthBook, so its small-model flag defaults off and
+// it asks on the session's model even when haiku is picked.
+func desktopSearchCall(body []byte) bool {
+	if !bodyHas(body, `"tool_choice"`) || !bodyHas(body, `web_search_`) {
+		return false
+	}
+	var v struct {
+		Tools []struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		} `json:"tools"`
+		ToolChoice struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		} `json:"tool_choice"`
+	}
+	if json.Unmarshal(body, &v) != nil || len(v.Tools) != 1 ||
+		!strings.HasPrefix(v.Tools[0].Type, "web_search_") || v.Tools[0].Name != "web_search" {
+		return false
+	}
+	switch v.ToolChoice.Type {
+	case "auto", "any":
+		return true
+	case "tool":
+		return v.ToolChoice.Name == "web_search"
+	}
+	return false
+}
+
 // hasTools: the request offers the model tools (Anthropic's, Chat's and
 // Responses' "tools" alike).
 func hasTools(body []byte) bool {
-	if !bytes.Contains(body, []byte(`"tools"`)) {
+	if !bodyHas(body, `"tools"`) {
 		return false
 	}
 	var v struct {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -15,13 +16,39 @@ import (
 // Via is ctx for requests made on the provider's behalf: they go through
 // its own proxy (ProxyChoice), or the global one when it has none. A
 // provider the user added and asked not to have its certificate checked
-// (InsecureTLS) has its own hosts' taken as they are, no other host's.
+// (InsecureTLS) has its own hosts' taken as they are, no other host's,
+// and one whose server certificate the user trusted (ServerPin) has them
+// taken with that certificate alone;
+// one with connect addresses (Resolve) has its hosts' connections made
+// there;
+// one asked to be spoken HTTP/1.1 to (HTTP1) is, at its own hosts alone;
+// one whose turns go over the Responses WebSocket (Socket) has them go
+// there, at its Responses URL alone (SocketTurn).
 func (p Provider) Via(ctx context.Context) context.Context {
 	ctx = netproxy.With(ctx, p.ProxyChoice())
 	if p.InsecureTLS && p.TakesInsecureTLS() {
 		ctx = netproxy.WithUncheckedTLS(ctx, p.UncheckedHosts()...)
 	}
-	return ctx
+	if p.HTTP1 && p.TakesInsecureTLS() {
+		ctx = netproxy.WithHTTP1(ctx, p.UncheckedHosts()...)
+	}
+	if len(p.Resolve) > 0 && p.TakesResolve() {
+		ctx = netproxy.WithResolve(ctx, p.Resolve)
+	}
+	if roots := p.failoverRoots(); len(roots) > 1 {
+		ctx = netproxy.WithFailover(ctx, roots...)
+		ctx = netproxy.WithVouch(ctx, p.vouch())
+	}
+	cert, key, ca := p.ClientCert, p.ClientKey, p.ServerCA
+	if !p.TakesClientCert() {
+		cert, key, ca = "", "", ""
+	}
+	if cert != "" || ca != "" || p.ServerPin != "" {
+		if hosts := p.PinHosts(); len(hosts) > 0 {
+			ctx = netproxy.WithClientCert(ctx, cert, key, ca, p.ServerPin, hosts...)
+		}
+	}
+	return withSocket(ctx, p)
 }
 
 // ProxyChoice is the proxy requests made on the provider's behalf go
@@ -72,6 +99,20 @@ func ProxyOfLogin(id, user string) string {
 		return v
 	}
 	return s.Proxy
+}
+
+// ClaudeProxies are the distinct proxy choices the Claude subscription's
+// accounts send their requests through (ProxyOfLogin): what
+// internal/egress looks the way out up through. No account, none: a user
+// without one is never looked up for.
+func ClaudeProxies() []string {
+	var out []string
+	for _, l := range Logins("claude") {
+		if c := strings.TrimSpace(ProxyOfLogin("claude", l.User)); !slices.Contains(out, c) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // Via is ctx for requests made on behalf of the provider or signed-in
@@ -200,4 +241,86 @@ func checkAccountProxies(m map[string]string) error {
 		}
 	}
 	return nil
+}
+
+// ProxyUse is a place a saved proxy is chosen: a provider (Account empty),
+// or an account or key of one.
+type ProxyUse struct {
+	Provider string `json:"provider"`
+	Account  string `json:"account,omitempty"`
+}
+
+// ProxyUses lists where the saved proxy id is chosen among the providers, so
+// that deleting it can say what would lose it. Settings' own two (global,
+// plugin downloads) are the caller's.
+func ProxyUses(id string) []ProxyUse {
+	ref := settings.ProxyRef(id)
+	var out []ProxyUse
+	for _, p := range storedFile().Providers {
+		name := p.Name
+		if name == "" {
+			name = p.ID
+		}
+		if strings.TrimSpace(p.Proxy) == ref {
+			out = append(out, ProxyUse{Provider: name})
+		}
+		accts := make([]string, 0, len(p.AccountProxies))
+		for a, v := range p.AccountProxies {
+			if strings.TrimSpace(v) == ref {
+				accts = append(accts, a)
+			}
+		}
+		slices.Sort(accts)
+		for _, a := range accts {
+			out = append(out, ProxyUse{Provider: name, Account: a})
+		}
+	}
+	return out
+}
+
+// ProxyGone is the name of a saved proxy p chooses (its own, or an
+// account's) that isn't on this computer, "" when none is missing: what a
+// sync from a magpie that didn't bring the proxy list leaves.
+func ProxyGone(p Provider) string {
+	gone := func(v string) string {
+		v = strings.TrimSpace(v)
+		if !settings.IsProxyRef(v) {
+			return ""
+		}
+		if _, ok := settings.ResolveProxy(v); ok {
+			return ""
+		}
+		return settings.ProxyLabel(settings.ProxyID(v))
+	}
+	if n := gone(p.Proxy); n != "" {
+		return n
+	}
+	keys := slices.Sorted(maps.Keys(p.AccountProxies))
+	for _, k := range keys {
+		if n := gone(p.AccountProxies[k]); n != "" {
+			return n
+		}
+	}
+	return ""
+}
+
+// ViaRemoteMagpieAt is ctx for a request to u made on behalf of the
+// Remote magpie whose gateway u is on (its scheme and host): Via of that
+// provider, so the Library's connection to its MCP router goes as its
+// model calls do (hhdaxia on X: a client certificate the remote asks for
+// went with the model calls alone). ctx as it is when no Remote magpie
+// is at u.
+func ViaRemoteMagpieAt(ctx context.Context, u *url.URL) context.Context {
+	if u == nil || u.Host == "" {
+		return ctx
+	}
+	for _, p := range All() {
+		if !p.IsRemoteMagpie() || p.Anthropic == "" {
+			continue
+		}
+		if b, err := url.Parse(p.Anthropic); err == nil && strings.EqualFold(b.Scheme, u.Scheme) && strings.EqualFold(b.Host, u.Host) {
+			return p.Via(ctx)
+		}
+	}
+	return ctx
 }

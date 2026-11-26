@@ -34,6 +34,13 @@ type Limiter interface {
 	Reserve(who access.Identity, body int64, model string, now time.Time) (release func(), refused Refusal)
 }
 
+// Spender is a Limiter that can tell which of a key's limits of some
+// models (access.Limit.Models) have nothing left: the gateway leaves
+// their models out of the request's candidates (access.Identity.Spent).
+type Spender interface {
+	Spent(who access.Identity, now time.Time) []access.SpentScope
+}
+
 var (
 	mu       sync.Mutex
 	limiters []*Limiter
@@ -96,7 +103,7 @@ func ForgetRefreshForTest() { lastAsk.Store(0) }
 
 // ErrUnlimited is the error a key's request gets when the key is held to
 // a limit and nothing can hold it.
-var ErrUnlimited = errors.New("this gateway key is held to a limit, but magpie's Key limits plugin isn't serving it, so nothing was sent; turn the plugin on in magpie's Settings → Plugins")
+var ErrUnlimited = errors.New("this gateway key is held to a limit, but magpie's Key limits built-in isn't serving it, so nothing was sent; turn it on in magpie's Plugins › Built-in")
 
 // Limiting is the limiter for who's request: nil, nil when who has no
 // limit; ErrUnlimited when it has one and none serves. With none, one

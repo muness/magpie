@@ -2,7 +2,9 @@ package gui
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -168,5 +170,99 @@ func TestQuitDontAskAgain(t *testing.T) {
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/api/window/quit?now=1", nil))
 	if settings.Load().QuitNoAsk {
 		t.Fatal("the question's Quit without Don't ask again saved it")
+	}
+}
+
+// tudjam17795 on X: with Settings › General › Put agents back when
+// quitting on, the app's quit restores the connected agents and its next
+// start connects them again; off (the default), a quit leaves them as
+// they are. With it on a Quit needs no question, and a gateway served by
+// another magpie leaves its agents alone.
+func TestRestoreAgentsOnQuit(t *testing.T) {
+	sandboxHome(t)
+	old := [...]any{servedHere, quitDetect, quitRestore, startAgents, startRewire}
+	t.Cleanup(func() {
+		servedHere, quitDetect, quitRestore = old[0].(func() bool), old[1].(func() []*agent.Agent), old[2].(func([]*agent.Agent) ([]string, error))
+		startAgents, startRewire = old[3].(func() []*agent.Agent), old[4].(func([]*agent.Agent) ([]string, error))
+	})
+	restored, rewired := 0, 0
+	servedHere = func() bool { return true }
+	quitDetect = func() []*agent.Agent { return nil }
+	quitRestore = func([]*agent.Agent) ([]string, error) { restored++; return nil, nil }
+	startAgents = func() []*agent.Agent { return nil }
+	startRewire = func([]*agent.Agent) ([]string, error) { rewired++; return nil, nil }
+	oldAgents := quitAgents
+	t.Cleanup(func() { quitAgents = oldAgents })
+	quitAgents = func() []quitAgentJSON { return []quitAgentJSON{{ID: "codex"}} }
+	if quitAtOnce(0, time.Now()) {
+		t.Fatal("off by default, a Quit with Codex connected quit without asking")
+	}
+
+	restoreAgentsOnQuit()
+	if restored != 0 {
+		t.Fatal("off by default, a quit put the agents back")
+	}
+	s := settings.Load()
+	s.RestoreOnQuit = true
+	if err := settings.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	servedHere = func() bool { return false }
+	restoreAgentsOnQuit()
+	if restored != 0 {
+		t.Fatal("another magpie serves the gateway, yet the quit put its agents back")
+	}
+	servedHere = func() bool { return true }
+	restoreAgentsOnQuit()
+	if restored != 1 {
+		t.Fatalf("with the setting on, restored %d times", restored)
+	}
+	// nothing to ask: agents are put back
+	if !quitAtOnce(0, time.Now()) {
+		t.Fatal("with the setting on a Quit asks")
+	}
+	rewireAgentsOnStart()
+	if rewired != 1 {
+		t.Fatalf("a start rewired %d times", rewired)
+	}
+}
+
+// jtbbtnt54249 on X: after Disconnect and quit, every agent's switch was
+// off when magpie opened again. The question's Disconnect and quit now
+// puts the agents back as Put agents back when quitting does, setting on
+// or off (the next start connects them again: agent.RewireOnStart), not
+// with each row's Disconnect, whose mark kept them off for good. One that
+// can't be put back answers an error and nothing quits.
+func TestQuitDisconnectComesBackOnStart(t *testing.T) {
+	sandboxHome(t)
+	old := [...]any{quitDetect, quitRestore}
+	t.Cleanup(func() {
+		quitDetect, quitRestore = old[0].(func() []*agent.Agent), old[1].(func([]*agent.Agent) ([]string, error))
+	})
+	detected := []*agent.Agent{{ID: "codex", Name: "Codex"}, {ID: "claude", Name: "Claude Code"}}
+	quitDetect = func() []*agent.Agent { return detected }
+	var got [][]*agent.Agent
+	var fails error
+	quitRestore = func(as []*agent.Agent) ([]string, error) { got = append(got, as); return []string{"codex"}, fails }
+	quits := 0
+	h := webPageHandler(t, askingHost{webHost{quit: func() { quits++ }}, make(chan struct{}, 1)}, nil)
+
+	r := httptest.NewRecorder()
+	h.ServeHTTP(r, httptest.NewRequest("POST", "/api/quit/disconnect", nil))
+	if r.Code != 200 || len(got) != 1 || len(got[0]) != 2 {
+		t.Fatalf("Disconnect and quit: %d %s, put back %d times", r.Code, r.Body, len(got))
+	}
+	if settings.Load().RestoreOnQuit {
+		t.Fatal("it turned Put agents back when quitting on")
+	}
+	if quits != 0 {
+		t.Fatal("it quit by itself: the page quits after it")
+	}
+
+	fails = errors.New("Claude Code: config is locked")
+	r = httptest.NewRecorder()
+	h.ServeHTTP(r, httptest.NewRequest("POST", "/api/quit/disconnect", nil))
+	if r.Code < 400 || !strings.Contains(r.Body.String(), "Claude Code: config is locked") {
+		t.Fatalf("a failed put back: %d %s", r.Code, r.Body)
 	}
 }

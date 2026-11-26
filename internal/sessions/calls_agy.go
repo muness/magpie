@@ -3,6 +3,8 @@ package sessions
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,6 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/dirent"
 )
 
 // Antigravity CLI's (agy's) calls (#2097, parkavenue9639: a call agy made
@@ -30,11 +35,24 @@ import (
 // began, to the second. A transcript an older agy wrote has the same lines
 // without the token fields; they are left out, not counted as zero.
 //
-// The step names no model (a custom model's isn't anywhere in agy's files,
-// and settings.json's is only the one picked now), nor the account, so the
-// call is agy's with the model and provider unknown. A step agy sent through
-// magpie is the gateway's to count: usage's matcher pairs it with the
-// gateway's record by its tokens and time (agy sends no session header).
+// The step names no model, nor the account. The model is in the
+// conversation's database, conversations/<conversation id>.db beside
+// brain/, the layout the Antigravity app keeps (antigravity_app.go: agy's
+// language server is the app's): a step's metadata field 20.3 is its
+// generator's gen_metadata idx, and the generator's field 1.19 the served
+// model's id ("gemini-4-argon"; agy 1.5.6's real rows on #3147 and #4805).
+// A generator also names the step it answered in its field 1.20, a list of
+// {1 key, 2 value}: "last_step_index" n is step n+1, which stands when the
+// step's own row can't be read. A call whose model can't be read keeps
+// none (DvnT662 on X: Usage → Requests showed agy's own calls with no
+// model). The provider stays unknown. A step agy sent through magpie is
+// the gateway's to count: usage's matcher pairs it with the gateway's
+// record by its tokens and time (agy sends no session header).
+//
+// How long a step's call took, and how long to its first token, are its
+// steps row's too (stepTimesOf; guyng35955 on X: Usage → Requests had no
+// first-token time, duration or speed for agy's own calls). The
+// transcript's created_at is to the second only.
 
 // AgyDir is agy's data folder, ~/.gemini/antigravity-cli.
 func AgyDir() string {
@@ -42,8 +60,198 @@ func AgyDir() string {
 	return filepath.Join(home, ".gemini", "antigravity-cli")
 }
 
-// agyCallFiles are each conversation's transcript_full.jsonl.
-func agyCallFiles() []file { return agyTranscripts(AgyDir()) }
+// T3 Code (pingdotgg/t3code) runs agy for each Antigravity instance of
+// its own, as an ACP server on the instance's Google sign-in:
+// `agy acp --gemini-dir <profile> --app-data-dir antigravity-acp`, the
+// profile being <T3 Code's folder>/userdata/providers/antigravity/<sha256
+// of the instance id> (antigravityAuthSupport.ts), T3 Code's folder
+// $T3CODE_HOME or ~/.t3 (dev in place of userdata for a T3 Code run from
+// its dev server). agy writes each conversation there as it does in its own folder
+// (agy 1.5.10 in a sandbox against a fake Gemini endpoint:
+// brain/<id>/.system_generated/logs/transcript_full.jsonl and
+// conversations/<id>.db under antigravity-acp), and its requests go to
+// Google, not through magpie, so they are counted from those files
+// (zzzkl on X: agy's calls in T3 Code weren't on Usage → Requests, a
+// plain agy's were).
+func t3AgyDirs() []string {
+	home, _ := os.UserHomeDir()
+	base := appdir.T3Code(home)
+	var out []string
+	for _, state := range []string{"userdata", "dev"} {
+		root := filepath.Join(base, state, "providers", "antigravity")
+		dirs, _ := os.ReadDir(root)
+		for _, d := range dirs {
+			if dirent.IsFolder(root, d) {
+				out = append(out, filepath.Join(root, d.Name(), "antigravity-acp"))
+			}
+		}
+	}
+	return out
+}
+
+// agyDataDirs are the folders agy keeps conversations in on this computer:
+// its own (AgyDir) and each T3 Code profile's (t3AgyDirs).
+func agyDataDirs() []string { return append([]string{AgyDir()}, t3AgyDirs()...) }
+
+// agyCallFiles are each conversation's transcript_full.jsonl, in every
+// folder agy keeps them in (agyDataDirs). A file's size and time take in
+// its conversation's database and write-ahead log, so a model agy writes
+// there after the step is read still reads the calls again.
+func agyCallFiles() []file {
+	if !Reads("agy") {
+		return nil
+	}
+	var out []file
+	for _, d := range agyDataDirs() {
+		out = append(out, agyTranscripts(d)...)
+	}
+	for i := range out {
+		agyCallStat(&out[i])
+	}
+	return out
+}
+
+// agyCallStat adds the transcript f's conversation database and its
+// write-ahead log to f's size and time, as a call source.
+func agyCallStat(f *file) {
+	for _, p := range agyDBFiles(f.path) {
+		if fi, err := os.Stat(p); err == nil {
+			f.size += fi.Size()
+			if fi.ModTime().After(f.mod.Time()) {
+				f.mod = modOf(fi.ModTime())
+			}
+		}
+	}
+}
+
+// agyConversationDB is the database of the conversation whose transcript
+// is at transcript: <data folder>/conversations/<id>.db for
+// <data folder>/brain/<id>/.system_generated/logs/transcript_full.jsonl.
+func agyConversationDB(transcript string) string {
+	conv := filepath.Dir(filepath.Dir(filepath.Dir(transcript)))
+	return filepath.Join(filepath.Dir(filepath.Dir(conv)), "conversations", filepath.Base(conv)+".db")
+}
+
+// agyDBFiles are the database of transcript's conversation and its
+// write-ahead log.
+func agyDBFiles(transcript string) []string {
+	db := agyConversationDB(transcript)
+	return []string{db, db + "-wal"}
+}
+
+// agyStepModels is the model of each step of a conversation's database,
+// by the step's index; nil when the database can't be read.
+func agyStepModels(path string) map[int]string {
+	models, _ := agyStepsOf(path)
+	return models
+}
+
+// agyStepsOf is the model of each step of a conversation's database, and
+// how long each step's model call took (stepTimesOf), by the step's index;
+// nil when the database can't be read.
+func agyStepsOf(path string) (map[int]string, map[int]stepTimes) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, nil
+	}
+	db, done, err := openAppStore(path)
+	if err != nil {
+		return nil, nil
+	}
+	defer done()
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, nil
+	}
+	defer tx.Rollback()
+	out := map[int]string{}
+	times := map[int]stepTimes{}
+	gens := map[int64]string{}
+	rows, err := tx.Query("SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL")
+	if err != nil {
+		return nil, nil
+	}
+	for rows.Next() {
+		var idx int64
+		var b []byte
+		if rows.Scan(&idx, &b) != nil {
+			continue
+		}
+		m := agAppModel(b)
+		if m == "" {
+			continue
+		}
+		gens[idx] = m
+		if step, ok := agyGenStep(b); ok {
+			out[step] = m
+		}
+	}
+	rows.Close()
+	rows, err = tx.Query("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL")
+	if err != nil {
+		return out, times
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var idx int64
+		var b []byte
+		if rows.Scan(&idx, &b) != nil {
+			continue
+		}
+		// a step's place names its generator, generator 0 by leaving it
+		// out (as antigravityRead reads it)
+		var gen int64
+		if pbWalk(b, func(num int, v uint64, d []byte) {
+			if num == 20 && d != nil {
+				_ = pbWalk(d, func(n int, v uint64, d []byte) {
+					if n == 3 && d == nil {
+						gen = int64(v)
+					}
+				})
+			}
+		}) != nil {
+			continue
+		}
+		if m, ok := gens[gen]; ok {
+			out[int(idx)] = m
+		}
+		if t := stepTimesOf(b); t.millis > 0 {
+			times[int(idx)] = t
+		}
+	}
+	return out, times
+}
+
+// agyGenStep is the step a generator answered: its "last_step_index" n,
+// in field 1.20, is step n+1.
+func agyGenStep(b []byte) (int, bool) {
+	step, ok := 0, false
+	_ = pbWalk(b, func(num int, v uint64, d []byte) {
+		if num != 1 || d == nil {
+			return
+		}
+		_ = pbWalk(d, func(n int, v uint64, d []byte) {
+			if n != 20 || d == nil {
+				return
+			}
+			var key, val string
+			_ = pbWalk(d, func(n int, v uint64, d []byte) {
+				switch {
+				case d == nil:
+				case n == 1:
+					key = string(d)
+				case n == 2:
+					val = string(d)
+				}
+			})
+			if key == "last_step_index" {
+				if i, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && i >= 0 {
+					step, ok = i+1, true
+				}
+			}
+		})
+	})
+	return step, ok
+}
 
 type agyStep struct {
 	Step      *int   `json:"step_index"`
@@ -88,6 +296,16 @@ func readAgyCalls(f file) (*callFile, bool) {
 		}
 		if err != nil {
 			break
+		}
+	}
+	if len(at) > 0 {
+		models, times := agyStepsOf(agyConversationDB(f.path))
+		for step, i := range at {
+			if models != nil {
+				st.Calls[i].Model = models[step]
+			}
+			t := times[step]
+			st.Calls[i].TTFT, st.Calls[i].Millis = t.ttft, t.millis
 		}
 	}
 	return st, true

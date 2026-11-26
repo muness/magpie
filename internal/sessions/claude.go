@@ -3,12 +3,14 @@ package sessions
 import (
 	"bytes"
 	"encoding/json"
-	"regexp"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
+
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // Claude Code writes one line per event: the prompts as "user" lines, each
@@ -77,6 +79,9 @@ func claudeLine(s *state, b []byte, main bool) {
 		case "ai-title", "custom-title", "summary":
 			claudeFull(s, b, main)
 			return
+		case "relocated":
+			ccRelocated(s, b, main)
+			return
 		default:
 			s.saw(tsAt(b, true), main)
 			return
@@ -103,7 +108,7 @@ func claudeLine(s *state, b []byte, main bool) {
 		ccLink(s, h, b, main)
 		ccReply(s, at, msg, b, main)
 	case bytes.HasPrefix(msg, ccRole) && typeAfter(msg, ccRole) == "user":
-		if main && !ccToolResult(msg) {
+		if (main || !s.more().TaskRead) && !ccToolResult(msg) {
 			// a prompt, or something Claude Code put in: read whole
 			claudeFull(s, b, main)
 			return
@@ -140,10 +145,10 @@ func (s *state) link(uuid string) {
 	if !ccRandomUUID(uuid) {
 		return
 	}
-	if s.Root == "" {
-		s.Root = uuid
+	if s.more().Root == "" {
+		s.own().Root = uuid
 	}
-	s.Leaf = uuid
+	s.own().Leaf = uuid
 }
 
 // ccRandomUUID reports whether u is a version 4 uuid, as Claude Code's
@@ -182,6 +187,50 @@ func ccWhere(s *state, b []byte) {
 	if s.ID == "" {
 		s.ID = strAt(b, ccSession)
 	}
+}
+
+var ccRelocatedCwd = []byte(`"relocatedCwd":"`)
+
+// ccRelocated reads the line Claude Code's /cd adds when it moves a session
+// to another folder: it moves the file into that folder's project and
+// writes {"type":"relocated","relocatedCwd":…}, while the lines before keep
+// the old cwd. The session is then the new folder's, the last move's.
+func ccRelocated(s *state, b []byte, main bool) {
+	s.saw(tsAt(b, true), main)
+	if !main {
+		return
+	}
+	if c := strAt(b, ccRelocatedCwd); c != "" {
+		s.Cwd = c
+	}
+}
+
+// ccStale reports whether a Claude Code session's kept parse was made by a
+// magpie that didn't read /cd's relocated lines, and the folder it names is
+// not the project the file is in: the session was moved with /cd, and its
+// parse names the folder it left. Read again once, the parse is current.
+// The same for a subagent's parse made before its task was kept.
+func ccStale(f file, s *state) bool {
+	if f.agent == "claude" && !f.main && s != nil && !s.more().TaskRead && SubagentOf(f.path) != "" {
+		// a subagent's parse from before its task and meta were kept with
+		// it: read again once, so a start no longer opens each of them
+		return true
+	}
+	if f.agent != "claude" || !f.main || s == nil || s.CdRead || s.Cwd == "" {
+		return false
+	}
+	return !ccInProject(filepath.Base(filepath.Dir(f.path)), s.Cwd)
+}
+
+// ccInProject reports whether dir is the name Claude Code gives cwd's
+// project folder: cwd with each UTF-16 unit not a letter or digit as "-",
+// past 200 of them cut and a hash added.
+func ccInProject(dir, cwd string) bool {
+	n := claudeSlug(cwd)
+	if len(n) <= 200 {
+		return dir == n
+	}
+	return strings.HasPrefix(dir, n[:200]+"-")
 }
 
 // strAt is the string after the last key in b.
@@ -234,7 +283,10 @@ func ccTools(s *state, m *claudeContribution, at time.Time, b []byte) {
 		}
 		var tool struct {
 			ID, Name string
-			Input    struct{ Skill any }
+			Input    struct {
+				Skill    any
+				FilePath string `json:"file_path"`
+			}
 		}
 		end := objectEnd(rest[i:])
 		if end < 0 || json.Unmarshal(rest[i:i+end], &tool) != nil {
@@ -244,6 +296,9 @@ func ccTools(s *state, m *claudeContribution, at time.Time, b []byte) {
 		skill, _ := tool.Input.Skill.(string)
 		if tool.Name != "Skill" {
 			skill = ""
+		}
+		if tool.Name == "Read" {
+			skill = routedSkill(tool.Input.FilePath)
 		}
 		ccTool(s, m, at, tool.ID, tool.Name, skill)
 	}
@@ -303,15 +358,9 @@ func ccReply(s *state, at time.Time, msg, b []byte, main bool) {
 	if i == len(b) || model == "<synthetic>" {
 		return
 	}
-	var u struct {
-		Input      int              `json:"input_tokens"`
-		Output     int              `json:"output_tokens"`
-		CacheRead  int              `json:"cache_read_input_tokens"`
-		CacheWrite int              `json:"cache_creation_input_tokens"`
-		Creation   *ccCacheCreation `json:"cache_creation"`
-	}
+	var u ccUsageFields
 	usage := b[i+len(ccUsage)-1:]
-	if end := objectEnd(usage); end < 0 || json.Unmarshal(usage[:end], &u) != nil {
+	if end := objectEnd(usage); end < 0 || ccDecodeUsage(usage[:end], &u) != nil {
 		return
 	}
 	ccCount(s, m, at, model, ccTokens(u.Input, u.Output, u.CacheRead, u.CacheWrite, u.Creation), main)
@@ -323,14 +372,21 @@ func claudeFull(s *state, b []byte, main bool) {
 	s.saw(at, main)
 	want := bytes.Contains(b, ccAssistant) ||
 		main && bytes.Contains(b, ccUser) ||
+		!main && !s.more().TaskRead && bytes.Contains(b, ccUser) ||
 		main && (bytes.Contains(b, ccTitle) || bytes.Contains(b, ccCustom) || bytes.Contains(b, ccSummary)) ||
 		s.Cwd == "" && bytes.Contains(b, ccCwd)
 	if !want {
 		return
 	}
+	// its content, a prompt's pasted text and images, is read where the
+	// line holds it, not copied for each line (#2278)
 	var l ccLine
-	if json.Unmarshal(b, &l) != nil {
+	content, err := ccDecodeLess(b, &l)
+	if err != nil {
 		return
+	}
+	if content != nil {
+		l.Message.Content = content
 	}
 	if s.Cwd == "" && l.Cwd != "" {
 		s.Cwd, s.Entry = l.Cwd, l.Entrypoint
@@ -340,25 +396,29 @@ func claudeFull(s *state, b []byte, main bool) {
 	}
 	if main && !l.IsSidechain && (l.Type == "user" || l.Type == "assistant") {
 		s.link(l.UUID)
-		if l.IsCompactSummary && l.Type == "user" && ccRandomUUID(l.UUID) && !slices.Contains(s.Compacts, l.UUID) {
-			s.Compacts = append(s.Compacts, l.UUID)
+		if l.IsCompactSummary && l.Type == "user" && ccRandomUUID(l.UUID) && !slices.Contains(s.more().Compacts, l.UUID) {
+			s.own().Compacts = append(s.more().Compacts, l.UUID)
 		}
 	}
 	switch l.Type {
 	case "ai-title":
 		if l.AITitle != "" {
-			s.Named = title(l.AITitle)
+			s.own().Named = title(l.AITitle)
 		}
 	case "custom-title":
 		// named by the user (/rename): before the one Claude Code made
 		if main && l.CustomTitle != "" {
-			s.Custom = title(l.CustomTitle)
+			s.own().Custom = title(l.CustomTitle)
 		}
 	case "summary":
-		if l.Summary != "" && s.Named == "" {
-			s.Named = title(l.Summary)
+		if l.Summary != "" && s.more().Named == "" {
+			s.own().Named = title(l.Summary)
 		}
 	case "user":
+		if !main && !l.IsMeta && !s.more().TaskRead {
+			// the subagent's task, as ccTask reads it
+			s.own().Task, s.own().TaskRead = untagged(ccText(l.Message.Content)), true
+		}
 		if main && !l.IsMeta && !l.IsSidechain {
 			p := ccPrompt(l.Message.Content)
 			if p != "" {
@@ -366,8 +426,8 @@ func claudeFull(s *state, b []byte, main bool) {
 			}
 			if s.Title == "" {
 				s.Title = p
-				if s.Title == "" && s.First == "" {
-					s.First = untagged(ccText(l.Message.Content))
+				if s.Title == "" && s.more().First == "" {
+					s.own().First = untagged(ccText(l.Message.Content))
 				}
 			}
 		}
@@ -376,7 +436,10 @@ func claudeFull(s *state, b []byte, main bool) {
 		defer s.Claude.finish(m)
 		var blocks []struct {
 			Type, ID, Name string
-			Input          struct{ Skill any }
+			Input          struct {
+				Skill    any
+				FilePath string `json:"file_path"`
+			}
 		}
 		if json.Unmarshal(l.Message.Content, &blocks) == nil {
 			for _, c := range blocks {
@@ -384,6 +447,9 @@ func claudeFull(s *state, b []byte, main bool) {
 					skill, _ := c.Input.Skill.(string)
 					if c.Name != "Skill" {
 						skill = ""
+					}
+					if c.Name == "Read" {
+						skill = routedSkill(c.Input.FilePath)
 					}
 					ccTool(s, m, at, c.ID, c.Name, skill)
 				}
@@ -420,8 +486,8 @@ func ccText(content json.RawMessage) string {
 }
 
 var (
-	ccCommand = regexp.MustCompile(`<command-name>\s*([^<]*?)\s*</command-name>`)
-	ccArgs    = regexp.MustCompile(`<command-args>\s*([^<]*?)\s*</command-args>`)
+	ccCommand = lazyre.New(`<command-name>\s*([^<]*?)\s*</command-name>`)
+	ccArgs    = lazyre.New(`<command-args>\s*([^<]*?)\s*</command-args>`)
 )
 
 // ccPrompt is the words of a prompt someone typed, or "" for what Claude

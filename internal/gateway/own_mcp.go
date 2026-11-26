@@ -1,8 +1,11 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
+	"slices"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/gwtool"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/provider"
@@ -10,7 +13,7 @@ import (
 )
 
 // OwnMCPPath lists the MCP servers magpie serves itself (web search,
-// image recognition, image generation, the plugins' tools) that are on
+// image recognition, image generation, memory, the plugins' tools) that are on
 // now, for an app that gives a model the Library's servers and wants
 // magpie's own beside them: the community chat page (ferock on Discord),
 // which read only library.json. A server is listed while an agent that
@@ -46,6 +49,12 @@ func ownMCP() []OwnMCP {
 	if _, ok := drawer(); ok {
 		out = append(out, OwnMCP{imageServerName, "Magpie Image", ImageMCPPath})
 	}
+	// memory is always there: it needs no model
+	out = append(out, OwnMCP{memoryServerName, "Magpie Memory", MemoryMCPPath})
+	// and so are the sessions: it reads what Settings › Sessions allows
+	out = append(out, OwnMCP{sessionsServerName, "Magpie Sessions", SessionsMCPPath})
+	// and the artifacts: pages kept on this computer
+	out = append(out, OwnMCP{artifactsServerName, "Magpie Artifacts", ArtifactsMCPPath})
 	if gwtool.Served(gwtool.PluginTools) {
 		// a note that can't be read says nothing: the server is listed,
 		// and its tools/list tells
@@ -57,7 +66,50 @@ func ownMCP() []OwnMCP {
 }
 
 func (s *Server) ownMCPList(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"servers": ownMCP()})
+	// a gateway key held to some MCP servers is told of those alone
+	who := access.Caller(r.Context())
+	ss := slices.DeleteFunc(ownMCP(), func(o OwnMCP) bool { ok, _ := who.MCPServer(o.Name); return !ok })
+	writeJSON(w, 200, map[string]any{"servers": ss})
+}
+
+// OwnMCPTools are magpie's own MCP servers that are on now, Magpie
+// Browser beside them, each with the names of its tools, for the picker
+// of the servers and tools a gateway key may use (wakaka on Discord). The
+// plugin tools' server is listed with no tools when they can't be read:
+// it can still be given whole.
+func OwnMCPTools(ctx context.Context) []OwnMCPServer {
+	out := []OwnMCPServer{}
+	for _, o := range ownMCP() {
+		s := OwnMCPServer{Name: o.Name, Title: o.Title}
+		switch o.Name {
+		case "magpie-web-search":
+			s.Tools = []string{searchMCPTool, fetchMCPTool}
+		case "magpie-vision":
+			s.Tools = []string{visionMCPTool}
+		case imageServerName:
+			s.Tools = []string{GenerateImageTool, GenerateVideoTool, GenerationResultTool}
+		case memoryServerName:
+			s.Tools = []string{memorySearchTool, memorySaveTool, memoryForgetTool, memoryContextTool}
+		case sessionsServerName:
+			s.Tools = []string{sessionsSearchTool, sessionsReadTool}
+		case artifactsServerName:
+			s.Tools = []string{artifactPublishTool, artifactReadTool, artifactListTool, artifactOpenTool, artifactDeleteTool}
+		case "magpie-tools":
+			ts, _ := servedTools(ctx)
+			for _, t := range ts {
+				s.Tools = append(s.Tools, t.name)
+			}
+		}
+		out = append(out, s)
+	}
+	return append(out, OwnMCPServer{Name: "magpie-browser", Title: "Magpie Browser", Tools: []string{"browser"}})
+}
+
+// OwnMCPServer is one of magpie's own MCP servers with its tools' names.
+type OwnMCPServer struct {
+	Name  string   `json:"name"`
+	Title string   `json:"title"`
+	Tools []string `json:"tools"`
 }
 
 // OwnUnready is why magpie's own server name (Magpie Web Search, Magpie
@@ -74,21 +126,21 @@ func OwnUnready(name string) string {
 		case !searchServed():
 			return "Web search is off in Plugins › Built-in: its tools say so until it is turned on"
 		}
-		return "Nothing searches yet: add a search API in Settings → Models → Web search, or a provider that can search. Until then its tools say so"
+		return "Nothing searches yet: add a search API in Settings › Models › Web search, or a provider that can search. Until then its tools say so"
 	case "magpie-vision":
 		if _, ok := seer(); ok {
 			return ""
 		}
 		if provider.HeldSettings().Vision == "off" {
-			return "Image recognition is off in Settings → Models → Images: its tool says so until a model is picked there"
+			return "Image recognition is off in Settings › Models › Images: its tool says so until a model is picked there"
 		}
 		return "No model that sees images is set up yet: it reads images once a provider with one is added, and says so until then"
 	case imageServerName:
 		if _, ok := drawer(); ok {
 			return ""
 		}
-		if settings.Load().ImageGen == "off" {
-			return "Image generation is off in Settings → Models → Images: its tools say so until a model is picked there"
+		if settings.Shared().ImageGen == "off" {
+			return "Image generation is off in Settings › Models › Images: its tools say so until a model is picked there"
 		}
 		return "No model that draws images is set up yet: it draws once a provider with an image model is added, and says so until then"
 	}

@@ -38,7 +38,7 @@ func TestProviderListBeforeSave(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		io.WriteString(w, `{"data":[{"id":"gpt-5.5"},{"id":"claude-sonnet-5"},{"id":"text-embedding-3"}]}`)
+		io.WriteString(w, `{"data":[{"id":"gpt-5.5"},{"id":"claude-sonnet-5"},{"id":"text-embedding-3"},{"id":"bge-reranker-v2-m3"}]}`)
 	}))
 	defer up.Close()
 	mux := http.NewServeMux()
@@ -54,10 +54,17 @@ func TestProviderListBeforeSave(t *testing.T) {
 		t.Fatalf("%d %s", w.Code, w.Body)
 	}
 	var got struct {
-		Models []struct{ ID, Name string }
+		Models    []struct{ ID, Name string }
+		EmbedIDs  []string
+		RerankIDs []string
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
+	}
+	// listed apart by kind, for the form to name each one (heatonz;
+	// solider1394 on X: a count alone read as no models)
+	if strings.Join(got.EmbedIDs, " ") != "text-embedding-3" || strings.Join(got.RerankIDs, " ") != "bge-reranker-v2-m3" {
+		t.Fatalf("embed %v rerank %v: %s", got.EmbedIDs, got.RerankIDs, w.Body)
 	}
 	var ids []string
 	for _, m := range got.Models {

@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/yetone/magpie/internal/provider"
@@ -45,15 +46,17 @@ func TestCodexCatalogOffersUnknownModelsLevels(t *testing.T) {
 		for _, l := range m.Levels {
 			ls = append(ls, l.Effort)
 		}
-		if len(ls) != 3 || ls[0] != "low" || ls[1] != "medium" || ls[2] != "high" || m.Default == nil {
-			t.Errorf("%s offers %v (default %v), want low, medium, high", m.Slug, ls, m.Default)
+		// and Ultra, which Codex sends as high, the top of them (pingqipai3 on X)
+		if !slices.Equal(ls, []string{"low", "medium", "high", "ultra"}) || m.Default == nil {
+			t.Errorf("%s offers %v (default %v), want low, medium, high, ultra", m.Slug, ls, m.Default)
 		}
 	}
 	if seen != 3 {
 		t.Errorf("%d of XJAI's models in magpie-models.json: %s", seen, raw)
 	}
-	// and magpie's own effort control for Codex offers the same
-	if opts := codexEfforts(magpieModels("codex"), "xjai/model-test"); len(opts) != 4 || opts[0].Value != "" {
+	// and magpie's own effort control for Codex offers the same, Ultra
+	// included (EDwinpzy on Discord)
+	if opts := codexEfforts(magpieModels("codex"), "xjai/model-test"); len(opts) != 5 || opts[0].Value != "" || opts[4].Value != "ultra" {
 		t.Errorf("effort control: %+v", opts)
 	}
 }

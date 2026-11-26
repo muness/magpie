@@ -1,10 +1,13 @@
 package sessions
 
 import (
+	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -235,7 +238,7 @@ func TestClaudeCopyAfterCompactIsOneRow(t *testing.T) {
 	var compacts []string
 	for p, st := range cache {
 		if strings.HasSuffix(p, ccCompacted+".jsonl") {
-			compacts = st.Compacts
+			compacts = st.more().Compacts
 		}
 	}
 	mu.Unlock()
@@ -475,6 +478,48 @@ func TestClaudeForkedSessionsSubagentIsCounted(t *testing.T) {
 // replies of 10 in; the branch holds one of them, after the summary, and
 // went on with one of its own.
 func TestClaudeCopyBeforeACompactionIsCounted(t *testing.T) {
+	ccCompactedBranchFixture(t)
+	want := []string{ccCompacted, ccBranch}
+	slices.Sort(want)
+	if got := ccRows("claude"); !slices.Equal(got, want) {
+		t.Fatalf("rows = %v, want the session and the branch under it, %v", got, want)
+	}
+	ccWantBranches(t, ccCompacted, ccBranch)
+	days, sessions := ccStatTokens(t)
+	if days.Input != 80 || sessions.Input != 80 {
+		t.Errorf("tokens in = %d (days), %d (sessions); want 80: 70 of the session, 10 the branch's own", days.Input, sessions.Input)
+	}
+}
+
+// What a branch holds that its session doesn't is kept on disk, so a start
+// after one that read it counts the same and reads no file's uuids again
+// (#2278).
+func TestClaudeBranchRestKeptAcrossStarts(t *testing.T) {
+	ccCompactedBranchFixture(t)
+	if days, sessions := ccStatTokens(t); days.Input != 80 || sessions.Input != 80 {
+		t.Fatalf("tokens in = %d (days), %d (sessions); want 80", days.Input, sessions.Input)
+	}
+	for start := range 2 {
+		Reset()
+		mu.Lock()
+		clear(ccUUIDMemo)
+		mu.Unlock()
+		if days, sessions := ccStatTokens(t); days.Input != 80 || sessions.Input != 80 {
+			t.Errorf("start %d: tokens in = %d (days), %d (sessions); want 80", start, days.Input, sessions.Input)
+		}
+		mu.Lock()
+		read := len(ccUUIDMemo)
+		mu.Unlock()
+		if read != 0 {
+			t.Errorf("start %d read the uuids of %d files", start, read)
+		}
+	}
+}
+
+// ccCompactedBranchFixture is compacted.jsonl as it was when
+// compacted-branch-on.jsonl was branched from it, and that branch.
+func ccCompactedBranchFixture(t *testing.T) {
+	t.Helper()
 	claude, _ := setup(t)
 	ccForkFixture(t, claude,
 		[2]string{"compacted.jsonl", ccCompacted},
@@ -500,16 +545,6 @@ func TestClaudeCopyBeforeACompactionIsCounted(t *testing.T) {
 		t.Fatal(err)
 	}
 	Reset()
-	want := []string{ccCompacted, ccBranch}
-	slices.Sort(want)
-	if got := ccRows("claude"); !slices.Equal(got, want) {
-		t.Fatalf("rows = %v, want the session and the branch under it, %v", got, want)
-	}
-	ccWantBranches(t, ccCompacted, ccBranch)
-	days, sessions := ccStatTokens(t)
-	if days.Input != 80 || sessions.Input != 80 {
-		t.Errorf("tokens in = %d (days), %d (sessions); want 80: 70 of the session, 10 the branch's own", days.Input, sessions.Input)
-	}
 }
 
 // Of two forks that went on from the same start, the one a /branch names
@@ -551,4 +586,341 @@ func TestClaudeBranchNamesItsSession(t *testing.T) {
 	}
 	Reset()
 	ccWantBranches(t, ccForkOther, ccForkOn)
+}
+
+// What a group of files that start alike came to is kept on disk, so a
+// start after one that judged it reads none of their uuids again, and a
+// file of it that changed has it judged again (#2278).
+func TestClaudeFamilyKeptAcrossStarts(t *testing.T) {
+	claude, _ := setup(t)
+	ccForkFixture(t, claude,
+		[2]string{"original.jsonl", ccOriginal},
+		[2]string{"original.jsonl", ccCopyIDs[0]},
+		[2]string{"fork-on.jsonl", ccForkOn})
+	if got := ccRows("claude"); !slices.Equal(got, []string{ccForkOn}) {
+		t.Fatalf("rows = %v, want the fork only", got)
+	}
+	Reset()
+	mu.Lock()
+	clear(ccUUIDMemo)
+	mu.Unlock()
+	if got := ccRows("claude"); !slices.Equal(got, []string{ccForkOn}) {
+		t.Fatalf("after a start, rows = %v, want the fork only", got)
+	}
+	mu.Lock()
+	read := len(ccUUIDMemo)
+	mu.Unlock()
+	if read != 0 {
+		t.Errorf("a start read the uuids of %d files of a group judged before", read)
+	}
+	// the copy goes on with a turn of its own: a branch now
+	b, err := os.ReadFile(filepath.Join("testdata", "claude-forks", "fork-other.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(claude, "projects", "-w-proj", ccCopyIDs[0]+".jsonl")
+	if err := os.WriteFile(p, []byte(strings.ReplaceAll(string(b), ccForkOther, ccCopyIDs[0])), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(p, at, at); err != nil {
+		t.Fatal(err)
+	}
+	Reset()
+	want := []string{ccForkOn, ccCopyIDs[0]}
+	slices.Sort(want)
+	if got := ccRows("claude"); !slices.Equal(got, want) {
+		t.Fatalf("after the copy went on, rows = %v, want %v", got, want)
+	}
+}
+
+// A long session resumed into copies (each a whole copy of it, ~100 MB
+// a file for the reporter's sessions, on X) goes on in one file, the one
+// the copies are kept in. A turn added to it is read on its own: the
+// copies, which didn't change, are not read again, neither for their
+// uuids (ccFamily) nor for what they hold that it doesn't (ccRest), and
+// the turn is counted.
+func TestClaudeKeeperTurnReadsNoCopy(t *testing.T) {
+	claude, _ := setup(t)
+	ccForkFixture(t, claude,
+		[2]string{"original.jsonl", ccOriginal},
+		[2]string{"original.jsonl", ccCopyIDs[0]},
+		[2]string{"fork-on.jsonl", ccForkOn})
+	if got := ccRows("claude"); !slices.Equal(got, []string{ccForkOn}) {
+		t.Fatalf("rows = %v, want the fork only", got)
+	}
+	before, _ := ccStatTokens(t)
+	proj := filepath.Join(claude, "projects", "-w-proj")
+	keeper := filepath.Join(proj, ccForkOn+".jsonl")
+	turn := func(n int) {
+		t.Helper()
+		id := fmt.Sprintf("0c0c0c0c-0000-4000-8000-%012d", n)
+		line := `{"parentUuid":null,"isSidechain":false,"message":{"id":"msg_turn_` + id + `","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"more"}],"stop_reason":"end_turn","usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}},"type":"assistant","uuid":"` + id + `","timestamp":"` + time.Now().Add(-time.Duration(10-n)*time.Minute).UTC().Format(time.RFC3339Nano) + `","sessionId":"` + ccForkOn + `","cwd":"/w/proj"}` + "\n"
+		f, err := os.OpenFile(keeper, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString(line); err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+		at := time.Now().Add(-time.Duration(10-n) * time.Minute)
+		if err := os.Chtimes(keeper, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var hmu sync.Mutex
+	var whole []string // files read from their start
+	scanHook = func(p string, off int64) {
+		if off == 0 && strings.HasPrefix(p, proj) {
+			hmu.Lock()
+			whole = append(whole, filepath.Base(p))
+			hmu.Unlock()
+		}
+	}
+	t.Cleanup(func() { scanHook = nil })
+	for n := 1; n <= 2; n++ {
+		turn(n)
+		hmu.Lock()
+		whole = nil
+		hmu.Unlock()
+		if got := ccRows("claude"); !slices.Equal(got, []string{ccForkOn}) {
+			t.Fatalf("turn %d: rows = %v, want the fork only", n, got)
+		}
+		days, _ := ccStatTokens(t)
+		if want := before.Input + n*1000; days.Input != want {
+			t.Errorf("turn %d: tokens in = %d, want %d", n, days.Input, want)
+		}
+		hmu.Lock()
+		got := whole
+		hmu.Unlock()
+		if len(got) > 0 {
+			t.Errorf("turn %d read files whole again: %v", n, got)
+		}
+	}
+}
+
+// When the file a branch is kept in grows with a message the branch held
+// on its own, that message is counted once still: the branch's own part
+// is read again, not kept as it was (ccRest).
+func TestClaudeKeeperTurnTheBranchHeldIsCountedOnce(t *testing.T) {
+	ccCompactedBranchFixture(t)
+	if days, _ := ccStatTokens(t); days.Input != 80 {
+		t.Fatalf("tokens in = %d, want 80", days.Input)
+	}
+	claude := os.Getenv("CLAUDE_CONFIG_DIR")
+	proj := filepath.Join(claude, "projects", "-w-proj")
+	b, err := os.ReadFile(filepath.Join(proj, ccBranch+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var own string
+	for _, l := range strings.SplitAfter(string(b), "\n") {
+		if strings.Contains(l, `"type":"assistant"`) && strings.Contains(l, `"input_tokens"`) {
+			own = l
+		}
+	}
+	if own == "" {
+		t.Fatal("the branch has no reply")
+	}
+	p := filepath.Join(proj, ccCompacted+".jsonl")
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString(strings.ReplaceAll(own, ccBranch, ccCompacted))
+	f.Close()
+	at := fi.ModTime().Add(time.Minute)
+	if err := os.Chtimes(p, at, at); err != nil {
+		t.Fatal(err)
+	}
+	if days, sessions := ccStatTokens(t); days.Input != 80 || sessions.Input != 80 {
+		t.Errorf("tokens in = %d (days), %d (sessions); want 80, the branch's reply counted once", days.Input, sessions.Input)
+	}
+}
+
+// A turn of the session the copies are kept in, made while magpie was
+// not running, reads none of the copies again on the next start: the
+// uuids of each file and what each copy holds on its own are kept on
+// disk, and the keeper is read on from where it was read to. In memory
+// only, each start after a turn read every file of the group whole: for
+// a session resumed into ~100 copies of 30 to 100 MB (shangyuan0818, on
+// X) gigabytes, and seconds before Sessions showed.
+func TestClaudeKeeperTurnAfterAStartReadsNoCopy(t *testing.T) {
+	claude, _ := setup(t)
+	ccForkFixture(t, claude,
+		[2]string{"original.jsonl", ccOriginal},
+		[2]string{"original.jsonl", ccCopyIDs[0]},
+		[2]string{"fork-on.jsonl", ccForkOn})
+	if got := ccRows("claude"); !slices.Equal(got, []string{ccForkOn}) {
+		t.Fatalf("rows = %v, want the fork only", got)
+	}
+	before, _ := ccStatTokens(t)
+	proj := filepath.Join(claude, "projects", "-w-proj")
+	keeper := filepath.Join(proj, ccForkOn+".jsonl")
+	var hmu sync.Mutex
+	var whole []string // files read from their start
+	scanHook = func(p string, off int64) {
+		if off == 0 && strings.HasPrefix(p, proj) {
+			hmu.Lock()
+			whole = append(whole, filepath.Base(p))
+			hmu.Unlock()
+		}
+	}
+	t.Cleanup(func() { scanHook = nil })
+	for n := 1; n <= 2; n++ {
+		ccKeeperTurn(t, keeper, ccForkOn, n)
+		Reset() // a start: nothing read is in memory
+		hmu.Lock()
+		whole = nil
+		hmu.Unlock()
+		if got := ccRows("claude"); !slices.Equal(got, []string{ccForkOn}) {
+			t.Fatalf("turn %d: rows = %v, want the fork only", n, got)
+		}
+		days, _ := ccStatTokens(t)
+		if want := before.Input + n*1000; days.Input != want {
+			t.Errorf("turn %d: tokens in = %d, want %d", n, days.Input, want)
+		}
+		hmu.Lock()
+		got := slices.Clone(whole)
+		hmu.Unlock()
+		// the keeper's own parse reads its turn on; nothing reads a copy,
+		// or the keeper, from its start
+		if len(got) > 0 {
+			t.Errorf("turn %d, after a start, read files whole again: %v", n, got)
+		}
+	}
+}
+
+// ccKeeperTurn appends the nth turn, of 1000 tokens in, to the session
+// file at p.
+func ccKeeperTurn(t *testing.T, p, session string, n int) {
+	t.Helper()
+	id := fmt.Sprintf("0c0c0c0c-0000-4000-8000-%012d", n)
+	line := `{"parentUuid":null,"isSidechain":false,"message":{"id":"msg_turn_` + id + `","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"more"}],"stop_reason":"end_turn","usage":{"input_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}},"type":"assistant","uuid":"` + id + `","timestamp":"` + time.Now().Add(-time.Duration(10-n)*time.Minute).UTC().Format(time.RFC3339Nano) + `","sessionId":"` + session + `","cwd":"/w/proj"}` + "\n"
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(line); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	at := time.Now().Add(-time.Duration(10-n) * time.Minute)
+	if err := os.Chtimes(p, at, at); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The uuids kept of a file stand only while what they were read from is
+// still its start: a file written over, longer than before, is read
+// again from its start.
+func TestClaudeKeptUUIDsOfAFileWrittenOver(t *testing.T) {
+	claude, _ := setup(t)
+	ccForkFixture(t, claude,
+		[2]string{"original.jsonl", ccOriginal},
+		[2]string{"original.jsonl", ccCopyIDs[0]},
+		[2]string{"fork-on.jsonl", ccForkOn})
+	ccRows("claude")
+	Reset()
+	p := filepath.Join(claude, "projects", "-w-proj", ccForkOn+".jsonl")
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := file{path: p, size: fi.Size(), mod: modOf(fi.ModTime())}
+	mu.Lock()
+	kept := ccUUIDKept(f)
+	mu.Unlock()
+	if kept == nil || len(kept.set) == 0 {
+		t.Fatal("no uuids kept of the fork after a start")
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// its first uuid changed, and a line more
+	i := strings.Index(string(b), `"uuid":"`) + len(`"uuid":"`)
+	b[i] ^= 1
+	if err := os.WriteFile(p, append(b, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err = os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f = file{path: p, size: fi.Size(), mod: modOf(fi.ModTime())}
+	mu.Lock()
+	kept = ccUUIDKept(f)
+	mu.Unlock()
+	if kept != nil {
+		t.Error("the uuids kept of a file written over still stand")
+	}
+}
+
+// When the file a branch is kept in grows, after a start, with a message
+// the branch held on its own, that message is counted once still: what
+// the branch held is kept with the uuids it was read from, and read
+// again when the keeper holds one of them.
+func TestClaudeKeeperTurnTheBranchHeldAfterAStart(t *testing.T) {
+	ccCompactedBranchFixture(t)
+	if days, _ := ccStatTokens(t); days.Input != 80 {
+		t.Fatalf("tokens in = %d, want 80", days.Input)
+	}
+	Reset()
+	claude := os.Getenv("CLAUDE_CONFIG_DIR")
+	proj := filepath.Join(claude, "projects", "-w-proj")
+	b, err := os.ReadFile(filepath.Join(proj, ccBranch+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var own string
+	for _, l := range strings.SplitAfter(string(b), "\n") {
+		if strings.Contains(l, `"type":"assistant"`) && strings.Contains(l, `"input_tokens"`) {
+			own = l
+		}
+	}
+	if own == "" {
+		t.Fatal("the branch has no reply")
+	}
+	p := filepath.Join(proj, ccCompacted+".jsonl")
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString(strings.ReplaceAll(own, ccBranch, ccCompacted))
+	f.Close()
+	at := fi.ModTime().Add(time.Minute)
+	if err := os.Chtimes(p, at, at); err != nil {
+		t.Fatal(err)
+	}
+	Reset()
+	if days, sessions := ccStatTokens(t); days.Input != 80 || sessions.Input != 80 {
+		t.Errorf("tokens in = %d (days), %d (sessions); want 80, the branch's reply counted once", days.Input, sessions.Input)
+	}
+}
+
+// The kept uuids and rest ids read back as they were written.
+func TestClaudeKeptUUIDsRoundTrip(t *testing.T) {
+	m := &ccUUIDs{size: 1 << 33, mod: -5, off: 77, forked: "s", set: uuidSet{}, hash: digest{1, 2}}
+	m.set.add("0c0c0c0c-0000-4000-8000-000000000001")
+	m.set.add("not-a-uuid")
+	path, got, err := decodeUUIDs(encodeUUIDs(`C:\x\y.jsonl`, m))
+	if err != nil || path != `C:\x\y.jsonl` || got.size != m.size || got.mod != m.mod || got.off != m.off ||
+		got.forked != m.forked || got.hash != m.hash || !maps.Equal(got.set, m.set) {
+		t.Fatalf("decoded %q %+v, %v; want %+v", path, got, err, m)
+	}
+	ids := map[string][][16]byte{"a\x00b": {uuidKey("x"), uuidKey("y")}, "c": {}}
+	back := decodeRestIDs(encodeRestIDs(ids))
+	if len(back) != 2 || len(back["c"]) != 0 || back["c"] == nil || !slices.Equal(back["a\x00b"], ids["a\x00b"]) {
+		t.Fatalf("rest ids = %v, want %v", back, ids)
+	}
 }

@@ -29,9 +29,16 @@ var serving sync.WaitGroup
 // stopServing stops this process's gateway taking requests and returns
 // once those in flight have finished.
 func stopServing() {
+	gatewayMu.Lock()
 	endBackend()
+	gatewayMu.Unlock()
 	serving.Wait()
 }
+
+// StopServing is stopServing, for a signal Wails doesn't handle (SIGHUP:
+// the terminal the app was started from closing), so the gateway drains and
+// saves its idle Claude sessions before magpie dies of it.
+func StopServing() { stopServing() }
 
 // startBackend starts what serves the page and the agents: the gateway,
 // unless another magpie has it (then that one serves and this one only
@@ -59,21 +66,30 @@ func startBackend() (gw *gateway.Server) {
 	// comes from the models.dev catalog plus each vendor's own /models answer.
 	// Keep both halves warm without making the user click anything.
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if catalog.Stale() {
+		// the copy magpie ships with, on a first run or over an older
+		// one: models.dev may not be reachable (creeksuen on X)
+		catalog.Seed()
+		if catalog.Source() == "" {
+			// no catalog file at all (the copy couldn't be written):
+			// fetched before the lists below are made of it
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			if err := catalog.Sync(ctx); err != nil {
 				log.Println("catalog:", err)
 			}
+			cancel()
 		}
-		cancel()
+		// fetched now when stale, beside the lists below rather than
+		// before them, so a models.dev that hangs holds nothing up; a
+		// fetch tells the agents (catalog.Changed). Then again each day
+		// it stays open, for new models' prices, and soon after a fetch
+		// that failed.
+		go catalog.KeepFresh()
 		// A signed-in agent's list exists only at the vendor; fill it in the
 		// first time so the picker never shows a stale snapshot.
 		provider.FetchNew(20 * time.Second)
 		// lists an older magpie wrote into agents' files, without what
 		// it has learnt since (context windows, providers added)
 		agent.SyncCatalog()
-		// and fetched again each day it stays open, for new models' prices
-		catalog.KeepFresh()
 	}()
 	return gw
 }
@@ -127,6 +143,13 @@ func serveGateway() *gateway.Server {
 }
 
 func serveGatewayLocked() *gateway.Server {
+	if backendCtx.Err() != nil {
+		return nil
+	}
+	// paused by the user (gatewaypause.go): nothing serves it until resumed
+	if pausedNow() {
+		return nil
+	}
 	// handing over, the one there is this one's predecessor, which lets go
 	// once this one listens beside it
 	// so is the one that handed this one its socket, still finishing its
@@ -152,12 +175,17 @@ func serveGatewayLocked() *gateway.Server {
 		if gateway.Taken() {
 			if !takenSaid.Swap(true) {
 				log.Printf("gateway: %s is taken but doesn't answer as magpie yet; this magpie serves the gateway once it is free", gateway.URL())
+				// who has it, when that can be read: the page says it too
+				if h, ok := gateway.NoteHeld(); ok {
+					log.Printf("gateway: %s", h.Sentence())
+				}
 			}
 			return nil
 		}
 	}
 	takenSaid.Store(false)
 	gatewayOther.Store(nil)
+	gateway.ClearHeld()
 	gw := gateway.New()
 	served.Store(gw)
 	serving.Add(1)

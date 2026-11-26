@@ -24,7 +24,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -33,10 +32,13 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/rosetta"
+	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/source"
+	"github.com/yetone/magpie/internal/winarm"
 )
 
 // Site is magpie's home; its /api/latest is the update feed.
@@ -48,7 +50,7 @@ func Feed() string {
 	if f := os.Getenv("MAGPIE_UPDATE_FEED"); f != "" {
 		return f
 	}
-	return Site + "/api/latest"
+	return siteFeed
 }
 
 // Release is one published version.
@@ -57,6 +59,8 @@ type Release struct {
 	Notes   string           `json:"notes"`   // markdown
 	URL     string           `json:"url"`     // the release page
 	Assets  map[string]Asset `json:"assets"`  // by file name
+	// Signed is what vouches for Assets' hashes (signed.go).
+	Signed *Signed `json:"signed,omitempty"`
 }
 
 // Asset is one downloadable file of a release.
@@ -64,18 +68,64 @@ type Asset struct {
 	URL    string `json:"url"`
 	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256"`
+	// API is GitHub's API address of the file, asked when URL is busy
+	// (apiroute.go); a feed without it has it looked up from URL.
+	API string `json:"api,omitempty"`
+	// GitHub is the file's github.com address when URL is another (the
+	// site's copy on R2): where a download goes on when URL fails, and
+	// what a mirror the user gave is put in front of.
+	GitHub string `json:"github,omitempty"`
+	// attest is set by Release.verify for a file of a release that carries
+	// GitHub build attestations (attest.go): download checks it.
+	attest bool
 }
 
 // client asks the feed and downloads a release through the proxy the rest
 // of magpie's requests take — Settings' Proxy, else the environment's, else
 // the system's (#294) — on a transport of its own, whatever the process has
-// done to http.DefaultTransport.
+// done to http.DefaultTransport. Its Timeout bounds the feed's small
+// answers; a release's file goes through fileClient, which has none.
 var client = &http.Client{Timeout: 10 * time.Minute, Transport: proxied()}
+
+// fileClient is client without its total Timeout, for a release's file: a
+// slow download still moving goes on however long it takes, and one that
+// stops sending is ended by fetch's stall timer (stallAfter) instead. The
+// Timeout failed an 83 MB Windows download under ~140 KB/s at 10 minutes,
+// part way and still coming (#5572).
+func fileClient() *http.Client {
+	c := *client
+	c.Timeout = 0
+	return &c
+}
 
 func proxied() http.RoundTripper {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.Proxy = netproxy.Func
-	return netproxy.Dispatch(t)
+	// a root the user gave in SSL_CERT_FILE (dev-sidecar and the like) is
+	// trusted beside the system's; the file is still checked against the
+	// feed's SHA-256 and, on macOS, the signer
+	netproxy.TrustEnvRoots(t)
+	return updateProxy{netproxy.Dispatch(t)}
+}
+
+// updateProxy has a request that names no proxy of its own (WithProxy,
+// magpie update --proxy) go through Settings' UpdateProxy when it is set
+// (moonlityu on X: models direct, updates through a proxy); unset, it
+// follows the global proxy as updates always did.
+type updateProxy struct{ http.RoundTripper }
+
+func (u updateProxy) RoundTrip(req *http.Request) (*http.Response, error) {
+	if c := strings.TrimSpace(settings.Shared().UpdateProxy); c != "" && netproxy.Choice(req.Context()) == "" {
+		req = req.WithContext(netproxy.With(req.Context(), c))
+	}
+	return u.RoundTripper.RoundTrip(req)
+}
+
+// CloseIdleConnections passes on to the transport underneath.
+func (u updateProxy) CloseIdleConnections() {
+	if c, ok := u.RoundTripper.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
 }
 
 // Latest asks the feed for the newest release, its notes in English.
@@ -85,7 +135,58 @@ func Latest(ctx context.Context) (*Release, error) { return LatestIn(ctx, "") }
 // InLang): the app's language, which What's new follows. On Settings'
 // Stable channel it is Stable's release (see Stable).
 func LatestIn(ctx context.Context, lang string) (*Release, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", withChannel(withLang(Feed(), lang)), nil)
+	return latestAt(ctx, withChannel(withLang(Feed(), lang)), lang)
+}
+
+// LatestEvery is LatestIn on every version, whatever Settings' channel:
+// what Stable's "up to date" leaves out, the newest release out.
+func LatestEvery(ctx context.Context, lang string) (*Release, error) {
+	return latestAt(ctx, withLang(Feed(), lang), lang)
+}
+
+// LatestStable is the Stable channel's release, whatever Settings'
+// channel: what a fresh install compares itself with, to stay on Stable
+// when it is Stable's version (the site's Stable download). Only the site
+// knows it, so a failed feed is never answered from GitHub.
+func LatestStable(ctx context.Context) (*Release, error) {
+	u, err := url.Parse(Feed())
+	if err != nil {
+		return nil, err
+	}
+	q := u.Query()
+	q.Set("channel", settings.UpdateStable)
+	u.RawQuery = q.Encode()
+	return latestFrom(ctx, u.String(), "")
+}
+
+func latestAt(ctx context.Context, feed, lang string) (*Release, error) {
+	if githubOnly() {
+		return githubLatest(ctx, lang)
+	}
+	if !fallsBack(ctx) {
+		return latestFrom(ctx, feed, lang)
+	}
+	// the site may be unreachable where github.com is (a company's allow
+	// list): after a failed feed, GitHub's own release is read and held
+	// to the same signature (fallback.go)
+	fctx, cancel := context.WithTimeout(ctx, feedWait)
+	defer cancel()
+	rel, err := latestFrom(fctx, feed, lang)
+	if err == nil {
+		return rel, nil
+	}
+	if ctx.Err() != nil {
+		return nil, err
+	}
+	rel, gerr := githubLatest(ctx, lang)
+	if gerr != nil {
+		return nil, fmt.Errorf("%w (and GitHub: %v)", err, gerr)
+	}
+	return rel, nil
+}
+
+func latestFrom(ctx context.Context, feed, lang string) (*Release, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", feed, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +205,11 @@ func LatestIn(ctx context.Context, lang string) (*Release, error) {
 	if parse(r.Version) == nil {
 		return nil, fmt.Errorf("update feed: no version")
 	}
+	if err := r.verify(); err != nil {
+		return nil, fmt.Errorf("update feed: %w", err)
+	}
 	r.Notes = InLang(r.Notes, lang)
+	r.githubAddresses()
 	return &r, nil
 }
 
@@ -117,7 +222,7 @@ func Released(v string) bool {
 }
 
 // describe matches what git describe adds after a tag: commits since, hash.
-var describe = regexp.MustCompile(`^\d+-g[0-9a-f]+`)
+var describe = lazyre.New(`^\d+-g[0-9a-f]+`)
 
 // Newer reports whether version a comes after b. A pre-release comes before
 // the release it leads up to.
@@ -200,11 +305,13 @@ func parse(v string) *semver {
 // one.
 var GUI bool
 
-// goos and goarch are the system this magpie was built for, and
-// translated says it runs under Rosetta; tests set them.
+// goos and goarch are the system this magpie was built for, translated
+// says it runs under Rosetta, and emulated under Windows on Arm's x64
+// emulation; tests set them.
 var (
 	goos, goarch = runtime.GOOS, runtime.GOARCH
 	translated   = rosetta.Translated
+	emulated     = winarm.Emulated
 )
 
 // arch is the architecture an update installs: this build's, but Apple
@@ -214,8 +321,14 @@ var (
 // fetched the Intel build again. Installing Apple silicon's is the same
 // swap: the zip's magpie.app is renamed over the bundle, signed by the
 // same team (sameSigner), and the bare binary is renamed over itself.
+//
+// The same on Windows: an x64 magpie on an Arm64 computer, emulated,
+// updates to the arm64 exe (@EV_John_Liu on X, "magpie是转译的"). The swap
+// is the x64 one: canStart starts the download, which runs natively there,
+// the running exe is moved aside and the arm64 one renamed in under its
+// name, and magpie.com is written again from the new app's own launcher.
 func arch() string {
-	if goos == "darwin" && goarch == "amd64" && translated() {
+	if goarch == "amd64" && (goos == "darwin" && translated() || goos == "windows" && emulated()) {
 		return "arm64"
 	}
 	return goarch
@@ -259,13 +372,24 @@ func Homebrew(exe string) bool {
 	return strings.Contains(filepath.ToSlash(exe), "/Cellar/magpie/")
 }
 
-// Executable is the running binary, symlinks resolved.
+// Executable is the running binary, symlinks resolved. When they can't be
+// (Go's EvalSymlinks fails on the current junction Scoop runs an app from,
+// "The system cannot find the path specified"), it is the path the binary
+// was started from, which still names it.
 func Executable() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return "", err
 	}
-	return filepath.EvalSymlinks(exe)
+	return resolved(exe), nil
+}
+
+// resolved is path with its symlinks resolved, or path when that fails.
+func resolved(path string) string {
+	if p, err := filepath.EvalSymlinks(path); err == nil {
+		return p
+	}
+	return path
 }
 
 // Writable reports whether magpie may replace what lives in dir.
@@ -298,6 +422,7 @@ func Stage(ctx context.Context, rel *Release, bundle string) (string, error) {
 		return "", err
 	}
 	out := filepath.Join(dir, "unzip")
+	step(ctx, StepUnpack)
 	if b, err := proc.CommandContext(ctx, "ditto", "-x", "-k", zip, out).CombinedOutput(); err != nil {
 		os.RemoveAll(dir)
 		return "", fmt.Errorf("unzip: %v: %s", err, b)
@@ -314,6 +439,7 @@ func Stage(ctx context.Context, rel *Release, bundle string) (string, error) {
 	}
 	os.Remove(out)
 	unregister(unzipped) // in case it looked in that moment
+	step(ctx, StepSignature)
 	if err := sameSigner(ctx, bundle, app); err != nil {
 		os.RemoveAll(dir)
 		return "", err
@@ -472,7 +598,7 @@ func relaunchScript(bundle string, window, quiet bool, log string, waits []strin
 }
 
 // bundleExecutableKey finds the program an app's Info.plist names.
-var bundleExecutableKey = regexp.MustCompile(`<key>CFBundleExecutable</key>\s*<string>([^<]+)</string>`)
+var bundleExecutableKey = lazyre.New(`<key>CFBundleExecutable</key>\s*<string>([^<]+)</string>`)
 
 // bundleExecutable is the name of the program in bundle's Contents/MacOS:
 // the one its Info.plist names, else this one's own when it runs from
@@ -1049,7 +1175,7 @@ func RelaunchArgs(window bool, view string) []string {
 }
 
 // AwaitPredecessor blocks, for a while at most, until the magpie that
-// relaunched this one has exited.
+// relaunched this one has exited; on Windows its WebView2 too (awaitGone).
 func AwaitPredecessor() {
 	reportStarted() // first: the one that started this waits for it
 	pid, err := strconv.Atoi(os.Getenv("MAGPIE_REPLACES"))
@@ -1057,9 +1183,7 @@ func AwaitPredecessor() {
 	if err != nil || pid <= 0 {
 		return
 	}
-	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline) && alive(pid); {
-		time.Sleep(100 * time.Millisecond)
-	}
+	awaitGone(pid)
 }
 
 type progressKey struct{}
@@ -1070,6 +1194,42 @@ func WithProgress(ctx context.Context, f func(done, total int64)) context.Contex
 	return context.WithValue(ctx, progressKey{}, f)
 }
 
+type stepKey struct{}
+
+// The steps an update made under WithStep's ctx goes through, in order.
+// After the download its percent says nothing, and a Mac's unpack and
+// signature check take seconds: each says its name instead (esir_tech on
+// Discord, a percent that sat still).
+const (
+	StepDownload  = "download"  // the bytes coming in
+	StepRetry     = "retry"     // the connection broke off or stalled: waiting to try again
+	StepVerify    = "verify"    // the file checked against its SHA-256
+	StepUnpack    = "unpack"    // the Mac's zip unpacked
+	StepSignature = "signature" // the Mac app's signature checked
+)
+
+// WithStep has an update made under ctx say each step it starts.
+func WithStep(ctx context.Context, f func(step string)) context.Context {
+	return context.WithValue(ctx, stepKey{}, f)
+}
+
+func step(ctx context.Context, s string) {
+	if f, ok := ctx.Value(stepKey{}).(func(string)); ok {
+		f(s)
+	}
+}
+
+// stallAfter is how long a download waits for its next byte. A
+// connection that sends nothing for that long (GitHub's asset host from
+// some networks holds one open with no data) is broken off and tried
+// again from where it stopped, as one that drops is; before, the download
+// sat at its percent until the update's 10 minutes ran out (esir_tech on
+// Discord, at 17%). A var for tests.
+var stallAfter = 30 * time.Second
+
+// errStalled is a try that got no byte for stallAfter.
+var errStalled = errors.New("no data came for a while")
+
 // retryWaits are the pauses before each try after the first: a
 // connection that drops at the start or part way (GitHub's asset host from
 // some networks: AIMetaPhD on X, "EOF" at 0.1.1618) is tried again, from
@@ -1077,12 +1237,16 @@ func WithProgress(ctx context.Context, f func(done, total int64)) context.Contex
 var retryWaits = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second}
 
 // download fetches a to path and checks its hash. A connection that drops
-// is tried again after each of retryWaits, asking with Range for what is
-// still missing; the hash is checked over the whole file, the bytes kept
+// is tried again after each of retryWaits, over HTTP/1.1 (OverHTTP1),
+// asking with Range for what is still missing; the hash is checked over the whole file, the bytes kept
 // from the tries before included.
 func download(ctx context.Context, a Asset, path string) error {
 	if a.SHA256 == "" {
 		return errors.New("the release lists no checksum for " + filepath.Base(path))
+	}
+	// the attestation of the signed checksum, before the bytes are fetched
+	if err := attestedFile(ctx, a, filepath.Base(path)); err != nil {
+		return err
 	}
 	// a file left by an earlier run is no part of this one; one that can't
 	// go is said so here, not asked to go on from its end (416)
@@ -1090,19 +1254,79 @@ func download(ctx context.Context, a Asset, path string) error {
 		return err
 	}
 	var err error
+	// the tries go to a's own address, then, once it answered busy
+	// (which trying it again didn't get past on 2026-11-08) or for the
+	// last tries after connections that broke, to the routes after it:
+	// github.com's address of a file the feed names elsewhere (GitHub,
+	// through the user's mirror when one is set), then GitHub's API
+	// route (apiroute.go), never through a mirror.
+	on, viaAPI := a, false
+	toGitHub := a.GitHub != "" && a.GitHub != a.URL
+	toAPI := mirrorOf(ctx) == ""
+	// Settings' update source (source.go): GitHub only starts at github.com
+	// and goes on to its API route; the site only goes to no other
+	switch Source() {
+	case settings.UpdateSourceGitHub:
+		if toGitHub {
+			on.URL, toGitHub = a.GitHub, false
+		}
+	case settings.UpdateSourceSite:
+		toGitHub, toAPI = false, false
+	}
+	var before []string // each route left, and how it failed
 	for try := 0; try <= len(retryWaits); try++ {
 		if try > 0 {
+			step(ctx, StepRetry)
 			select {
 			case <-ctx.Done():
 				return err
 			case <-time.After(retryWaits[try-1]):
 			}
 		}
-		if err = fetch(ctx, a, path); err == nil || ctx.Err() != nil || !Network(err) {
+		step(ctx, StepDownload)
+		tctx := ctx
+		if viaAPI {
+			tctx = withAPIRoute(ctx)
+		}
+		if err = fetch(tctx, on, path); err == nil || ctx.Err() != nil || !Network(err) {
 			break
 		}
+		left := 0
+		if toGitHub {
+			left++
+		}
+		if toAPI {
+			left++
+		}
+		if left > 0 && (busyErr(err) || try >= len(retryWaits)-left) {
+			if toGitHub {
+				toGitHub = false
+				before = append(before, fmt.Sprintf("%v (from %s)", err, hostOf(on.URL)))
+				on.URL = a.GitHub
+			} else {
+				toAPI = false
+				if api, aerr := apiRoute(ctx, a); api != "" {
+					before = append(before, err.Error())
+					on.URL, viaAPI = api, true
+				} else if aerr != nil {
+					err = fmt.Errorf("%w (GitHub's API route couldn't be found: %v)", err, aerr)
+				}
+			}
+		}
+		// the tries after a connection that broke go over HTTP/1.1: a
+		// proxy that cuts HTTP/2 streams part way cuts every try made
+		// over it the same way, while HTTP/1.1 through it holds
+		// (biubiu8802 on X: "unexpected EOF" on each try)
+		ctx = netproxy.OverHTTP1(ctx)
 	}
 	if err != nil {
+		if len(before) > 0 {
+			last := "from " + hostOf(on.URL)
+			if viaAPI {
+				last = "through api.github.com"
+			}
+			err = fmt.Errorf("%s, and %s: %w", strings.Join(before, ", "), last, err)
+		}
 		if cerr := clearFile(path); cerr != nil {
 			err = errors.Join(err, cerr)
 		}
@@ -1130,6 +1354,15 @@ func clearFile(path string) error {
 	return fmt.Errorf("couldn't clear the earlier download %s: %w", filepath.Base(path), err)
 }
 
+// hostOf is u's host, for an error that says where a try went without
+// the address itself.
+func hostOf(u string) string {
+	if p, err := url.Parse(u); err == nil && p.Host != "" {
+		return p.Host
+	}
+	return u
+}
+
 // NetError is a download the network broke off: the connection failed or
 // dropped part way. It names the file and the cause, never the address:
 // GitHub's redirect is a signed URL, hundreds of characters of signature
@@ -1140,6 +1373,9 @@ type NetError struct {
 }
 
 func (e *NetError) Error() string {
+	if s, ok := e.Err.(statusError); ok {
+		return fmt.Sprintf("download %s: %s, on every try", e.File, string(s))
+	}
 	cause := e.Err
 	var ue *url.Error
 	if errors.As(cause, &ue) {
@@ -1149,6 +1385,23 @@ func (e *NetError) Error() string {
 }
 
 func (e *NetError) Unwrap() error { return e.Err }
+
+// statusError is a reply a host gives when it is busy, not a refusal of
+// the file: its status line.
+type statusError string
+
+func (s statusError) Error() string { return string(s) }
+
+// busyStatus is a status trying again may get past: the host or its
+// gateway overloaded or timed out, or asking for a pause.
+func busyStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
 
 // Network reports whether err is a download the network broke off, which
 // trying again may get through.
@@ -1162,7 +1415,10 @@ func Network(err error) bool { return errors.As(err, new(*NetError)) }
 func fetch(ctx context.Context, a Asset, path string) error {
 	// through a mirror when one is given (mirror.go): the hash checked
 	// below is still the feed's
-	u := mirrored(mirrorOf(ctx), a.URL)
+	u := a.URL
+	if !onAPIRoute(ctx) {
+		u = mirrored(mirrorOf(ctx), a.URL)
+	}
 	mirror := strings.TrimSuffix(u, a.URL)
 	name := filepath.Base(path)
 	var have int64
@@ -1191,26 +1447,52 @@ func fetch(ctx context.Context, a Asset, path string) error {
 		}
 		have = 0
 	}
+	// a try that hears nothing for stallAfter, from the ask to the last
+	// byte, is broken off as the network's (errStalled)
+	tctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	idle := time.AfterFunc(stallAfter, func() { cancel(errStalled) })
+	defer idle.Stop()
+	netErr := func(err error) error {
+		if errors.Is(context.Cause(tctx), errStalled) {
+			err = errStalled
+		}
+		return &NetError{File: name, Err: err}
+	}
 	var res *http.Response
 	flag := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 	for restarted := false; ; restarted = true {
-		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		req, err := http.NewRequestWithContext(tctx, "GET", u, nil)
 		if err != nil {
 			return err
 		}
 		if have > 0 {
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", have))
 		}
-		res, err = source.Do(client, req)
+		if onAPIRoute(ctx) {
+			// the file itself; GitHub redirects to it, and Go's client
+			// carries Accept and Range to where it is
+			req.Header.Set("Accept", "application/octet-stream")
+		}
+		res, err = source.Do(fileClient(), req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return fail(err)
 			}
-			return fail(&NetError{File: name, Err: err})
+			return fail(netErr(err))
 		}
 		if res.StatusCode == http.StatusRequestedRangeNotSatisfiable && have > 0 && !restarted {
 			// what was kept isn't the start of the file the host has (it
 			// changed, or the feed's size is off): once more, whole
+			res.Body.Close()
+			have = 0
+			continue
+		}
+		if res.StatusCode == http.StatusPartialContent && have > 0 && !restarted && !strings.HasPrefix(res.Header.Get("Content-Range"), fmt.Sprintf("bytes %d-", have)) {
+			// a 206 that doesn't say it starts where it was asked to (a
+			// host whose Content-Range is bytes NaN-NaN/…, usemagpie.ai
+			// before 0.1.3733): what came can't be laid after what was kept,
+			// so once more, whole
 			res.Body.Close()
 			have = 0
 			continue
@@ -1223,6 +1505,11 @@ func fetch(ctx context.Context, a Asset, path string) error {
 		flag = os.O_WRONLY | os.O_APPEND
 	case res.StatusCode == http.StatusOK:
 		have = 0 // the whole file again
+	case busyStatus(res.StatusCode):
+		// the host is busy or its edge timed out (GitHub's asset host
+		// answered 504 Gateway Timeout, 0.1.3316): tried again, as a
+		// connection that broke, with what came kept
+		return fail(&NetError{File: name, Err: statusError(res.Status)})
 	default:
 		if u != a.URL {
 			return fail(&MirrorError{Mirror: mirror, Err: fmt.Errorf("download %s through the mirror %s: %s", name, mirror, res.Status)})
@@ -1235,7 +1522,8 @@ func fetch(ctx context.Context, a Asset, path string) error {
 	}
 	// a read that fails is the network's; a write that fails (a full
 	// disk) is not, and isn't tried again
-	in := &readErr{r: res.Body}
+	idle.Reset(stallAfter)
+	in := &readErr{r: res.Body, idle: idle}
 	var body io.Reader = in
 	if report, ok := ctx.Value(progressKey{}).(func(done, total int64)); ok {
 		total := res.ContentLength
@@ -1253,11 +1541,13 @@ func fetch(ctx context.Context, a Asset, path string) error {
 	}
 	if err != nil {
 		if ctx.Err() == nil && in.err != nil {
-			err = &NetError{File: name, Err: err}
+			err = netErr(err)
 		}
 		return fail(err)
 	}
+	idle.Stop()
 	// the whole file, what earlier tries kept included, against the feed's
+	step(ctx, StepVerify)
 	if !strings.EqualFold(fileHash(path), a.SHA256) {
 		err = fmt.Errorf("%s does not match its checksum", name)
 		if u != a.URL {
@@ -1268,14 +1558,19 @@ func fetch(ctx context.Context, a Asset, path string) error {
 	return nil
 }
 
-// readErr keeps the error its reader returned, io.EOF aside.
+// readErr keeps the error its reader returned, io.EOF aside, and puts
+// idle off again with each byte.
 type readErr struct {
-	r   io.Reader
-	err error
+	r    io.Reader
+	err  error
+	idle *time.Timer
 }
 
 func (r *readErr) Read(p []byte) (int, error) {
 	n, err := r.r.Read(p)
+	if n > 0 && r.idle != nil {
+		r.idle.Reset(stallAfter)
+	}
 	if err != nil && err != io.EOF {
 		r.err = err
 	}
@@ -1324,4 +1619,17 @@ func openBeside(bundle string, window, quiet bool) string {
 func StartBeside(exe string, window bool, view string) error {
 	_, _, err := launch(exe, RelaunchArgs(window, view), os.Environ())
 	return err
+}
+
+// githubAddresses gives each file the feed names on the site its
+// github.com address, where download goes on when the site's can't be
+// reached; the hash it is checked against is the same.
+func (rel *Release) githubAddresses() {
+	for name, a := range rel.Assets {
+		if a.GitHub != "" || rel.Version == "" || !strings.HasPrefix(a.URL, Site+"/") {
+			continue
+		}
+		a.GitHub = fmt.Sprintf("%s/%s/releases/download/v%s/%s", githubWeb, releaseRepo, rel.Version, url.PathEscape(name))
+		rel.Assets[name] = a
+	}
 }

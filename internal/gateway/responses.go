@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bytes"
 	"cmp"
 	"encoding/json"
 	"fmt"
@@ -33,6 +32,12 @@ type rItem struct {
 	// tool_search_output: the tools Codex's search found, which the model
 	// may call from then on
 	Tools []rTool `json:"tools,omitempty"`
+	// input_file as a standalone item: its file_data and filename sit on
+	// the item itself, flat (a PDF the client drops straight into the
+	// input array, #5452)
+	FileData string `json:"file_data,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+	Filename string `json:"filename,omitempty"`
 	// configuration_update's: an effort changed mid-thread
 	Reasoning *struct {
 		Effort string `json:"effort"`
@@ -173,7 +178,7 @@ func searchFound(tools []rTool) string {
 // Codex as unsealed (callTo's encrypted_function_args), so an upstream that
 // honours the mark must not seal them (#613).
 func unsealed(schema json.RawMessage) json.RawMessage {
-	if !bytes.Contains(schema, []byte(`"encrypted"`)) {
+	if !bodyHas(schema, `"encrypted"`) {
 		return schema
 	}
 	var v any
@@ -208,7 +213,7 @@ func unsealed(schema json.RawMessage) json.RawMessage {
 // "encrypted" (MultiAgentV2's spawn_agent message): an upstream that
 // honours the mark answers the call with that argument sealed.
 func asksSealing(body []byte) bool {
-	if !bytes.Contains(body, []byte(`"encrypted"`)) {
+	if !bodyHas(body, `"encrypted"`) {
 		return false
 	}
 	var q struct {
@@ -245,7 +250,7 @@ func asksSealing(body []byte) bool {
 	}
 	marked := func(schema json.RawMessage) bool {
 		var v any
-		return bytes.Contains(schema, []byte(`"encrypted"`)) && decodeJSON(schema, &v) == nil && mark(v)
+		return bodyHas(schema, `"encrypted"`) && decodeJSON(schema, &v) == nil && mark(v)
 	}
 	for _, t := range q.Tools {
 		if marked(t.Parameters) {
@@ -346,6 +351,9 @@ func readResponsesFor(body []byte, facts, keepInstructions bool) (*Request, erro
 		TopP: q.TopP, Stream: q.Stream, Parallel: q.ParallelToolCalls, Fast: q.ServiceTier == "priority" || q.ServiceTier == "ultrafast", Ultrafast: q.ServiceTier == "ultrafast", Tier: q.ServiceTier, CacheKey: q.PromptCacheKey, Include: q.Include,
 		ClientMetadata: sentRaw(q.ClientMetadata), AccessPrograms: q.AccessPrograms}
 	r.Text, r.Format = textFormat(sentRaw(q.Text))
+	if q.Instructions != "" {
+		r.systemParts = []string{q.Instructions}
+	}
 	// a Responses client's turns go to Claude with hour-long cache marks,
 	// unless it asked for its prompt to be kept in memory only
 	r.hourMarks = q.PromptCacheRetention != "in_memory"
@@ -373,12 +381,27 @@ func readResponsesFor(body []byte, facts, keepInstructions bool) (*Request, erro
 		// written to the vendor's cache again (Anthropic's system comes
 		// first; a Claude subscription's waiting run is found by it) (#502)
 		replied := false
+		// mode: the conversation's latest Codex collaboration mode block;
+		// sysModes: those lifted into the system prompt (latestModeInSystem)
+		var mode string
+		var sysModes []string
 		var rawItems []json.RawMessage // decoded only for native standalone outputs and sealed reasoning
 		for i, it := range items {
 			if it.Role == "assistant" || strings.HasPrefix(it.Type, "function_call") || strings.HasPrefix(it.Type, "custom_tool_call") || strings.HasPrefix(it.Type, "tool_search") || it.Type == "reasoning" {
 				replied = true
 			}
 			switch {
+			case it.Type == "input_file":
+				// a file part as its own item: dropped whole before, it
+				// reached the model only when the request was relayed as
+				// sent (#5452). A video rides the video machinery (#6135)
+				if mt := videoFileType(it.FileData, it.Filename); mt != "" {
+					if v, ok := videoPart(it.FileData, mt, it.Filename); ok {
+						r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{v}})
+					}
+				} else if p, ok := chatFile(it.FileData, it.FileID, it.Filename); ok {
+					r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{p}})
+				}
 			case it.Type == "message" || (it.Type == "" && it.Role != ""):
 				role := "user"
 				if it.Role == "assistant" {
@@ -387,6 +410,19 @@ func readResponsesFor(body []byte, facts, keepInstructions bool) (*Request, erro
 				var parts []Part
 				if !facts || role != "assistant" {
 					parts = responsesParts(it.Content)
+				}
+				if it.Role == "system" || it.Role == "developer" {
+					for _, p := range parts {
+						if p.Kind == Text && p.Text != "" {
+							r.systemParts = append(r.systemParts, p.Text)
+						}
+						if isCollaborationMode(p) {
+							mode = p.Text
+							if !replied && !keepInstructions {
+								sysModes = append(sysModes, p.Text)
+							}
+						}
+					}
 				}
 				if keepInstructions && (it.Role == "system" || it.Role == "developer") {
 					r.Messages = append(r.Messages, Message{Role: it.Role, Parts: parts})
@@ -444,8 +480,8 @@ func readResponsesFor(body []byte, facts, keepInstructions bool) (*Request, erro
 			case (it.Type == "function_call_output" || it.Type == "custom_tool_call_output") && facts:
 				r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: it.CallID}}})
 			case it.Type == "function_call_output" || it.Type == "custom_tool_call_output":
-				out, images := toolOutput(it.Output)
-				part := Part{Kind: ToolResult, CallID: it.CallID, Text: out, Images: images}
+				out, images, audio := toolOutput(it.Output)
+				part := Part{Kind: ToolResult, CallID: it.CallID, Text: out, Images: images, Audio: audio}
 				if it.CallID == "" {
 					// Native account requests may still need translation to
 					// collect a streamed response for a non-streaming client.
@@ -505,6 +541,7 @@ func readResponsesFor(body []byte, facts, keepInstructions bool) (*Request, erro
 				r.Messages = append(r.Messages, Message{Role: "assistant", Parts: []Part{{Kind: Search, ID: it.ID, Text: it.Action.Query, Hits: hits}}})
 			}
 		}
+		r.System = latestModeInSystem(r.System, sysModes, mode)
 	}
 	r.Messages = mergeTurns(r.Messages)
 	sent := len(q.Tools)
@@ -676,6 +713,8 @@ func searchRoundsBack(msgs []Message, name string) []Message {
 
 func isSearch(p Part) bool { return p.Kind == Search }
 
+func isResult(p Part) bool { return p.Kind == ToolResult }
+
 // claudeSigned is thinking Claude signed, or its redacted_thinking.
 func claudeSigned(p Part) bool {
 	return p.Kind == Thinking && (p.SignedBy == sealAnthropic && p.Signature != "" || p.sealedBy(sealAnthropic))
@@ -730,7 +769,7 @@ func toolResultItem(t string) bool {
 // whole exchanges stays where it is, and a request with nothing inside a
 // run comes back byte for byte.
 func joinToolRuns(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`_call"`)) {
+	if !bodyHas(body, `_call"`) {
 		return body
 	}
 	var q map[string]json.RawMessage
@@ -881,7 +920,9 @@ func orphanedToolOutputs(body []byte) []byte {
 			out = append(out, raw)
 			continue
 		}
-		text, images := toolOutput(item.Output)
+		// a recording is told of in the text: a Chat upstream's user
+		// message takes no audio from magpie (chat.go's File)
+		text, images, _ := toolOutput(item.Output)
 		content := []map[string]any{}
 		if text != "" {
 			content = append(content, map[string]any{"type": "input_text", "text": text})
@@ -926,7 +967,7 @@ func orphanedToolOutputs(body []byte) []byte {
 // orphanedToolOutputs, and one naming a call another request carried
 // (previous_response_id) stays as it is.
 func pairToolItems(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`_call"`)) {
+	if !bodyHas(body, `_call"`) {
 		return body
 	}
 	var q map[string]json.RawMessage
@@ -1002,7 +1043,7 @@ func pairToolItems(body []byte) []byte {
 // pages, never what they said, and the reply after it says what was
 // found, so nothing the model read is lost.
 func withoutSearchCalls(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`"web_search_call"`)) {
+	if !bodyHas(body, `"web_search_call"`) {
 		return body
 	}
 	var q map[string]json.RawMessage
@@ -1035,12 +1076,21 @@ func withoutSearchCalls(body []byte) []byte {
 }
 
 // mergeTurns joins consecutive messages of the same role, since the
-// Responses API splits an assistant turn into one item per part.
+// Responses API splits an assistant turn into one item per part. A user
+// message joined after tool results is marked where it begins (opens): the
+// message Codex sends next after a turn that ended on its tool results —
+// interrupted, or failed with no answer — is the user's next turn, as a
+// message after a Chat tool message or an Anthropic tool_result message
+// is, and turnIn tells it so.
 func mergeTurns(msgs []Message) []Message {
 	var out []Message
 	for _, m := range msgs {
 		if n := len(out); n > 0 && out[n-1].Role == m.Role && (m.Role == "user" || m.Role == "assistant") {
+			at := len(out[n-1].Parts)
 			out[n-1].Parts = append(out[n-1].Parts, m.Parts...)
+			if m.Role == "user" && len(m.Parts) > 0 && !slices.ContainsFunc(m.Parts, isResult) && slices.ContainsFunc(out[n-1].Parts[:at], isResult) {
+				out[n-1].Parts[at].opens = true
+			}
 			continue
 		}
 		out = append(out, m)
@@ -1095,6 +1145,15 @@ func responsesParts(raw json.RawMessage) []Part {
 		Text     string `json:"text"`
 		ImageURL string `json:"image_url"`
 		Detail   string `json:"detail"`
+		FileData string `json:"file_data"`
+		FileURL  string `json:"file_url"`
+		FileID   string `json:"file_id"`
+		Filename string `json:"filename"`
+		File     struct {
+			FileData string `json:"file_data"`
+			FileID   string `json:"file_id"`
+			Filename string `json:"filename"`
+		} `json:"file"`
 	}
 	decodeJSON(raw, &items)
 	var out []Part
@@ -1107,6 +1166,19 @@ func responsesParts(raw json.RawMessage) []Part {
 				im := imagePart(it.ImageURL)
 				im.Detail = it.Detail
 				out = append(out, im)
+			}
+		case "input_file":
+			// a video rides the video machinery (#6135); every other file,
+			// a PDF say, is a file part, which the encoders write in their
+			// own tongue (#5452) — dropped whole before, it reached the
+			// model only when the request was relayed as sent
+			src := cmp.Or(it.FileData, it.FileURL, it.File.FileData)
+			if mt := videoFileType(src, it.Filename); mt != "" {
+				if v, ok := videoPart(src, mt, it.Filename); ok {
+					out = append(out, v)
+				}
+			} else if p, ok := chatFile(src, cmp.Or(it.FileID, it.File.FileID), cmp.Or(it.Filename, it.File.Filename)); ok {
+				out = append(out, p)
 			}
 		}
 	}
@@ -1135,8 +1207,8 @@ func replaysReasoning(model, host string) bool {
 // be passed back to the API" (#1104, #1592, #1822). A body with nothing to
 // give comes back byte for byte.
 func withReasoningText(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`"reasoning"`)) && !bytes.Contains(body, []byte(`_call"`)) &&
-		!bytes.Contains(body, []byte(`_output"`)) {
+	if !bodyHas(body, `"reasoning"`) && !bodyHas(body, `_call"`) &&
+		!bodyHas(body, `_output"`) {
 		return body
 	}
 	var q map[string]json.RawMessage
@@ -1375,11 +1447,21 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 				}
 				content = append(content, map[string]any{"type": t, "text": p.Text})
 			case File:
-				t := "input_text"
-				if m.Role == "assistant" {
-					t = "output_text"
+				if m.Role != "assistant" && p.MediaType == "application/pdf" && p.Data != "" {
+					// the file itself, in Responses' own tongue (#5452):
+					// file_data goes with a filename, and a PDF is the
+					// file every Responses model reads
+					content = append(content, map[string]any{"type": "input_file", "filename": "document.pdf", "file_data": "data:" + p.MediaType + ";base64," + p.Data})
+				} else {
+					// a file only referenced (a Gemini fileUri, another
+					// host's file id) is told of: Responses' file_id is
+					// OpenAI's own, not that reference (#5452)
+					t := "input_text"
+					if m.Role == "assistant" {
+						t = "output_text"
+					}
+					content = append(content, map[string]any{"type": t, "text": attachmentText(p)})
 				}
-				content = append(content, map[string]any{"type": t, "text": attachmentText(p)})
 			case Image:
 				if m.Role != "assistant" {
 					content = append(content, map[string]any{"type": "input_image", "detail": responsesDetail(p.Detail), "image_url": dataURL(p)})
@@ -1476,7 +1558,11 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	if r.CacheKey != "" {
 		out["prompt_cache_key"] = r.CacheKey
 	}
-	if r.System != "" {
+	if r.System != "" && provider.InstructionsAfterInput(model) {
+		// GPT-6.2 reads top-level instructions after the input, uncached
+		// every turn: the system prompt goes first in it instead
+		out["input"] = append([]any{provider.DeveloperMessage(r.System)}, input...)
+	} else if r.System != "" {
 		out["instructions"] = r.System
 	}
 	if r.MaxTokens > 0 {
@@ -1494,8 +1580,9 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	if r.Fast && (host == "chatgpt.com" || host == "api.openai.com") {
 		out["service_tier"] = "priority"
 	}
-	// Ultrafast only the ChatGPT backend offers
-	if r.Ultrafast && host == "chatgpt.com" {
+	// Ultrafast the ChatGPT backend offers, and OpenAI's API on the models
+	// its Ultrafast mode names (OoopsHh on X); elsewhere it goes as Fast
+	if r.Ultrafast && (host == "chatgpt.com" || host == "api.openai.com" && provider.OpenAIUltra(model)) {
 		out["service_tier"] = "ultrafast"
 	}
 	if r.OwnTier && r.Tier != "" {
@@ -2536,4 +2623,32 @@ func renderResponses(res Result, model string, named map[string]nsTool) []byte {
 		"model": model, "output": output, "usage": res.Usage.responses(), "incomplete_details": incomplete,
 		"parallel_tool_calls": true, "tool_choice": "auto", "tools": []any{}, "error": nil})
 	return b
+}
+
+// isCollaborationMode: p is a Codex collaboration mode block (Default,
+// Plan), a part of a developer message, which says the thread's mode from
+// there on.
+func isCollaborationMode(p Part) bool {
+	return p.Kind == Text && strings.HasPrefix(strings.TrimSpace(p.Text), "<collaboration_mode>")
+}
+
+// latestModeInSystem is system with each collaboration mode block lifted
+// into it (sysModes) saying the conversation's latest mode instead. The
+// system prompt is the history's first developer messages, so it holds
+// the mode the thread started in or was compacted in, and a switch made
+// after a reply goes in its turn as a reminder: the system prompt said
+// Plan mode "until a developer message explicitly ends it", and the
+// Default switch a user turn carried did not end it, so the model kept
+// planning on every turn (#6835 after a compaction in Plan mode, through
+// the Claude subscription's append.md; #6100 on Chat). The system prompt
+// changes when the mode does (a new run for the Claude subscription, a
+// cache write anew), not on every turn. Codex's words are kept; only which
+// of its blocks the prompt carries is the latest.
+func latestModeInSystem(system string, sysModes []string, mode string) string {
+	for _, m := range sysModes {
+		if m != mode {
+			system = strings.ReplaceAll(system, m, mode)
+		}
+	}
+	return system
 }

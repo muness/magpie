@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/catalog"
 )
 
 // fakePeer is another magpie's gateway as RemoteCards asks it: its kept
@@ -65,6 +67,10 @@ func (f *fakePeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if f.status != 0 {
 		w.WriteHeader(f.status)
+		if f.status == http.StatusForbidden {
+			// the gateway's own word for a magpie that isn't shared
+			w.Write([]byte(`{"error":{"message":"magpie's quotas are told to another machine only when magpie is shared on the local network (Settings → Network and sharing → Share on local network) and the request carries its API key"}}`))
+		}
 		return
 	}
 	if f.held {
@@ -102,8 +108,10 @@ func remoteQuotaHome(t *testing.T, peer http.Handler) {
 // 莫 on Discord: a computer whose providers are another's magpie showed
 // no quota at all. It now shows the other magpie's cards, named with it
 // and kept apart from its own by id, in their kinds; what a card's
-// buttons would do to this computer's accounts is left off, and a card
-// the other magpie has from a third isn't passed on.
+// buttons would do to this computer's accounts is left off. A card the
+// other magpie has from a third is shown too, named after both
+// (yuyong_id on Discord), with no reset to spend from here; one that has
+// been through this magpie before is left out (a loop).
 func TestRemoteMagpieCards(t *testing.T) {
 	peer := &fakePeer{cards: []SubscriptionQuota{
 		{Provider: "codex", Name: "Codex", Icon: "codex", User: "a@x.com", Kind: "subscription", Windows: []QuotaWindow{{Name: "5h", Used: 40}},
@@ -111,7 +119,9 @@ func TestRemoteMagpieCards(t *testing.T) {
 		{Provider: "zhipu", Name: "GLM Coding", Kind: "plan", Windows: []QuotaWindow{{Name: "5h", Used: 10}},
 			Resets: &ResetCredits{Count: 2, ByWindow: true}},
 		{Provider: "deepseek", Name: "DeepSeek", Kind: "balance", Balance: "¥12.00"},
-		{Provider: "home/codex", Name: "Codex · Home", Kind: "subscription", From: "Home"},
+		{Provider: "home/codex", Name: "Codex · Home", Kind: "subscription", From: "Home", User: "b@x.com", Via: []string{"home-self", "office-self"},
+			Windows: []QuotaWindow{{Name: "5h", Used: 20}}, Resets: &ResetCredits{Count: 1}},
+		{Provider: "back/codex", Name: "Codex · Back", Kind: "subscription", From: "Back", User: "c@x.com", Via: []string{catalog.Self(), "office-self"}},
 	}}
 	remoteQuotaHome(t, peer)
 	ctx := context.Background()
@@ -139,10 +149,14 @@ func TestRemoteMagpieCards(t *testing.T) {
 	if b := find(balances, "office/deepseek"); b == nil || b.Balance != "¥12.00" {
 		t.Errorf("balance: %+v", balances)
 	}
+	h := find(subs, "office/home/codex")
+	if h == nil || h.Name != "Codex · Home · Office" || h.From != "Office" || h.User != "b@x.com" || len(h.Windows) != 1 || h.Windows[0].Used != 20 || h.Resets != nil {
+		t.Errorf("a third magpie's card: %+v", h)
+	}
 	for _, qs := range [][]SubscriptionQuota{subs, plans, balances} {
 		for _, q := range qs {
-			if strings.Contains(q.Provider, "home") {
-				t.Errorf("a third magpie's card passed on: %+v", q)
+			if strings.Contains(q.Provider, "back") {
+				t.Errorf("a card that came back through this magpie: %+v", q)
 			}
 		}
 	}
@@ -233,8 +247,7 @@ func TestRemoteMagpieUnreachable(t *testing.T) {
 }
 
 // The cards told to another magpie are this one's as last read: nothing
-// is read for it, however old they are, and another magpie's aren't
-// passed on.
+// is read for it, however old they are.
 func TestCachedCardsAskNobody(t *testing.T) {
 	azureHome(t)
 	c := &subscriptionUsageCache
@@ -279,7 +292,9 @@ func TestKeptQuotaReportAsksNobody(t *testing.T) {
 		c.Unlock()
 	})
 	qs := KeptQuotaReport(time.Now())
-	if len(qs) != 1 || qs[0].Provider != "codex" || qs[0].Kind != "subscription" || len(qs[0].Windows) != 1 || qs[0].Windows[0].Used != 62 || qs[0].Windows[0].ResetsAt == nil {
+	// a ChatGPT card's image row (#6160, WithImageLane) is made from what
+	// the gateway remembers, not read
+	if len(qs) != 1 || qs[0].Provider != "codex" || qs[0].Kind != "subscription" || len(qs[0].Windows) != 2 || qs[0].Windows[0].Used != 62 || qs[0].Windows[0].ResetsAt == nil || qs[0].Windows[1].Lane != "images" {
 		t.Fatalf("report: %+v", qs)
 	}
 	if SubscriptionUsageReading() {
@@ -552,5 +567,216 @@ func TestRemoteCodexResetAnswers(t *testing.T) {
 	}
 	if n := asks.Load(); n != 4 {
 		t.Fatalf("a card not a remote's Codex card asked the remote (%d)", n)
+	}
+}
+
+// #5443: a refresh of a remote magpie's every card has it run each saved
+// Claude account's /usage there, about 5 seconds each, side by side. The
+// refresh was waited for as long as a read of the kept cards (8s), given
+// up on while it still read, and the cards asked for after it were the
+// old ones. It is waited for as long as the remote's gateway may take.
+func TestRemoteMagpieRefreshWaitedFor(t *testing.T) {
+	peer := &fakePeer{cards: []SubscriptionQuota{{Provider: "claude", Name: "Claude", User: "max@x.com", Windows: []QuotaWindow{{Name: "5h", Used: 0}}}}}
+	slow := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == RemoteRefreshPath {
+			// reading there, longer than a read of what it keeps may take
+			time.Sleep(time.Second)
+			peer.Lock()
+			peer.cards = []SubscriptionQuota{{Provider: "claude", Name: "Claude", User: "max@x.com", Windows: []QuotaWindow{{Name: "5h", Used: 45}}}}
+			peer.Unlock()
+		}
+		peer.ServeHTTP(w, r)
+	})
+	remoteQuotaHome(t, slow)
+	oldWait, oldRefresh := remoteWait, remoteRefreshWait
+	remoteWait, remoteRefreshWait = 100*time.Millisecond, 20*time.Second
+	t.Cleanup(func() { remoteWait, remoteRefreshWait = oldWait, oldRefresh })
+	ctx := context.Background()
+	RefreshUsage(ctx, "office", "")
+	var got *SubscriptionQuota
+	for _, q := range peerCards(RemoteCards(ctx)) {
+		if q.Provider == "office/claude" {
+			got = &q
+		}
+	}
+	if got == nil || got.Error != "" || len(got.Windows) != 1 || got.Windows[0].Used != 45 {
+		t.Fatalf("after the remote's refresh of every card: %+v", got)
+	}
+}
+
+// X on 0.1.3678: three magpies each other's Remote (A → B → C → A). A's
+// Remote B was enabled for one local model, and still told Kiro and
+// Codex, by B/kiro and B/C/A/B/C/kiro, the same account read at different
+// hours. A card is shown for the providers the Remote is enabled for, a
+// card whose way repeats a magpie is neither kept nor told, and one
+// account's copies are the newest complete reading.
+func TestRemoteCardsFollowEnabledModelsAndDedupe(t *testing.T) {
+	old, fresh := time.Now().Add(-5*time.Hour), time.Now().Add(-time.Minute)
+	peer := &fakePeer{cards: []SubscriptionQuota{
+		{Provider: "kiro", Name: "Kiro", Kind: "subscription", User: "k@x.com", Via: []string{"c", "b"}, ReadAt: &old, Windows: []QuotaWindow{{Name: "credits", Used: 10}}},
+		{Provider: "c/kiro", Name: "Kiro · C", Kind: "subscription", User: "k@x.com", Via: []string{"c", "b"}, ReadAt: &fresh, Windows: []QuotaWindow{{Name: "credits", Used: 30}}},
+		{Provider: "codex", Name: "Codex", Kind: "subscription", User: "a@x.com", Via: []string{"b"}, Windows: []QuotaWindow{{Name: "5h", Used: 40}}},
+		{Provider: "c/a/b/c/zed", Name: "Zed", Kind: "subscription", User: "z@x.com", Via: []string{"a", "b", "c", "a2", "b", "c"}, Windows: []QuotaWindow{{Name: "credits", Used: 99}}},
+	}}
+	remoteQuotaHome(t, peer)
+	ctx := context.Background()
+	// before the list is read, nothing says what the remote is enabled for
+	got := map[string]SubscriptionQuota{}
+	for _, q := range RemoteCards(ctx) {
+		if q.Kind == "subscription" {
+			got[q.Provider] = q
+		}
+	}
+	if len(got) != 2 || got["office/c/kiro"].Windows[0].Used != 30 || got["office/codex"].Name == "" {
+		t.Fatalf("one Kiro, the newest, and Codex: %+v", got)
+	}
+	for _, q := range got {
+		if len(q.Via) > 3 {
+			t.Errorf("a card that went round was kept: %+v", q)
+		}
+	}
+	// enabled for one model of the remote's own Codex alone
+	list := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"object":"list","data":[{"id":"codex/gpt-6","object":"model","owned_by":"codex","magpie_via":["b"]},{"id":"kiro/claude","object":"model","owned_by":"kiro","magpie_via":["b"]}]}`))
+	}))
+	defer list.Close()
+	p, err := Find("office")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerURL, anth := p.Chat, p.Anthropic
+	p.Chat, p.Anthropic = list.URL, list.URL
+	p.Models = []string{"codex/gpt-6"}
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	p, _ = Find("office")
+	if _, err := p.Fetch(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p.Chat, p.Anthropic = peerURL, anth
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	ForgetRemoteCardsForTest()
+	got = map[string]SubscriptionQuota{}
+	for _, q := range RemoteCards(ctx) {
+		if q.Kind == "subscription" {
+			got[q.Provider] = q
+		}
+	}
+	if _, ok := got["office/codex"]; !ok || len(got) != 1 {
+		t.Fatalf("a Remote enabled for Codex alone tells Codex alone: %+v", got)
+	}
+	for _, q := range CachedCards(time.Now()) {
+		if strings.Contains(q.Provider, "kiro") {
+			t.Errorf("a card of a provider the Remote isn't enabled for is passed on: %+v", q)
+		}
+	}
+}
+
+// @748975219 on X (0.1.3771): with only relay/strata/model enabled, the
+// cards of relay/kiro and relay/codex still passed, as only the first part
+// of the card's id was compared.
+func TestRemoteCardWantedByWholePath(t *testing.T) {
+	cases := []struct {
+		name string
+		ids  []string
+		yes  []string
+		no   []string
+	}{
+		{"two levels", []string{"relay/strata/m"}, []string{"relay/strata", "relay"}, []string{"relay/kiro", "relay/codex", "kiro", "relay/strata/x"}},
+		{"three levels", []string{"a/b/c/m"}, []string{"a/b/c", "a/b", "a"}, []string{"a/b/d", "a/x", "a/b/c/d", "b"}},
+		{"not at a boundary", []string{"relay/kiro/m"}, []string{"relay/kiro"}, []string{"relay/kir", "relay/kiro2", "relay/kiroo", "rel"}},
+		{"prefix of the other way", []string{"relay/kir/m"}, []string{"relay/kir"}, []string{"relay/kiro"}},
+		{"several", []string{"relay/strata/m", "relay/kiro/n"}, []string{"relay/strata", "relay/kiro"}, []string{"relay/codex"}},
+		{"one level", []string{"kiro/m"}, []string{"kiro"}, []string{"codex", "kiro/x"}},
+		{"unknown provider", []string{"m"}, []string{"anything", "a/b"}, nil},
+	}
+	for _, c := range cases {
+		w := cardWantedFor(c.ids)
+		for _, id := range c.yes {
+			if !w(id) {
+				t.Errorf("%s: %v should tell %q", c.name, c.ids, id)
+			}
+		}
+		for _, id := range c.no {
+			if w(id) {
+				t.Errorf("%s: %v should not tell %q", c.name, c.ids, id)
+			}
+		}
+	}
+}
+
+// A user on X (0.1.3929): a Remote magpie added for the Usage page's
+// quotas, with Select none (no model of it served), showed the remote's
+// cards before cfd49e36a and none after, as no card was wanted of a
+// provider with no enabled model. Select none still reads and shows usage.
+func TestRemoteSelectNoneStillShowsItsCards(t *testing.T) {
+	peer := &fakePeer{cards: []SubscriptionQuota{
+		{Provider: "kiro", Name: "Kiro", Kind: "subscription", User: "k@x.com", Windows: []QuotaWindow{{Name: "credits", Used: 10}}},
+		{Provider: "codex", Name: "Codex", Kind: "subscription", User: "a@x.com", Windows: []QuotaWindow{{Name: "5h", Used: 40}}},
+	}}
+	remoteQuotaHome(t, peer)
+	p, err := Find("office")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.NoModels, p.Models = true, nil
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	ForgetRemoteCardsForTest()
+	got := map[string]bool{}
+	for _, q := range RemoteCards(context.Background()) {
+		if q.Kind == "subscription" && q.Error == "" {
+			got[q.Provider] = true
+		}
+	}
+	if !got["office/kiro"] || !got["office/codex"] {
+		t.Fatalf("a Remote set to serve no model still tells its cards: %v", got)
+	}
+}
+
+// fcooji on X (0.1.3959): Claude Code set to usage only on the remote lists
+// no Claude model there, so a Remote with nothing picked here (exposing
+// whatever the remote lists) dropped Claude's card. Only picks narrow cards.
+func TestRemoteUsageOnlyProviderStillShowsItsCard(t *testing.T) {
+	peer := &fakePeer{cards: []SubscriptionQuota{
+		{Provider: "claude", Name: "Claude", Kind: "subscription", User: "c@x.com", Windows: []QuotaWindow{{Name: "5h", Used: 20}}},
+		{Provider: "codex", Name: "Codex", Kind: "subscription", User: "a@x.com", Windows: []QuotaWindow{{Name: "5h", Used: 40}}},
+	}}
+	remoteQuotaHome(t, peer)
+	list := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"object":"list","data":[{"id":"codex/gpt-6","object":"model","owned_by":"codex"}]}`))
+	}))
+	defer list.Close()
+	ctx := context.Background()
+	p, err := Find("office")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerURL, anth := p.Chat, p.Anthropic
+	p.Chat, p.Anthropic = list.URL, list.URL
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	p, _ = Find("office")
+	if _, err := p.Fetch(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p.Chat, p.Anthropic = peerURL, anth
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	ForgetRemoteCardsForTest()
+	got := map[string]bool{}
+	for _, q := range RemoteCards(ctx) {
+		if q.Kind == "subscription" && q.Error == "" {
+			got[q.Provider] = true
+		}
+	}
+	if !got["office/claude"] || !got["office/codex"] {
+		t.Fatalf("nothing picked: every card of the remote is told: %v", got)
 	}
 }

@@ -71,7 +71,7 @@ func setUp(t *testing.T) {
 	}
 	for _, p := range []provider.Provider{
 		{ID: "acme", Name: "Acme", Chat: "https://acme.example.com/v1", Key: "sk-acme", Icon: icon,
-			BalanceToken: "balance-acme", AccessKeyID: "AK-acme", SecretAccessKey: "SK-acme",
+			BalanceToken: "balance-acme", AccessKeyID: "AK-acme", SecretAccessKey: "SK-acme", SessionToken: "ST-acme",
 			Keys:    []provider.KeyAccount{{Name: "second", Key: "sk-acme-2"}},
 			Headers: map[string]string{"X-Team": "a", "X-Api-Key": "hdr-secret"}},
 		// one of the user's whose certificate isn't checked (#2383)
@@ -123,7 +123,7 @@ func TestRoundTrip(t *testing.T) {
 	}
 	p, err := provider.Find("acme")
 	if err != nil || p.Key != "sk-acme" || len(p.Keys) != 1 || p.BalanceToken != "balance-acme" || p.Headers["X-Api-Key"] != "hdr-secret" ||
-		p.AccessKeyID != "AK-acme" || p.SecretAccessKey != "SK-acme" {
+		p.AccessKeyID != "AK-acme" || p.SecretAccessKey != "SK-acme" || p.SessionToken != "ST-acme" {
 		t.Fatalf("acme: %+v %v", p, err)
 	}
 	if b, err := provider.Find("beta"); err != nil || !b.InsecureTLS {
@@ -151,7 +151,7 @@ func TestNoKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range b.Providers {
-		if p.Key != "" || len(p.Keys) != 0 || p.BalanceToken != "" || p.AccessKeyID != "" || p.SecretAccessKey != "" {
+		if p.Key != "" || len(p.Keys) != 0 || p.BalanceToken != "" || p.AccessKeyID != "" || p.SecretAccessKey != "" || p.SessionToken != "" {
 			t.Fatalf("key in a keyless backup: %+v", p)
 		}
 		if _, ok := p.Headers["X-Api-Key"]; ok {
@@ -168,7 +168,7 @@ func TestNoKeys(t *testing.T) {
 
 	home(t)
 	if err := provider.Save(provider.Provider{ID: "acme", Name: "Acme old", Chat: "https://old.example.com/v1", Key: "sk-here", BalanceToken: "balance-here",
-		AccessKeyID: "AK-here", SecretAccessKey: "SK-here"}); err != nil {
+		AccessKeyID: "AK-here", SecretAccessKey: "SK-here", SessionToken: "ST-here"}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := Open(data, "pw")
@@ -182,7 +182,7 @@ func TestNoKeys(t *testing.T) {
 	if r.Added != 1 || r.Replaced != 1 || !slices.Equal(r.NeedKey, []string{"Beta"}) || r.Settings || r.Profiles != 0 {
 		t.Fatalf("result: %+v", r)
 	}
-	if p, _ := provider.Find("acme"); p.Key != "sk-here" || p.BalanceToken != "balance-here" || p.AccessKeyID != "AK-here" || p.SecretAccessKey != "SK-here" || p.Chat != "https://acme.example.com/v1" || p.Headers["X-Team"] != "a" {
+	if p, _ := provider.Find("acme"); p.Key != "sk-here" || p.BalanceToken != "balance-here" || p.AccessKeyID != "AK-here" || p.SecretAccessKey != "SK-here" || p.SessionToken != "ST-here" || p.Chat != "https://acme.example.com/v1" || p.Headers["X-Team"] != "a" {
 		t.Fatalf("acme: %+v", p)
 	}
 	if p, _ := provider.Find("beta"); p.BalanceToken != "" {
@@ -262,6 +262,41 @@ func TestGitHubTokenBackup(t *testing.T) {
 		want := map[bool]string{false: "ghp_local", true: "ghp_incoming"}[keys]
 		if got := settings.Load(); got.GitHubToken != want || got.Theme != "light" {
 			t.Errorf("keys %v: restored token %q theme %q, want %q", keys, got.GitHubToken, got.Theme, want)
+		}
+	}
+}
+
+// Bark's device key is a key too (EV_John_Liu on X): a backup without keys
+// leaves it out, and restoring one keeps the key this machine has.
+func TestBarkKeyBackup(t *testing.T) {
+	home(t)
+	if err := settings.Save(settings.Settings{BarkKey: "bark_local_key", BarkServer: "https://bark.example.com", Theme: "dark"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, keys := range []bool{false, true} {
+		b, err := Collect(keys, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := Seal(b, "pw")
+		if got := strings.Contains(string(mustOpen(t, data)), "bark_local_key"); got != keys {
+			t.Fatalf("keys %v: the Bark key is in the backup: %v", keys, got)
+		}
+	}
+	for _, keys := range []bool{false, true} {
+		incoming := settings.Settings{Theme: "light"}
+		if keys {
+			incoming.BarkKey = "bark_incoming_key"
+		}
+		if err := settings.Save(settings.Settings{BarkKey: "bark_local_key"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Restore(Bundle{Version: 1, Keys: keys, Settings: &incoming}, Parts{Settings: true}); err != nil {
+			t.Fatal(err)
+		}
+		want := map[bool]string{false: "bark_local_key", true: "bark_incoming_key"}[keys]
+		if got := settings.Load(); got.BarkKey != want {
+			t.Errorf("keys %v: restored key %q, want %q", keys, got.BarkKey, want)
 		}
 	}
 }

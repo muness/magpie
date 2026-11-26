@@ -17,6 +17,7 @@ import (
 	"github.com/yetone/magpie/internal/budget"
 	"github.com/yetone/magpie/internal/oidc"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
 )
 
 func gatewayKeys(args []string) error { return gatewayKeysTo(os.Stdout, args) }
@@ -35,17 +36,52 @@ func gatewayKeysTo(out io.Writer, args []string) error {
 		access.MigrateLegacyLANKeyBestEffort()
 		return gatewayKeyModels(out, args[1:])
 	}
+	if action == "aliases" {
+		access.MigrateLegacyLANKeyBestEffort()
+		return gatewayKeyAliases(out, args[1:])
+	}
 	if action == "accounts" {
 		access.MigrateLegacyLANKeyBestEffort()
 		return gatewayKeyAccounts(out, args[1:])
+	}
+	if action == "groups" || action == "group" {
+		return gatewayKeyGroups(out, args[1:])
 	}
 	if action == "quotas" {
 		access.MigrateLegacyLANKeyBestEffort()
 		return gatewayKeyQuotas(out, args[1:])
 	}
+	if action == "concurrency" {
+		access.MigrateLegacyLANKeyBestEffort()
+		return gatewayKeyConcurrency(out, args[1:])
+	}
+	if action == "tier" {
+		access.MigrateLegacyLANKeyBestEffort()
+		return gatewayKeyTier(out, args[1:])
+	}
+	if action == "routing" {
+		access.MigrateLegacyLANKeyBestEffort()
+		return gatewayKeyRouting(out, args[1:])
+	}
+	if action == "redact" || action == "masking" {
+		access.MigrateLegacyLANKeyBestEffort()
+		return gatewayKeyRedact(out, args[1:])
+	}
+	if action == "mcp" {
+		access.MigrateLegacyLANKeyBestEffort()
+		return gatewayKeyMCP(out, args[1:])
+	}
 	if action == "access" {
 		access.MigrateLegacyLANKeyBestEffort()
 		return gatewayKeyAccess(out, args[1:])
+	}
+	if action == "admin" {
+		access.MigrateLegacyLANKeyBestEffort()
+		return gatewayKeyAdmin(out, args[1:])
+	}
+	if action == "memory" {
+		access.MigrateLegacyLANKeyBestEffort()
+		return gatewayKeyMemory(out, args[1:])
 	}
 	if action == "move" {
 		access.MigrateLegacyLANKeyBestEffort()
@@ -92,7 +128,7 @@ func gatewayKeysTo(out io.Writer, args []string) error {
 		args = args[:2]
 	}
 	if (action == "list" && len(args) != 1) || (action != "list" && len(args) != 2) {
-		return fmt.Errorf("usage: magpie gateway-key list | add <name> [--key <value> | --key -] [--read-only] | rotate <id> [--key <value> | --key -] | remove <id> | limit <id> [list | off | reset [<n>] | remove <n> | [add] day|week|month|<N>d|<N>h [--tokens N] [--cost USD] [--cache-reads]] | models <id> [all | <provider>/<model>|<provider>/* ...] | accounts <id> [all | <provider>/<account>|<provider>/<key id> ...] | quotas <id> [on | off] | access <id> [read-only | full] | move <id> <place> | issue --ttl <duration> [--name <name>] [--models a,b] [--accounts a,b] [--tokens N] [--cost USD] [--read-only] [--from <id>] | issuer <id> [on | off] | oidc [list | add --key <id> --repo owner/name … | remove <rule id>]")
+		return fmt.Errorf("usage: magpie gateway-key list | add <name> [--key <value> | --key -] [--read-only] | rotate <id> [--key <value> | --key -] | remove <id> | limit <id> [list | off | reset [<n>] | remove <n> | [add] day|week|month|total|<N>d|<N>h|account [--account <provider>/<account> --window <name>] [--tokens N] [--cost USD] [--cache-reads] [--model <provider>/<model>|<provider>/* ...]] | models <id> [all | <provider>/<model>|<provider>/*|re:<regexp> ...] | aliases <id> [none | <name>=<provider>/<model> ...] | accounts <id> [all | <provider>/<account>|<provider>/<key id> ...] | quotas <id> [on | off] | concurrency <id> [<n> | off] | tier <id> [follow | standard | fast | ultrafast] | routing <id> [follow | smart | order | drain | pace-drain | rotate | usage | pace | weight | free | fast | cheap | expiring | fit | <plugin>/<name>] | redact <id> [follow | on | off] | mcp <id> [all | none | <server>|<server>/<tool> ...] | access <id> [read-only | full] | move <id> <place> | issue --ttl <duration> [--name <name>] [--models a,b] [--accounts a,b] [--tokens N] [--cost USD] [--read-only] [--from <id>] | issuer <id> [on | off] | oidc [list | add --key <id> --repo owner/name … | remove <rule id>]")
 	}
 	switch action {
 	case "list", "add", "rotate", "remove":
@@ -128,16 +164,13 @@ func gatewayKeysTo(out io.Writer, args []string) error {
 			// a key that names accounts and no model may use only its
 			// accounts' providers' models (access.HeldModels)
 			models := "all"
-			if ms := access.HeldModels(k.Models, k.Accounts); len(ms) > 0 {
+			if ms := access.HeldModels(k.Models, access.ExpandGroups(k.Accounts)); len(ms) > 0 {
 				models = strings.Join(ms, ",")
 			}
 			accounts := "all"
 			if len(k.Accounts) > 0 {
-				shown := make([]string, len(k.Accounts))
-				for i, a := range k.Accounts {
-					shown[i] = cmp.Or(names[a], a)
-				}
-				accounts = strings.Join(shown, ",")
+				// a column: no space after each comma, as before
+				accounts = strings.ReplaceAll(access.AccountsShown(names, k.Accounts), ", ", ",")
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", k.ID, strings.Map(func(r rune) rune {
 				if r < 32 || r == 127 {
@@ -171,14 +204,19 @@ func gatewayKeysTo(out io.Writer, args []string) error {
 //
 //	magpie gateway-key limit <id> [list]                what it has used of each limit
 //	magpie gateway-key limit <id> off                   no limit
-//	magpie gateway-key limit <id> day|week|month|<N>d|<N>h [--tokens N] [--cost USD] [--cache-reads]
+//	magpie gateway-key limit <id> day|week|month|total|<N>d|<N>h|account [--account <provider>/<account> --window <name>] [--tokens N] [--cost USD] [--cache-reads]
 //	                                                    its only limit, or the one of several with that window
-//	magpie gateway-key limit <id> add <window> [--tokens N] [--cost USD] [--cache-reads]
+//	magpie gateway-key limit <id> add <window> [--tokens N] [--cost USD] [--cache-reads] [--model openai/*]
 //	                                                    one more limit; a request passes only while every one has something left
 //	magpie gateway-key limit <id> remove <n>            take off the nth limit
 //	magpie gateway-key limit <id> reset [<n>]           count from 0 again, every limit or the nth; a new N-day or N-hour cycle from now (#1509)
+//
+// --model (again, or a comma list) makes a limit count only those models'
+// calls, "<provider>/<model>" or "<provider>/*" (zola_xynb on X): a cap for
+// one model or provider under one key, the key's other models served once
+// it is spent.
 func gatewayKeyLimit(out io.Writer, args []string) error {
-	usage := fmt.Errorf("usage: magpie gateway-key limit <id> [off | reset [<n>] | remove <n> | [add] day|week|month|<N>d|<N>h [--tokens N] [--cost USD] [--cache-reads]]")
+	usage := fmt.Errorf("usage: magpie gateway-key limit <id> [off | reset [<n>] | remove <n> | [add] day|week|month|total|<N>d|<N>h|account [--account <provider>/<account> --window <name>] [--tokens N] [--cost USD] [--cache-reads] [--model <provider>/<model>|<provider>/* ...]]")
 	if len(args) == 0 {
 		return usage
 	}
@@ -264,10 +302,11 @@ func gatewayKeyLimit(out io.Writer, args []string) error {
 			if len(have) > 1 {
 				v, _ := lim.Valid()
 				n := slices.IndexFunc(have, func(l *access.Limit) bool {
-					return v != nil && l.Period == v.Period && l.Days == v.Days && l.Hours == v.Hours
+					return v != nil && l.Period == v.Period && l.Days == v.Days && l.Hours == v.Hours && l.Scope() == v.Scope() &&
+						strings.EqualFold(l.Account, v.Account) && strings.EqualFold(l.AccountWindow, v.AccountWindow)
 				})
 				if n < 0 {
-					return fmt.Errorf("%s has %d limits and none %s: add one with `magpie gateway-key limit %s add %s ...`, or take one off with `remove <n>`", keys[i].Name, len(have), perPhrase(v), id, args[1])
+					return fmt.Errorf("%s has %d limits and none %s%s: add one with `magpie gateway-key limit %s add %s ...`, or take one off with `remove <n>`", keys[i].Name, len(have), perPhrase(v), onModels(v), id, args[1])
 				}
 				in.Index = &n
 			}
@@ -295,9 +334,16 @@ func gatewayKeyLimit(out io.Writer, args []string) error {
 	for n, st := range all {
 		if len(all) > 1 {
 			fmt.Fprintf(w, "\t\n")
-			fmt.Fprintf(w, "Limit %d\t%s, all must have something left\n", n+1, perPhrase(&access.Limit{Period: st.Period, Days: st.Days, Hours: st.Hours}))
+			fmt.Fprintf(w, "Limit %d\t%s, all must have something left\n", n+1, perPhrase(statusLimit(st)))
 		}
-		fmt.Fprintf(w, "Window\tthis %s, %s – %s (local time)\n", (&access.Limit{Period: st.Period, Days: st.Days, Hours: st.Hours}).Per(), st.Start.Format("2006-01-02 15:04"), st.Reset.Format("2006-01-02 15:04"))
+		if len(st.Models) > 0 {
+			fmt.Fprintf(w, "Models\t%s: only their calls count, and only requests for them are refused once it is spent\n", strings.Join(st.Models, ", "))
+		}
+		ends := st.Reset.Format("2006-01-02 15:04")
+		if st.ResetUnknown {
+			ends = "when the account's window resets (not readable now; counted from the earliest it can have begun)"
+		}
+		fmt.Fprintf(w, "Window\tthis %s, %s – %s (local time)\n", statusLimit(st).Per(), st.Start.Format("2006-01-02 15:04"), ends)
 		if st.TokenLimit > 0 {
 			counted := "input, output and cache writes"
 			if st.CacheReads {
@@ -318,7 +364,16 @@ func gatewayKeyLimit(out io.Writer, args []string) error {
 		}
 		state := "open"
 		if st.Spent {
-			state = "spent: requests are refused until " + st.Reset.Format("2006-01-02 15:04")
+			until := st.Reset.Format("2006-01-02 15:04")
+			if st.Period == "total" {
+				until = "the limit is reset or raised"
+			} else if st.ResetUnknown {
+				until = "the account's window resets"
+			}
+			state = "spent: requests are refused until " + until
+			if len(st.Models) > 0 {
+				state = "spent: requests for these models are refused until " + until
+			}
 		}
 		fmt.Fprintf(w, "State\t%s\n", state)
 	}
@@ -337,14 +392,34 @@ func perPhrase(l *access.Limit) string {
 	case "hours":
 		return fmt.Sprintf("every %d hours", l.Hours)
 	}
+	if l.Period == "total" {
+		return "in total"
+	}
+	if l.Period == "account" {
+		return "per " + l.Per()
+	}
 	return "per " + l.Period
+}
+
+// statusLimit is the window of the limit st is the status of.
+func statusLimit(st budget.Status) *access.Limit {
+	return &access.Limit{Period: st.Period, Days: st.Days, Hours: st.Hours, Account: st.Account, AccountWindow: st.AccountWindow}
+}
+
+// onModels is " on <models>" for a limit of some models, "" for one of the
+// whole key.
+func onModels(l *access.Limit) string {
+	if !l.Scoped() {
+		return ""
+	}
+	return " on " + strings.Join(l.Models, ", ")
 }
 
 // parseKeyLimit reads a limit as typed: its window, then --tokens,
 // --cost and --cache-reads.
 func parseKeyLimit(window string, rest []string, usage error) (*access.Limit, error) {
 	lim := &access.Limit{Period: window}
-	if window == "day" || window == "week" || window == "month" {
+	if window == "day" || window == "week" || window == "month" || window == "total" || window == "account" {
 		// a period by its name: month ends in an h, and is no count of hours
 	} else if n, ok := strings.CutSuffix(window, "d"); ok {
 		days, err := strconv.Atoi(n)
@@ -360,7 +435,7 @@ func parseKeyLimit(window string, rest []string, usage error) (*access.Limit, er
 		}
 		lim = &access.Limit{Period: "hours", Hours: hours}
 	} else if !slices.Contains(access.Periods, lim.Period) || lim.Period == "days" || lim.Period == "hours" {
-		return nil, fmt.Errorf("a limit's period is day, week, month, <N>d (every N days) or <N>h (every N hours), not %q", lim.Period)
+		return nil, fmt.Errorf("a limit's period is day, week, month, total, <N>d (every N days), <N>h (every N hours) or account (an account's window), not %q", lim.Period)
 	}
 	for i := 0; i < len(rest); i++ {
 		flag, val, has := strings.Cut(rest[i], "=")
@@ -395,12 +470,38 @@ func parseKeyLimit(window string, rest []string, usage error) (*access.Limit, er
 			}
 		case "--cache-reads":
 			lim.CacheReads = true
+		case "--account", "--window":
+			v, err := next()
+			if err != nil {
+				return nil, err
+			}
+			if lim.Period != "account" {
+				return nil, fmt.Errorf("%s is for an account limit: limit <id> account --account <provider>/<account> --window <name>", flag)
+			}
+			if flag == "--account" {
+				lim.Account = v
+			} else {
+				lim.AccountWindow = v
+			}
+		case "--model", "--models":
+			v, err := next()
+			if err != nil {
+				return nil, err
+			}
+			for _, m := range strings.Split(v, ",") {
+				if m = strings.TrimSpace(m); m != "" {
+					lim.Models = append(lim.Models, m)
+				}
+			}
 		default:
 			return nil, usage
 		}
 	}
 	if !lim.Limited() {
 		return nil, fmt.Errorf("say --tokens, --cost or both, or off for no limit")
+	}
+	if lim.Period == "account" && (lim.Account == "" || lim.AccountWindow == "") {
+		return nil, fmt.Errorf("an account limit names the account and its window: --account codex/me@example.com --window 5h")
 	}
 	return lim, nil
 }
@@ -433,8 +534,8 @@ func gatewayKeyModels(out io.Writer, args []string) error {
 		return fmt.Errorf("Key not found")
 	}
 	k := keys[i]
-	if len(k.Models) == 0 && len(k.Accounts) > 0 {
-		_, err = fmt.Fprintf(out, "%s: only its accounts' providers' models, %s\n", k.Name, strings.Join(access.HeldModels(nil, k.Accounts), ", "))
+	if ms := access.HeldModels(nil, access.ExpandGroups(k.Accounts)); len(k.Models) == 0 && len(ms) > 0 {
+		_, err = fmt.Fprintf(out, "%s: only its accounts' providers' models, %s\n", k.Name, strings.Join(ms, ", "))
 		return err
 	}
 	if len(k.Models) == 0 {
@@ -442,6 +543,99 @@ func gatewayKeyModels(out io.Writer, args []string) error {
 		return err
 	}
 	_, err = fmt.Fprintf(out, "%s: only %s\n", k.Name, strings.Join(k.Models, ", "))
+	return err
+}
+
+// gatewayKeyAliases shows or sets the names a key gives models
+// (tsingchao on X):
+//
+//	magpie gateway-key aliases <id>                          its names
+//	magpie gateway-key aliases <id> none                     no names
+//	magpie gateway-key aliases <id> fast=openai/gpt-5 ...    only these
+func gatewayKeyAliases(out io.Writer, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: magpie gateway-key aliases <id> [none | <name>=<provider>/<model> ...]")
+	}
+	id := args[0]
+	if len(args) > 1 {
+		as := map[string]string{}
+		if !(len(args) == 2 && args[1] == "none") {
+			for _, a := range args[1:] {
+				name, target, ok := strings.Cut(a, "=")
+				if !ok {
+					return fmt.Errorf("usage: magpie gateway-key aliases <id> [none | <name>=<provider>/<model> ...]: %q has no =", a)
+				}
+				as[name] = target
+			}
+		}
+		if _, err := access.Update("aliases-key", access.Change{Key: id, Aliases: as}); err != nil {
+			return err
+		}
+	}
+	keys, err := access.List()
+	if err != nil {
+		return err
+	}
+	i := slices.IndexFunc(keys, func(k access.Key) bool { return k.ID == id })
+	if i < 0 {
+		return fmt.Errorf("Key not found")
+	}
+	k := keys[i]
+	if len(k.Aliases) == 0 {
+		_, err = fmt.Fprintf(out, "%s: no model names\n", k.Name)
+		return err
+	}
+	for _, name := range slices.Sorted(maps.Keys(k.Aliases)) {
+		if _, err = fmt.Fprintf(out, "%s: %s = %s\n", k.Name, name, k.Aliases[name]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// gatewayKeyMCP shows or sets the MCP servers and tools a key may use
+// (wakaka on Discord):
+//
+//	magpie gateway-key mcp <id>                        what it may use
+//	magpie gateway-key mcp <id> all                    every server
+//	magpie gateway-key mcp <id> none                   no server
+//	magpie gateway-key mcp <id> github fs/read_file    only these
+func gatewayKeyMCP(out io.Writer, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: magpie gateway-key mcp <id> [all | none | <server>|<server>/<tool> ...]")
+	}
+	id := args[0]
+	if len(args) > 1 {
+		l := args[1:]
+		switch {
+		case len(l) == 1 && l[0] == "all":
+			l = nil
+		case len(l) == 1 && l[0] == "none":
+			l = []string{access.NoMCP}
+		case slices.ContainsFunc(l, func(e string) bool { return strings.HasPrefix(e, "-") }):
+			return fmt.Errorf("usage: magpie gateway-key mcp <id> [all | none | <server>|<server>/<tool> ...]")
+		}
+		if _, err := access.Update("mcp-key", access.Change{Key: id, MCP: l}); err != nil {
+			return err
+		}
+	}
+	keys, err := access.List()
+	if err != nil {
+		return err
+	}
+	i := slices.IndexFunc(keys, func(k access.Key) bool { return k.ID == id })
+	if i < 0 {
+		return fmt.Errorf("Key not found")
+	}
+	k := keys[i]
+	switch {
+	case len(k.MCP) == 0:
+		_, err = fmt.Fprintf(out, "%s: every MCP server\n", k.Name)
+	case slices.Equal(k.MCP, []string{access.NoMCP}):
+		_, err = fmt.Fprintf(out, "%s: no MCP server\n", k.Name)
+	default:
+		_, err = fmt.Fprintf(out, "%s: only %s\n", k.Name, strings.Join(k.MCP, ", "))
+	}
 	return err
 }
 
@@ -461,9 +655,13 @@ func limitWords(k access.Key, now time.Time) string {
 		if st.CostLimit > 0 {
 			parts = append(parts, fmt.Sprintf("$%.2f/$%.2f", st.Cost, st.CostLimit))
 		}
-		s := strings.Join(parts, " ") + " " + perPhrase(&access.Limit{Period: st.Period, Days: st.Days, Hours: st.Hours})
+		s := strings.Join(parts, " ") + " " + perPhrase(statusLimit(st)) + onModels(&access.Limit{Models: st.Models})
 		if st.Spent {
-			s += " (spent until " + st.Reset.Format("01-02 15:04") + ")"
+			if st.ResetUnknown {
+				s += " (spent until the account's window resets)"
+			} else {
+				s += " (spent until " + st.Reset.Format("01-02 15:04") + ")"
+			}
 		}
 		each = append(each, s)
 	}
@@ -473,9 +671,11 @@ func limitWords(k access.Key, now time.Time) string {
 // gatewayKeyAccounts shows or sets a key's account whitelist (#905): the
 // accounts and keys it may use, "<provider>/<account>" — a signed-in
 // account by its name, a key by its KeyID — every one when none are set.
+// "<provider>/!<account>" keeps one out instead (LeiWang_2000 on X): the
+// key may use every other, those signed in later too.
 func gatewayKeyAccounts(out io.Writer, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: magpie gateway-key accounts <id> [all | <provider>/<account>|<provider>/<key id> ...]")
+		return fmt.Errorf("usage: magpie gateway-key accounts <id> [all | <provider>/<account>|<provider>/<key id>|<provider>/!<account>|@<group>|!@<group> ...]")
 	}
 	id := args[0]
 	if len(args) > 1 {
@@ -500,14 +700,101 @@ func gatewayKeyAccounts(out io.Writer, args []string) error {
 		_, err = fmt.Fprintf(out, "%s: every account\n", k.Name)
 		return err
 	}
-	// shown by who is signed in, kept by the account's stable id (#905)
-	names := provider.AccountNames()
-	shown := make([]string, len(k.Accounts))
-	for i, a := range k.Accounts {
-		shown[i] = cmp.Or(names[a], a)
+	// shown by who is signed in, kept by the account's stable id (#905);
+	// one kept out, "<provider>/!<account>", as every account but it
+	shown := access.AccountsShown(provider.AccountNames(), k.Accounts)
+	if !strings.HasPrefix(shown, "every account but ") {
+		shown = "only " + shown
 	}
-	_, err = fmt.Fprintf(out, "%s: only %s\n", k.Name, strings.Join(shown, ", "))
+	_, err = fmt.Fprintf(out, "%s: %s\n", k.Name, shown)
 	return err
+}
+
+// gatewayKeyGroups lists and edits the account groups a key's accounts
+// may name, "@<group>" or "!@<group>" (LeiWang_2000 on X): a named set of
+// accounts of any providers, read by every key naming it as it is now.
+//
+//	magpie gateway-key groups                          each group
+//	magpie gateway-key groups add <name> <account>...  a new one
+//	magpie gateway-key groups set <group> <account>... its accounts
+//	magpie gateway-key groups rename <group> <name>
+//	magpie gateway-key groups remove <group>           unless a key names it
+func gatewayKeyGroups(out io.Writer, args []string) error {
+	usage := fmt.Errorf("usage: magpie gateway-key groups [list | add <name> <provider>/<account>... | set <group> <provider>/<account>... | rename <group> <name> | remove <group>]")
+	if len(args) == 0 {
+		args = []string{"list"}
+	}
+	switch args[0] {
+	case "list":
+		if len(args) != 1 {
+			return usage
+		}
+		gs, err := access.AccountGroups()
+		if err != nil {
+			return err
+		}
+		if len(gs) == 0 {
+			_, err = fmt.Fprintln(out, "No account groups. Add one: magpie gateway-key groups add <name> <provider>/<account>...")
+			return err
+		}
+		names := provider.AccountNames()
+		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "ID\tNAME\tACCOUNTS")
+		for _, g := range gs {
+			shown := "none"
+			if len(g.Accounts) > 0 {
+				shown = strings.ReplaceAll(access.AccountsShown(names, g.Accounts), ", ", ",")
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\n", g.ID, g.Name, shown)
+		}
+		return w.Flush()
+	case "add":
+		if len(args) < 2 {
+			return usage
+		}
+		g, err := access.SaveAccountGroup(access.AccountGroup{Name: args[1], Accounts: args[2:]})
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(out, "Added the account group %s (%s). Use it: magpie gateway-key accounts <id> @%s, or !@%s to keep it out\n", g.Name, g.ID, g.ID, g.ID)
+		return err
+	case "set", "rename":
+		if len(args) < 2 || (args[0] == "rename" && len(args) != 3) {
+			return usage
+		}
+		g, err := access.FindAccountGroup(args[1])
+		if err != nil {
+			return err
+		}
+		if args[0] == "rename" {
+			g.Name = args[2]
+		} else {
+			g.Accounts = args[2:]
+		}
+		if g, err = access.SaveAccountGroup(g); err != nil {
+			return err
+		}
+		shown := "no account"
+		if len(g.Accounts) > 0 {
+			shown = access.AccountsShown(provider.AccountNames(), g.Accounts)
+		}
+		_, err = fmt.Fprintf(out, "%s: %s\n", g.Name, shown)
+		return err
+	case "remove":
+		if len(args) != 2 {
+			return usage
+		}
+		g, err := access.FindAccountGroup(args[1])
+		if err != nil {
+			return err
+		}
+		if err := access.RemoveAccountGroup(g.ID); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(out, "Removed the account group %s\n", g.Name)
+		return err
+	}
+	return usage
 }
 
 // gatewayKeyQuotas shows or sets whether a key held to a budget, models
@@ -548,8 +835,146 @@ func gatewayKeyQuotas(out io.Writer, args []string) error {
 	return err
 }
 
-// accessWord is a key's access as the list says it: "read-only" or "full".
+// gatewayKeyConcurrency shows or sets how many of a key's requests may
+// be in flight at once (young02036 on Discord); one more waits its turn,
+// as over a provider's concurrency:
+//
+//	magpie gateway-key concurrency <id>           its cap, or none
+//	magpie gateway-key concurrency <id> <n>|off   at most n at once, or no cap
+func gatewayKeyConcurrency(out io.Writer, args []string) error {
+	usage := fmt.Errorf("usage: magpie gateway-key concurrency <id> [<n> | off], n a whole number from 1 to %d", access.MaxKeyConcurrency)
+	if len(args) == 0 || len(args) > 2 {
+		return usage
+	}
+	id := args[0]
+	if len(args) == 2 {
+		n := 0
+		if args[1] != "off" {
+			v, err := strconv.Atoi(args[1])
+			if err != nil || v < 1 || v > access.MaxKeyConcurrency {
+				return usage
+			}
+			n = v
+		}
+		if _, err := access.Update("concurrency-key", access.Change{Key: id, MaxConcurrency: n}); err != nil {
+			return err
+		}
+	}
+	keys, err := access.List()
+	if err != nil {
+		return err
+	}
+	i := slices.IndexFunc(keys, func(k access.Key) bool { return k.ID == id })
+	if i < 0 {
+		return fmt.Errorf("Key not found")
+	}
+	k := keys[i]
+	if k.MaxConcurrency > 0 {
+		reqs := "requests"
+		if k.MaxConcurrency == 1 {
+			reqs = "request"
+		}
+		_, err = fmt.Fprintf(out, "%s: at most %d %s at once, the rest wait their turn\n", k.Name, k.MaxConcurrency, reqs)
+	} else {
+		_, err = fmt.Fprintf(out, "%s: no concurrency limit\n", k.Name)
+	}
+	return err
+}
+
+// gatewayKeyTier shows or sets the service tier a key's OpenAI-API requests
+// are sent at whatever the client asked (JackyFill on X):
+//
+//	magpie gateway-key tier <id>                                    its tier
+//	magpie gateway-key tier <id> follow|standard|fast|ultrafast     set it
+func gatewayKeyTier(out io.Writer, args []string) error {
+	if len(args) == 0 || len(args) > 2 {
+		return fmt.Errorf("usage: magpie gateway-key tier <id> [follow | standard | fast | ultrafast]")
+	}
+	id := args[0]
+	if len(args) == 2 {
+		if _, err := access.Update("tier-key", access.Change{Key: id, ServiceTier: args[1]}); err != nil {
+			return err
+		}
+	}
+	keys, err := access.List()
+	if err != nil {
+		return err
+	}
+	i := slices.IndexFunc(keys, func(k access.Key) bool { return k.ID == id })
+	if i < 0 {
+		return fmt.Errorf("Key not found")
+	}
+	k := keys[i]
+	word := map[string]string{"": "follows the request", settings.CodexTierStandard: "standard", "priority": "fast", "ultrafast": "ultrafast"}[k.ServiceTier]
+	_, err = fmt.Fprintf(out, "%s: service tier %s\n", k.Name, word)
+	return err
+}
+
+// gatewayKeyRouting shows or sets how a routing group a key's requests
+// ask for picks its members' accounts and keys for them (access.Key.Routing,
+// justforlxz on X):
+//
+//	magpie gateway-key routing <id>             its routing
+//	magpie gateway-key routing <id> follow|smart|order|drain|pace-drain|rotate|usage|pace|weight|free|fast|cheap|expiring|fit|<plugin>/<name>
+func gatewayKeyRouting(out io.Writer, args []string) error {
+	if len(args) == 0 || len(args) > 2 {
+		return fmt.Errorf("usage: magpie gateway-key routing <id> [follow | smart | order | drain | pace-drain | rotate | usage | pace | weight | free | fast | cheap | expiring | fit | <plugin>/<name>]")
+	}
+	id := args[0]
+	if len(args) == 2 {
+		if _, err := access.Update("routing-key", access.Change{Key: id, Routing: args[1]}); err != nil {
+			return err
+		}
+	}
+	keys, err := access.List()
+	if err != nil {
+		return err
+	}
+	i := slices.IndexFunc(keys, func(k access.Key) bool { return k.ID == id })
+	if i < 0 {
+		return fmt.Errorf("Key not found")
+	}
+	k := keys[i]
+	word := cmp.Or(map[string]string{"": "follows each routing group's own", access.RoutingSmart: "smart"}[k.Routing], k.Routing)
+	_, err = fmt.Fprintf(out, "%s: group routing %s\n", k.Name, word)
+	return err
+}
+
+// gatewayKeyRedact shows or sets whether Settings › Privacy's masking
+// applies to a key's requests (access.Key.Redact, y0ngb1n on X):
+//
+//	magpie gateway-key redact <id>                      its setting
+//	magpie gateway-key redact <id> follow|on|off        set it
+func gatewayKeyRedact(out io.Writer, args []string) error {
+	if len(args) == 0 || len(args) > 2 {
+		return fmt.Errorf("usage: magpie gateway-key redact <id> [follow | on | off]")
+	}
+	id := args[0]
+	if len(args) == 2 {
+		if _, err := access.Update("redact-key", access.Change{Key: id, Redact: args[1]}); err != nil {
+			return err
+		}
+	}
+	keys, err := access.List()
+	if err != nil {
+		return err
+	}
+	i := slices.IndexFunc(keys, func(k access.Key) bool { return k.ID == id })
+	if i < 0 {
+		return fmt.Errorf("Key not found")
+	}
+	k := keys[i]
+	word := map[string]string{"": "follows Settings › Privacy", access.RedactOn: "on", access.RedactOff: "off"}[k.Redact]
+	_, err = fmt.Fprintf(out, "%s: masking %s\n", k.Name, word)
+	return err
+}
+
+// accessWord is a key's access as the list says it: "browser" (Magpie
+// Browser's, access.Key.Browser), "read-only" or "full".
 func accessWord(k access.Key) string {
+	if k.Browser {
+		return "browser"
+	}
 	if k.ReadOnly {
 		return "read-only"
 	}
@@ -584,10 +1009,94 @@ func gatewayKeyAccess(out io.Writer, args []string) error {
 		return fmt.Errorf("Key not found")
 	}
 	k := keys[i]
-	if k.ReadOnly {
+	if k.Browser {
+		_, err = fmt.Fprintf(out, "%s: Magpie Browser's, it connects the extension and uses no model, MCP server, stats or write\n", k.Name)
+	} else if k.ReadOnly {
 		_, err = fmt.Fprintf(out, "%s: read-only, it reads quotas and usage and uses no model, MCP server or write\n", k.Name)
 	} else {
 		_, err = fmt.Fprintf(out, "%s: full access, models and stats as its other limits let it\n", k.Name)
+	}
+	return err
+}
+
+// gatewayKeyAdmin shows or sets whether a key may call the management API
+// (/v1/magpie/admin/), which adds, changes and removes providers, accounts
+// and gateway keys:
+//
+//	magpie gateway-key admin <id> [off | local | any]
+//
+// Only here and in the app: the API itself never sets it.
+func gatewayKeyAdmin(out io.Writer, args []string) error {
+	usage := fmt.Errorf("usage: magpie gateway-key admin <id> [off | local | any]")
+	if len(args) == 0 || len(args) > 2 {
+		return usage
+	}
+	id := args[0]
+	if len(args) == 2 {
+		if _, err := access.CleanAdmin(args[1]); err != nil {
+			return usage
+		}
+		if _, err := access.Update("admin-key", access.Change{Key: id, Admin: args[1]}); err != nil {
+			return err
+		}
+	}
+	keys, err := access.List()
+	if err != nil {
+		return err
+	}
+	i := slices.IndexFunc(keys, func(k access.Key) bool { return k.ID == id })
+	if i < 0 {
+		return fmt.Errorf("Key not found")
+	}
+	k := keys[i]
+	switch k.Admin {
+	case access.AdminLocal:
+		_, err = fmt.Fprintf(out, "%s: may manage magpie (/v1/magpie/admin/) from this computer\n", k.Name)
+	case access.AdminAny:
+		_, err = fmt.Fprintf(out, "%s: may manage magpie (/v1/magpie/admin/) from this computer and, while magpie is shared, from other machines\n", k.Name)
+	default:
+		_, err = fmt.Fprintf(out, "%s: may not manage magpie\n", k.Name)
+	}
+	return err
+}
+
+// gatewayKeyMemory shows or sets whether a key's agents on another
+// computer may use Magpie Memory (/mcp/magpie/memory and the hub's
+// magpie-memory), reading and saving what is known about this computer's
+// user (Niapyaya on X):
+//
+//	magpie gateway-key memory <id> [on | off]
+func gatewayKeyMemory(out io.Writer, args []string) error {
+	usage := fmt.Errorf("usage: magpie gateway-key memory <id> [on | off]")
+	if len(args) == 0 || len(args) > 2 {
+		return usage
+	}
+	id := args[0]
+	if len(args) == 2 {
+		var on bool
+		switch strings.ToLower(args[1]) {
+		case "on":
+			on = true
+		case "off":
+		default:
+			return usage
+		}
+		if _, err := access.Update("memory-key", access.Change{Key: id, Memory: on}); err != nil {
+			return err
+		}
+	}
+	keys, err := access.List()
+	if err != nil {
+		return err
+	}
+	i := slices.IndexFunc(keys, func(k access.Key) bool { return k.ID == id })
+	if i < 0 {
+		return fmt.Errorf("Key not found")
+	}
+	if k := keys[i]; k.Memory {
+		_, err = fmt.Fprintf(out, "%s: its agents on other computers may read and save Magpie Memory, while magpie is shared\n", k.Name)
+	} else {
+		_, err = fmt.Fprintf(out, "%s: Magpie Memory only for the agents on this computer\n", k.Name)
 	}
 	return err
 }

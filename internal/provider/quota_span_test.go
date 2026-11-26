@@ -58,11 +58,13 @@ func TestQuotaSpanCarriesEveryWindowField(t *testing.T) {
 		"resetSecs": "made into resetsAt from the report's now",
 		"family":    "the Usage page's grouping of per-model windows",
 		"credits":   "routing's (Allowance.OnCredits)",
+		"extra":     "routing's (Allowance.extraCapped)",
 		"capped":    "the GUI's cap marks (WithCapped)",
 		"capsSome":  "the GUI's cap marks (WithCapped)",
 		"capId":     "the GUI's cap marks (WithCapped)",
 		"ownCap":    "the GUI's cap marks (WithCapped)",
 		"startsAt":  "the GUI's Pace number (WithWindowStarts)",
+		"period":    "the GUI's Usage table columns (WithWindowPeriods)",
 		"trayKind":  "the GUI's menu bar picker (gui.withTrayKinds)",
 		"trayExtra": "the GUI's menu bar picker (gui.withTrayKinds)",
 		"heldBy":    "the GUI's all-accounts sum (WithHeldWindows)",
@@ -89,7 +91,7 @@ func TestQuotaSpanCarriesEveryWindowField(t *testing.T) {
 	at := time.Date(2026, 10, 30, 17, 0, 0, 0, time.UTC)
 	bal := 6291.0
 	full := QuotaWindow{Balance: &bal, Unlimited: true, Name: "Credits", Used: 40, ResetsAt: &at, Display: "1 / 2", Text: true, Amount: 1, Limit: 2, Unit: "credits",
-		RunsOutAt: &at, RunsOut: 3, Pool: "P", Holds: &WindowHolds{}, HoldsWhy: "x"}
+		RunsOutAt: &at, RunsOut: 3, Pool: "P", Lane: "images", Holds: &WindowHolds{}, HoldsWhy: "x", Spent: &bal, SpentSince: &at}
 	got := quotaReport([]SubscriptionQuota{{Provider: "p", Windows: []QuotaWindow{full}}}, nil, nil, at)
 	b, _ := json.Marshal(got[0].Windows[0])
 	var m map[string]any

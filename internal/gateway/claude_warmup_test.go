@@ -46,7 +46,7 @@ func TestWarmClaudeAsksClaudeCodeOnce(t *testing.T) {
 	b, _ := os.ReadFile(log)
 	got := string(b)
 	for _, want := range []string{"[-p]", "[--model][haiku]", "[--tools][]", "[--setting-sources][]", "[--no-session-persistence]",
-		`[--settings][{"disableDeepLinkRegistration":"disable"}]`,
+		`[--settings][{"disableDeepLinkRegistration":"disable",`,
 		"dir:/saved/account\n", "base:\n", "stdin:hi", "magpie-claude-"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("run lacks %q:\n%s", want, got)
@@ -120,9 +120,74 @@ func TestClaudeUsageRunsClaudeCode(t *testing.T) {
 	}
 	b, _ = os.ReadFile(log)
 	for _, want := range []string{"[-p][/usage]", "[--setting-sources][]", "[--strict-mcp-config]", "[--no-session-persistence]", "token:\n",
-		`[--settings][{"disableDeepLinkRegistration":"disable"}]`} {
+		`[--settings][{"disableDeepLinkRegistration":"disable",`} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("run lacks %q:\n%s", want, b)
+		}
+	}
+}
+
+// Claude Code's -p /usage prints no figure for extra usage (usage
+// credits), but its verbose json carries a usage_report with the month's cap
+// and spend (Shinji_Zl on X). The read adds them as a line for the card, and
+// adds none for an account with it off, no cap, or a Claude Code that sends
+// no report.
+func TestClaudeUsageCredits(t *testing.T) {
+	text := "Current session: 13% used · resets 4pm (Asia/Shanghai)"
+	msgs := func(extra string) string {
+		report := ``
+		if extra != "" {
+			report = `,"usage_report":{"rate_limits":{"limits":null,"extra_usage":` + extra + `}}`
+		}
+		return `[{"type":"system","subtype":"init"},{"type":"assistant"` + report + `},{"type":"result","is_error":false,"result":"` + text + `"}]`
+	}
+	for _, c := range []struct{ name, extra, want string }{
+		{"on", `{"is_enabled":true,"monthly_limit":50000,"used_credits":27140,"utilization":54,"currency":"USD"}`, "\nExtra usage: 271.40 / 500.00 USD spent"},
+		{"unused", `{"is_enabled":true,"monthly_limit":2000,"used_credits":null,"utilization":null,"currency":"USD"}`, "\nExtra usage: 0.00 / 20.00 USD spent"},
+		{"off", `{"is_enabled":false,"monthly_limit":null,"used_credits":null,"utilization":null,"currency":null}`, ""},
+		{"no cap", `{"is_enabled":true,"monthly_limit":null,"used_credits":100,"utilization":null,"currency":"USD"}`, ""},
+		{"no report", "", ""},
+	} {
+		fakeWarmClaude(t, msgs(c.extra), 0)
+		got, err := claudeUsage(context.Background(), "")
+		want := text + c.want
+		if err != nil || got != want {
+			t.Errorf("%s: usage %q %v, want %q", c.name, got, err, want)
+		}
+	}
+}
+
+// A Claude Enterprise seat's -p /usage printed only the subscription line
+// (@andy_chen1997 on X): its meters came as the usage endpoint's rows
+// (limits[]), which Claude Code's text doesn't draw. The read adds them as
+// /usage's own lines; a report of no meters ([]) as the plan having none;
+// a null one, a fetch that failed or a server before rows, adds nothing.
+// The rows follow Claude Code 2.1.328's usage_report schema; no Enterprise
+// account was at hand.
+func TestClaudeUsageRows(t *testing.T) {
+	const sub = "You are currently using your subscription to power your Claude Code usage"
+	msgs := func(text, limits string) string {
+		return `[{"type":"system","subtype":"init"},{"type":"assistant","usage_report":{"rate_limits":` + limits + `}},{"type":"result","is_error":false,"result":"` + text + `"}]`
+	}
+	rows := `{"limits":[` +
+		`{"kind":"session","group":"session","percent":37.5,"resets_at":"2026-11-19T15:00:00.000Z","scope":null,"severity":"normal","is_active":true},` +
+		`{"kind":"weekly_scoped","group":"weekly","percent":4,"resets_at":null,"scope":{"model":{"display_name":"Fable"}}},` +
+		`{"kind":"weekly_scoped","group":"weekly","percent":9,"resets_at":null,"scope":{"surface":{"display_name":"Claude Design"}}},` +
+		`{"kind":"new_meter","group":"x","percent":50,"resets_at":null}` +
+		`],"extra_usage":null}`
+	for _, c := range []struct{ name, text, limits, want string }{
+		{"rows", sub, rows, "\nCurrent session: 37.5% used · resets 2026-11-19T15:00:00.000Z\nCurrent week (Fable): 4% used"},
+		{"text drew its own", "Current session: 13% used", rows, ""},
+		{"no meters", sub, `{"limits":[],"extra_usage":null}`, "\n" + provider.ClaudeNoLimitsLine},
+		{"no meters, credits", sub, `{"limits":[],"extra_usage":{"is_enabled":true,"monthly_limit":50000,"used_credits":100,"currency":"USD"}}`, "\n" + provider.ClaudeNoLimitsLine + "\nExtra usage: 1.00 / 500.00 USD spent"},
+		{"a row of another shape", sub, `{"limits":[{"kind":"session","percent":"most"}],"extra_usage":{"is_enabled":true,"monthly_limit":50000,"used_credits":100,"currency":"USD"}}`, "\nExtra usage: 1.00 / 500.00 USD spent"},
+		{"rows unknown", sub, `{"limits":null,"extra_usage":null}`, ""},
+		{"fetch failed", sub, `null`, ""},
+	} {
+		fakeWarmClaude(t, msgs(c.text, c.limits), 0)
+		got, err := claudeUsage(context.Background(), "")
+		if want := c.text + c.want; err != nil || got != want {
+			t.Errorf("%s: usage %q %v, want %q", c.name, got, err, want)
 		}
 	}
 }

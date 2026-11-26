@@ -14,12 +14,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -30,8 +30,11 @@ import (
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/desktopdir"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/source"
 	"github.com/yetone/magpie/internal/update"
 )
@@ -224,6 +227,8 @@ var cliSpecs = map[string]cliSpec{
 	// exists, but its installed-binary update path is not exercised here, so
 	// only its npm package and brew cask are recognized
 	"atomcode": {npm: []string{"@atomgit.com/atomcode"}, brew: []string{"atomcode"}},
+	// Open Code Review: npm, or its install script's /usr/local/bin/ocr
+	"open-code-review": {npm: []string{"@alibaba-group/open-code-review"}},
 	// Snow CLI is published on npm alone (snow-ai)
 	"snow": {npm: []string{"snow-ai"}, scripts: true},
 	// MothX: its npm installer package, which brings the native binary
@@ -236,7 +241,7 @@ var cliSpecs = map[string]cliSpec{
 	// none is offered there.
 	"penguin": {npm: []string{"@prismshadow/penguin-cli"},
 		self: func(bin, real string) []string {
-			if runtime.GOOS == "windows" {
+			if runtime.GOOS == "windows" && !strings.HasPrefix(real, "/") { // a distro's path is Linux's
 				return nil
 			}
 			if l := strings.ToLower(real); strings.Contains(l, "/.penguin/bin/") || strings.Contains(l, "/.penguin/lib/") {
@@ -248,6 +253,8 @@ var cliSpecs = map[string]cliSpec{
 	// the engine it pins (senpi) with it
 	"omo": {npm: []string{"omo-ai"}, scripts: true,
 		self: func(bin, real string) []string { return []string{bin, "update"} }},
+	// mu-agent from npm: its own `mu update` updates Pi packages, not mu
+	"mu": {npm: []string{"mu-agent"}},
 }
 
 // updater is how an installed CLI is brought up to date.
@@ -267,6 +274,9 @@ type updater struct {
 	// reshim is run after the update: the version manager whose shim the
 	// CLI was found as making shims for what it installed
 	reshim []string
+	// wsl is the distro the CLI is in and the update runs in, "" for this
+	// machine's (cliupdate_wsl.go)
+	wsl string
 }
 
 // shown is the update as a person would type it.
@@ -280,7 +290,7 @@ func (u *updater) shown() string {
 	return strings.Join(parts, " ")
 }
 
-var brewPath = regexp.MustCompile(`/(Cellar|Caskroom)/([^/]+)/`)
+var brewPath = lazyre.New(`/(Cellar|Caskroom)/([^/]+)/`)
 
 // howInstalled says how the CLI at bin was installed, from where it is;
 // nil when that says nothing sure.
@@ -515,12 +525,12 @@ func exe(name string) string {
 	return name
 }
 
-func isFile(p string) bool { st, err := os.Stat(p); return err == nil && !st.IsDir() }
-func isDir(p string) bool  { st, err := os.Stat(p); return err == nil && st.IsDir() }
+func isFile(p string) bool { dir, ok := statKind(p); return ok && !dir }
+func isDir(p string) bool  { dir, ok := statKind(p); return ok && dir }
 
 // ---- versions --------------------------------------------------------------
 
-var versionRe = regexp.MustCompile(`(?:^|[^\w.])v?(\d+\.\d+(?:\.\d+)*(?:-[0-9A-Za-z][0-9A-Za-z.]*)?)`)
+var versionRe = lazyre.New(`(?:^|[^\w.])v?(\d+\.\d+(?:\.\d+)*(?:-[0-9A-Za-z][0-9A-Za-z.]*)?)`)
 
 // parseVersion is the first version in what a CLI printed.
 func parseVersion(out string) string {
@@ -637,6 +647,19 @@ func (m *memo) forget(key string) {
 	m.mu.Lock()
 	if e := m.m[key]; e != nil && e.ready == nil {
 		delete(m.m, key)
+	}
+	m.mu.Unlock()
+}
+
+// expireAll has every kept answer whose ask isn't running asked again on
+// its next read: the Agents page's re-detect. The answer stays as the one
+// before, which a failed ask keeps, as get does for an answer out of date.
+func (m *memo) expireAll() {
+	m.mu.Lock()
+	for _, e := range m.m {
+		if e.ready == nil {
+			e.until = time.Time{}
+		}
 	}
 	m.mu.Unlock()
 }
@@ -768,6 +791,9 @@ func channelVersion(url string) (string, error) {
 // brewLatest is the version Homebrew has for u, as it last updated itself:
 // what brew upgrade would install, or newer once it updates first.
 var brewLatest = func(u *updater) (string, error) {
+	if u.wsl != "" {
+		return wslBrewLatest(u)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	args := []string{"info", "--json=v2", u.pkg}
@@ -781,6 +807,11 @@ var brewLatest = func(u *updater) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return brewVersion(out)
+}
+
+// brewVersion is the version brew info --json=v2 says.
+func brewVersion(out []byte) (string, error) {
 	var r struct {
 		Formulae []struct {
 			Versions struct{ Stable string }
@@ -895,6 +926,9 @@ func (a *Agent) BinPath() string {
 // update it, with its desktop app's version. ok is false for an agent with
 // neither a CLI magpie knows nor its app.
 func (a *Agent) CLI() (c CLI, ok bool) {
+	if a.WSL != "" {
+		return a.wslCLIInfo()
+	}
 	c.App = a.AppVersion()
 	bin, spec := a.cliBin()
 	if bin == "" {
@@ -962,7 +996,12 @@ func CLIs(wait time.Duration) (out map[string]CLI, pending bool) {
 	var wg sync.WaitGroup
 	out = map[string]CLI{}
 	for _, a := range Detected() {
-		if _, ok := cliSpecs[a.ID]; !ok || a.WSL != "" {
+		kind := a.ID
+		if a.WSL != "" {
+			kind, _, _ = strings.Cut(kind, "@")
+			kind, _, _ = strings.Cut(kind, "#")
+		}
+		if _, ok := cliSpecs[kind]; !ok {
 			continue
 		}
 		wg.Add(1)
@@ -1068,12 +1107,41 @@ func updateEnv(u *updater) []string {
 	return append(env, "NONINTERACTIVE=1", "HOMEBREW_NO_ENV_HINTS=1", "NO_COLOR=1", "CLINE_NO_AUTO_UPDATE=1")
 }
 
+// letGoBeforeUpdate ends what magpie itself keeps running of the agent
+// id's CLI, before a package manager on Windows replaces its package: a
+// program running from it can't be removed there (EPERM), and npm, which
+// takes the old shims away first, stopped partway and left none (CLJY on
+// Discord: %APPDATA%\npm with only the sh shim of claude, no claude.cmd,
+// and no codex at all). The Claude subscription bridge's runs kept for
+// their conversations' next turns, and Codex's app-server daemon with no
+// session on it; a var so tests can see it asked.
+var letGoBeforeUpdate = func(ctx context.Context, id string) {
+	switch id {
+	case "claude":
+		if n := gateway.LetGoIdleClaudeCode(); n > 0 {
+			log.Printf("claude: ended %d Claude Code runs waiting for their next turn, to update it", n)
+		}
+	case "codex":
+		if stopped, err := provider.StopIdleCodexDaemon(ctx); err != nil {
+			log.Println("codex: before its update:", err)
+		} else if stopped {
+			log.Println("codex: stopped its app-server daemon, to update it")
+		}
+	}
+}
+
+// updateGOOS is runtime.GOOS; a var so tests can be Windows.
+var updateGOOS = runtime.GOOS
+
 // updateTimeout bounds an update: a download, or Homebrew updating itself first.
 var updateTimeout = 10 * time.Minute
 
 // UpdateCLI brings the agent's CLI up to date the way it was installed, and
 // says what it is afterwards.
 func (a *Agent) UpdateCLI() (CLI, error) {
+	if a.WSL != "" {
+		return a.updateWSL()
+	}
 	bin, spec := a.cliBin()
 	if bin == "" {
 		return CLI{}, fmt.Errorf("magpie can't find %s's CLI", a.Name)
@@ -1097,6 +1165,9 @@ func (a *Agent) UpdateCLI() (CLI, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), updateTimeout)
 	defer cancel()
+	if updateGOOS == "windows" && (u.via == "npm" || u.via == "bun" || u.via == "pnpm") {
+		letGoBeforeUpdate(ctx, a.ID)
+	}
 	run := runUpdate
 	if u.admin {
 		run = runAdmin
@@ -1121,6 +1192,13 @@ func (a *Agent) UpdateCLI() (CLI, error) {
 			msg = strings.TrimSpace(msg + " " + err.Error())
 		}
 		return c, fmt.Errorf("%s: %s", u.shown(), msg)
+	}
+	if updateGOOS == "windows" && !isFile(bin) {
+		// npm took the old shims away and stopped before it wrote the new
+		// ones: a file of the old package's was still running (EPERM), and
+		// what is left of claude is npm's sh shim, which Windows can't run
+		// (CLJY on Discord)
+		return c, fmt.Errorf("%s was updated, but %s is gone (a copy of it still running keeps %s from finishing): quit it, and %s", a.Name, bin, u.via, mendHint(u, c.Version))
 	}
 	if c.Update && c.Version == before {
 		return c, fmt.Errorf("%s is still %s after %s; %s is out", a.Name, c.Version, u.shown(), c.Latest)
@@ -1228,7 +1306,7 @@ func mendHint(u *updater, version string) string {
 	return "run " + u.shown() + " again, or reinstall it the way you installed it"
 }
 
-var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+var ansiRe = lazyre.New(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 
 // lastLines is the last n lines of out with something on them, without
 // their colours.

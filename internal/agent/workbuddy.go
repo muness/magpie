@@ -41,8 +41,10 @@ import (
 	"strings"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 func workbuddy(home string) *Agent {
@@ -154,12 +156,15 @@ func workbuddyRead(path string) (workbuddyDoc, error) {
 
 // workbuddyEntry is what magpie reads of an entry.
 type workbuddyEntry struct {
-	ID        string `json:"id"`
-	Vendor    string `json:"vendor"`
-	Disabled  *bool  `json:"disabled"`
-	URL       string `json:"url"`
-	APIKey    string `json:"apiKey"`
-	Reasoning *struct {
+	ID       string `json:"id"`
+	Vendor   string `json:"vendor"`
+	Disabled *bool  `json:"disabled"`
+	URL      string `json:"url"`
+	APIKey   string `json:"apiKey"`
+	// MaxOutputTokens is the reply limit the entry has now: one typed in
+	// WorkBuddy's model settings stays (outputsKept)
+	MaxOutputTokens int `json:"maxOutputTokens"`
+	Reasoning       *struct {
 		DefaultEffort string `json:"defaultEffort"`
 		Effort        string `json:"effort"` // the older key WorkBuddy still reads
 	} `json:"reasoning"`
@@ -246,10 +251,47 @@ func buddyWriteAt(path, agent string, on bool, where place) error {
 			keys[e.APIKey] = true
 		}
 	}
+	var models []catalog.Model
+	if on {
+		models = sharedModels(agent)
+	}
+	// the model each entry is, by the id it has now: magpie's catalog id,
+	// or the name it was given as its id (buddyIDs) under this Provider in
+	// model names or another, so what was set on it in WorkBuddy stays
+	// when the setting changes
+	modelOf := func(id string) string { return id }
+	if len(models) > 0 {
+		isID, byName := map[string]bool{}, map[string]string{}
+		named := func(name, id string) {
+			if name == "" {
+				return
+			}
+			if was, ok := byName[name]; ok && was != id {
+				id = "" // two models' name: neither's
+			}
+			byName[name] = id
+		}
+		shown, _ := provider.CatalogFor(agent)
+		for _, e := range shown {
+			named(e.Label(), e.ID)
+			named(e.PlainName(), e.ID)
+		}
+		for _, m := range models {
+			isID[m.ID] = true
+			named(m.Name, m.ID)
+		}
+		modelOf = func(id string) string {
+			if c := byName[id]; c != "" && !isID[id] {
+				return c
+			}
+			return id
+		}
+	}
 	var kept []json.RawMessage
 	var ours []string
 	off := map[string]bool{}
 	effort := map[string]string{} // the default effort each model was given in WorkBuddy, "" for its Auto
+	haveOut := map[string]int{}   // the reply limit each model has in the file now
 	var remote, remoteKey string
 	at := -1 // where magpie's were, which they keep
 	for _, raw := range d.models {
@@ -268,11 +310,13 @@ func buddyWriteAt(path, agent string, on bool, where place) error {
 				remote, remoteKey = e.URL, e.APIKey
 			}
 			ours = append(ours, e.ID)
+			m := modelOf(e.ID)
+			haveOut[m] = e.MaxOutputTokens
 			if e.Disabled != nil && *e.Disabled {
-				off[e.ID] = true
+				off[m] = true
 			}
 			if r := e.Reasoning; r != nil {
-				effort[e.ID] = cmp.Or(r.DefaultEffort, r.Effort)
+				effort[m] = cmp.Or(r.DefaultEffort, r.Effort)
 			}
 			continue
 		}
@@ -284,8 +328,18 @@ func buddyWriteAt(path, agent string, on bool, where place) error {
 	var add []json.RawMessage
 	var ids []string
 	if on {
-		for _, m := range sharedModels(agent) {
-			e := buddyModel(agent, m.ID, m.Name, m.Context, outputOr(m, zcodeOutput(maxTokens(m))), m.Images, m.Efforts)
+		idOf := buddyIDs(agent, models, away || remote != "")
+		// a reply limit typed into the file stays; magpie's is put where
+		// the user set none (outputsKept)
+		wantOut := map[string]int{}
+		for _, m := range models {
+			if n := outputOr(m, zcodeOutput(maxTokens(m))); n > 0 {
+				wantOut[m.ID] = n
+			}
+		}
+		keptOut := outputsKept(path, wantOut, haveOut)
+		for _, m := range models {
+			e := buddyModel(agent, idOf(m), m.Name, m.Context, keptOut[m.ID], m.Images, m.Efforts)
 			if off[m.ID] {
 				e["disabled"] = true
 			}
@@ -314,18 +368,18 @@ func buddyWriteAt(path, agent string, on bool, where place) error {
 				return err
 			}
 			add = append(add, b)
-			ids = append(ids, m.ID)
+			ids = append(ids, idOf(m))
 		}
 	}
 	if at < 0 {
 		at = len(kept)
 	}
-	models := slices.Concat(kept[:at], add, kept[at:])
-	if models == nil {
-		models = []json.RawMessage{}
+	list := slices.Concat(kept[:at], add, kept[at:])
+	if list == nil {
+		list = []json.RawMessage{}
 	}
 
-	var out any = models
+	var out any = list
 	if d.rest != nil {
 		// a list of the models to show keeps showing magpie's
 		if raw, ok := d.rest["availableModels"]; ok {
@@ -337,7 +391,7 @@ func buddyWriteAt(path, agent string, on bool, where place) error {
 				d.rest["availableModels"] = b
 			}
 		}
-		b, err := json.Marshal(models)
+		b, err := json.Marshal(list)
 		if err != nil {
 			return err
 		}
@@ -351,6 +405,41 @@ func buddyWriteAt(path, agent string, on bool, where place) error {
 	return edit.WriteAtomic(path, append(b, '\n'))
 }
 
+// buddyIDs is the id each of models is written under in the agent's
+// models.json. WorkBuddy's picker shows a model it was given as
+// "name:id" whenever the two differ (its renderer's getModelDisplayName,
+// 5.5.6), so magpie's catalog id put the provider back after every name
+// the user had asked to see without it ("GLM-5.3:workbuddy/glm-5.3",
+// elis_pina on X). With Provider in model names Off or Own (LabelsFor),
+// WorkBuddy and WorkBuddy AI are given the name as the id too, and show
+// it alone; the gateway takes a name back to its model by the agent's key
+// (provider.AgentNamed). Else, and for a magpie on another machine (whose
+// own names this one cannot answer for), the catalog id, as CodeBuddy
+// Code's always is: its settings.json names the model by it, and its
+// picker shows the name alone.
+func buddyIDs(agent string, models []catalog.Model, away bool) func(catalog.Model) string {
+	catalogID := func(m catalog.Model) string { return m.ID }
+	if agent != "workbuddy" && agent != "workbuddy-ai" || away {
+		return catalogID
+	}
+	if mode := provider.SuffixModeFor(agent); mode != provider.SuffixOff && mode != provider.SuffixOwn {
+		return catalogID
+	}
+	// a name two models share, or one that is another model's id, stays
+	// the catalog id: the gateway could not tell which was asked for
+	n, isID := map[string]int{}, map[string]bool{}
+	for _, m := range models {
+		n[m.Name]++
+		isID[m.ID] = true
+	}
+	return func(m catalog.Model) string {
+		if m.Name == "" || n[m.Name] != 1 || isID[m.Name] && m.Name != m.ID {
+			return m.ID
+		}
+		return m.Name
+	}
+}
+
 // buddySmallWindow is the smaller context WorkBuddy offers beside a
 // model's whole window, the size its own models offer.
 const buddySmallWindow = 200000
@@ -359,7 +448,7 @@ const buddySmallWindow = 200000
 // agent's key.
 func buddyModel(agent, id, name string, context, output int, images bool, efforts []string) map[string]any {
 	if context == 0 {
-		context = 200000
+		context = unknownWindow(200000)
 	}
 	e := map[string]any{
 		"id": id, "name": name, "vendor": magpieID,

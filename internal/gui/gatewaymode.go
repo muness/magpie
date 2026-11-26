@@ -5,19 +5,22 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/yetone/magpie/internal/agent"
+	"github.com/yetone/magpie/internal/library"
 	"github.com/yetone/magpie/internal/sessions"
 	"github.com/yetone/magpie/internal/settings"
 )
 
 // Gateway mode (Player on Discord): `magpie web` on a server that is only
 // the gateway for other machines' agents shows what such a gateway needs —
-// Providers, Gateway, Routing, Usage, Sessions, Plugins and Settings — and leaves out
-// what is this machine's agents' (Agents, Library, the settings
+// Providers, Gateway, Routing, Usage, Sessions, Plugins, Settings and the
+// Library's MCP servers with the router (treeman_26897) — and leaves out
+// what is this machine's agents' (Agents, the Library's other tabs, the settings
 // written into agents' files) and its desktop's (the tray, the Dock, open
 // at login, notifications). It is the browser page's alone: the app's
 // windows show everything whatever it says.
@@ -41,7 +44,7 @@ func gatewayMode(web bool) (bool, string) {
 	if !web {
 		return false, ""
 	}
-	switch m := settings.Load().GatewayMode; m {
+	switch m := settings.Shared().GatewayMode; m {
 	case "on", "off":
 		return m == "on", m
 	}
@@ -54,8 +57,11 @@ func gatewayMode(web bool) (bool, string) {
 	return false, ""
 }
 
-// agentsHere says whether an agent is found on this computer; a test's own.
-var agentsHere = func() bool { return len(agent.Detected()) > 0 }
+// agentsHere says whether an agent is found on this computer, stopping at
+// the first: each agent's check can read app bundles and ask Spotlight.
+// WSL's agents are those last listed: a hung wsl.exe doesn't hold the
+// Sessions page (sessions.Dirs asks this). A test's own.
+var agentsHere = func() bool { return slices.ContainsFunc(agent.AllKnown(), (*agent.Agent).Detected) }
 
 // gatewayModeRoutes: POST /api/settings/gateway-mode {"mode": "on" | "off"
 // | ""} sets Settings' choice, "" leaving it to magpie again.
@@ -153,4 +159,7 @@ func agentsHereKept() bool {
 func init() {
 	f := ownSessionsOff
 	sessions.OwnOff.Store(&f)
+	// the browser page in gateway mode ticks a skill or the prompts for
+	// no agent: a magpie that uses this one's Library gives them to its own
+	library.NoAgentsShown = func() bool { on, _ := gatewayMode(true); return on }
 }

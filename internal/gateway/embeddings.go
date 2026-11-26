@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/usage"
 )
@@ -61,6 +62,18 @@ type retrieval interface {
 	// answerType is the Content-Type the vendor's answer goes back with,
 	// given the one it came with
 	answerType(got string) string
+}
+
+// refusingRetrieval is a retrieval request only some providers can be
+// sent: refuses is why p can't, "" when it can (decisionRequest).
+type refusingRetrieval interface {
+	refuses(p provider.Provider) string
+}
+
+// countedRetrieval is a retrieval request whose answer's usage is read
+// its own way, cached tokens apart (decisionRequest).
+type countedRetrieval interface {
+	counted(b []byte) Usage
 }
 
 // jsonRetrieval is an embeddings or rerank body: a JSON object.
@@ -121,10 +134,11 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 	if isGroup {
 		r = heldByGroup(r, g) // held to the group's accounts, if it is
 	}
-	if keyWho, held := keyHolds(r); held && (isGroup && !groupAllowed(keyWho, g, ms) || !isGroup && !modelAllowed(keyWho, p, model)) {
-		msg := keyModelError(keyWho, asked)
-		call.Status, call.Error = 403, msg
-		writeError(w, provider.Chat, 403, msg)
+	keyWho, keyHeld := keyHolds(r)
+	if isGroup && !groupGiven(r, keyWho, keyHeld, g, ms) || keyHeld && !isGroup && !modelAllowed(keyWho, p, model) {
+		st, msg := keyModelRefusal(w, keyWho, asked)
+		call.Status, call.Error = st, msg
+		writeError(w, provider.Chat, st, msg)
 		s.record(call)
 		return
 	}
@@ -148,7 +162,7 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 	// (429) or one whose vendor fails; a model is asked on its own
 	tries := []candidate{{p: p, model: model}}
 	if isGroup {
-		cs, pl := s.planGroup(g.Live(), ms, provider.Chat)
+		cs, pl := s.planGroup(keyRouted(access.Caller(r.Context()), g.Live()), ms, provider.Chat)
 		if len(cs) > 0 {
 			tries = cs
 		} else if slices.ContainsFunc(pl.left, func(w Weighed) bool { return w.HeldBy != "" }) {
@@ -171,6 +185,19 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 			return
 		}
 		tries = cs
+	}
+	// a group's members the key may not go to through it are left out
+	// (groupKeeps): those a spent limit of the key's counts
+	if keyHeld && isGroup {
+		keeps := groupKeeps(keyWho, g, ms)
+		tries = slices.DeleteFunc(tries, func(c candidate) bool { return !keeps[c.p.ID+"/"+c.model] })
+		if len(tries) == 0 {
+			st, msg := keyGroupRefusal(w, keyWho, asked, ms)
+			call.Status, call.Error = st, msg
+			writeError(w, provider.Chat, st, msg)
+			s.record(call)
+			return
+		}
 	}
 	// the accounts or keys the calling key may not use are left out of
 	// the tries too (#905): a group's members through it no less
@@ -196,7 +223,7 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 	side := s.beginSide(r, start, asked, tries[0].p.ID, grp)
 	// unless every try is on this machine or the local network, set
 	// to go unmasked (provider.SkipsRedaction)
-	if slices.ContainsFunc(tries, func(c candidate) bool { return !c.p.SkipsRedaction() }) {
+	if slices.ContainsFunc(tries, func(c candidate) bool { return !c.unmasked() }) {
 		var done func()
 		var err error
 		var hits maskHits
@@ -214,6 +241,8 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 		switch req.(type) {
 		case *audioForm, *speechRequest:
 			what = "audio"
+		case *decisionRequest:
+			what = "decisions"
 		}
 		// the record names the try that had it last, not the first
 		// planned (noteMaskedUntil)
@@ -226,8 +255,21 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 		call.Provider, went = c.p.ID, c.model
 		base := strings.TrimRight(c.p.OpenAIBase(), "/")
 		tried := side.try(c)
-		if base == "" {
-			msg := fmt.Sprintf("%s has no OpenAI-style API for %s", c.p.Name, path)
+		msg := ""
+		// asked in the vendor's own shape where it has no OpenAI-style one
+		// (Gemini's speech, speech_gemini.go)
+		var nat *vendorAsk
+		if nr, ok := req.(nativeRetrieval); ok {
+			nat, msg = nr.nativeAt(c.p, c.model)
+		}
+		if msg == "" && nat == nil {
+			if base == "" {
+				msg = fmt.Sprintf("%s has no OpenAI-style API for %s", c.p.Name, path)
+			} else if rr, ok := req.(refusingRetrieval); ok {
+				msg = rr.refuses(c.p) // never sent, so never a 404 of the vendor's
+			}
+		}
+		if msg != "" {
 			tried(400, errors.New(msg))
 			if !last {
 				skipped = append(skipped, c.label()+": "+msg)
@@ -241,6 +283,9 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 			return
 		}
 		out, ctype, err := req.forModel(c.model)
+		if nat != nil {
+			out, ctype = nat.body, "application/json"
+		}
 		if err != nil {
 			tried(400, err)
 			side.end(c.p, c.model, 400, err, Usage{})
@@ -250,6 +295,8 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), retrieveTimeout)
+		// the headers the user gave the model
+		ctx = provider.WithModel(ctx, c.p.ID, c.model)
 		// the headers of the vendor's reply passed on (#4145)
 		var heard heardHeaders
 		ctx = withReplySink(ctx, c.p.ID, heard.put)
@@ -257,10 +304,18 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 		var got string
 		var code int
 		var res *http.Response // a streamed answer, not read yet
-		if st, ok := req.(streamedRetrieval); ok && st.streams() {
-			res, b, got, code, err = s.retrieveOpen(ctx, c.p, base+path, ctype, "", out)
+		var natIn, natOut int
+		if st, ok := req.(streamedRetrieval); ok && st.streams() && nat == nil {
+			res, b, got, code, err = s.retrieveOpen(ctx, c.p, provider.Chat, base+path, ctype, "", out)
+		} else if nat != nil {
+			// whole, then put in the client's shape
+			if b, got, code, err = s.retrieveAs(ctx, c.p, nat.proto, nat.url, ctype, out); err == nil {
+				if b, got, natIn, natOut, err = nat.answer(ctx, b); err != nil {
+					code, err = 502, fmt.Errorf("%s: %v", provider.HostOf(nat.url), err)
+				}
+			}
 		} else {
-			b, got, code, err = s.retrieveAs(ctx, c.p, base+path, ctype, out)
+			b, got, code, err = s.retrieveAs(ctx, c.p, provider.Chat, base+path, ctype, out)
 		}
 		if res == nil {
 			cancel()
@@ -275,6 +330,14 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 		}
 		call.Status = code
 		in, outTokens := retrievedTokens(b), answeredTokens(b)
+		if nat != nil {
+			in, outTokens = natIn, natOut
+		}
+		var cached Usage // the cache's share, when the answer tells it
+		if cr, ok := req.(countedRetrieval); ok && res == nil && err == nil {
+			cached = cr.counted(b)
+			in, outTokens = cached.Input, cached.Output
+		}
 		if res != nil {
 			// passed on as it comes: audio, or SSE, is never held whole
 			heard.into(w.Header())
@@ -289,14 +352,15 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 			}
 		}
 		call.Usage.Input, call.Usage.Output = in, outTokens
+		call.Usage.CacheRead, call.Usage.CacheWrite = cached.CacheRead, cached.CacheWrite
 		call.Fallback = strings.Join(skipped, "; ")
 		providerKeyID, providerKeyName := "", ""
 		if c.p.Account == nil && c.p.Key != "" {
 			providerKeyID, providerKeyName = provider.KeyID(c.p.Key), c.p.KeyName
 		}
-		side.end(c.p, c.model, code, err, Usage{Input: in, Output: outTokens})
+		side.end(c.p, c.model, code, err, Usage{Input: in, Output: outTokens, CacheRead: cached.CacheRead, CacheWrite: cached.CacheWrite})
 		appendUsage(r, usage.Record{RouteID: side.id(), Operation: operation, Time: start, Agent: call.Agent, Via: call.Via, Provider: c.p.ID, Host: c.p.Where(), Model: c.model, Requested: asked, ProviderKeyID: providerKeyID, ProviderKeyName: providerKeyName, ProviderAccount: accountOf(c.p),
-			Input: in, Output: outTokens, Millis: call.Millis, Status: code, Session: sessionOf(r.Header)})
+			Input: in, Output: outTokens, CacheRead: cached.CacheRead, CacheWrite: cached.CacheWrite, Millis: call.Millis, Status: code, Session: sessionOf(r.Header)})
 		if err != nil {
 			call.Error = err.Error()
 			s.record(call)
@@ -320,9 +384,10 @@ func (s *Server) serveRetrieval(w http.ResponseWriter, r *http.Request, path, op
 	}
 }
 
-// resolveRetrievalModel also finds a preset plan's embedding model by its
-// bare id. Such models stay out of agents' chat-model lists, so the general
-// resolver does not otherwise see them there.
+// resolveRetrievalModel also finds a preset plan's embedding or rerank
+// model, of kind's, by its bare id. Such models stay out of agents'
+// chat-model lists, so the general resolver does not otherwise see them
+// there.
 func resolveRetrievalModel(id, kind string) (provider.Provider, string, bool) {
 	if p, model, ok := mediaGroupFirst(id, kind); ok {
 		return p, model, true
@@ -337,7 +402,7 @@ func resolveRetrievalModel(id, kind string) (provider.Provider, string, bool) {
 		if !p.On() || p.DecideOnly() {
 			continue
 		}
-		for _, m := range p.PlanEmbeddings() {
+		for _, m := range p.PlanRetrieval(kind) {
 			if m.ID == id {
 				return p, id, true
 			}
@@ -349,18 +414,19 @@ func resolveRetrievalModel(id, kind string) (provider.Provider, string, bool) {
 // retrieveFrom posts body to url as the provider signs its requests, and
 // reads the answer; a failure's code is the vendor's, with its message.
 func (s *Server) retrieveFrom(ctx context.Context, p provider.Provider, url string, body []byte) ([]byte, int, error) {
-	b, _, code, err := s.retrieveAs(ctx, p, url, "application/json", body)
+	b, _, code, err := s.retrieveAs(ctx, p, provider.Chat, url, "application/json", body)
 	return b, code, err
 }
 
 // retrieveAs is retrieveFrom with a body of its own Content-Type, a
-// multipart form's with its boundary; it also gives the answer's.
-func (s *Server) retrieveAs(ctx context.Context, p provider.Provider, url, ctype string, body []byte) ([]byte, string, int, error) {
+// multipart form's with its boundary, signed as a request of proto's; it
+// also gives the answer's.
+func (s *Server) retrieveAs(ctx context.Context, p provider.Provider, proto provider.Protocol, url, ctype string, body []byte) ([]byte, string, int, error) {
 	accept := ""
 	if ctype == "application/json" {
 		accept = "application/json"
 	}
-	res, b, got, code, err := s.retrieveOpen(ctx, p, url, ctype, accept, body)
+	res, b, got, code, err := s.retrieveOpen(ctx, p, proto, url, ctype, accept, body)
 	if res == nil {
 		return b, got, code, err
 	}
@@ -375,7 +441,7 @@ func (s *Server) retrieveAs(ctx context.Context, p provider.Provider, url, ctype
 // retrieveOpen posts body as retrieveAs does, with an Accept of its own
 // (none when empty). A success's answer is left unread in res, for the
 // caller to read and close; a failure's is read into b, res nil.
-func (s *Server) retrieveOpen(ctx context.Context, p provider.Provider, url, ctype, accept string, body []byte) (*http.Response, []byte, string, int, error) {
+func (s *Server) retrieveOpen(ctx context.Context, p provider.Provider, proto provider.Protocol, url, ctype, accept string, body []byte) (*http.Response, []byte, string, int, error) {
 	ctx = s.metered(p.Via(ctx), p, "") // counted against its MaxRPM (rpm.go)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -390,8 +456,9 @@ func (s *Server) retrieveOpen(ctx context.Context, p provider.Provider, url, cty
 	if p.IsRemoteMagpie() {
 		req.Header.Set("User-Agent", "magpie/"+Version)
 		passOnCaller(ctx, req)
+		passOnUA(req, callerUA(ctx))
 	}
-	if err := p.Sign(ctx, req, provider.Chat, body); err != nil {
+	if err := p.Sign(ctx, req, proto, body); err != nil {
 		return nil, nil, "", 502, err
 	}
 	res, err := p.Do(s.client, req)

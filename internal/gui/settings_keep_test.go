@@ -116,6 +116,7 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 		DisabledModels:       []string{"*fable*", "p/m"},
 		PickedModels:         map[string][]string{"opencode": {"p/m"}},
 		OwnModelsHidden:      []string{"dsh"},
+		PicksJoin:            []string{"opencode"},
 		OrderedModels:        map[string][]string{"codex": {"group/g", "p/n"}},
 		FastPicks:            map[string][]string{"codex": {"p/n"}},
 		UltraPicks:           map[string][]string{"codex": {"p/n"}},
@@ -131,6 +132,7 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 		ModelCompacts:        map[string]int{"p/*": 500000},
 		CompactAt:            400000,
 		AgentCompacts:        map[string]settings.AgentCompact{"claude": {At: 600000}},
+		AgentContexts:        map[string]map[string]int{"dsh": {"p/m": 400000}},
 		ModelPrices:          map[string]settings.ModelPrice{"p/m": {Input: &one, Output: &two}},
 		ModelWires:           map[string]string{"p/m": "vendor-c/m"},
 		ModelAPIs:            map[string]string{"p/m": "anthropic"},
@@ -139,6 +141,9 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 		UsageAliases:         map[string]string{"deepseek-v4.1-flash": "deepseek-flash"},
 		UsageCleared:         []settings.UsageClear{{Provider: "p", Model: "m", At: 1761600000000}},
 		ModelKinds:           map[string]string{"p/m": "video"},
+		ModelHeaders:         map[string]map[string]string{"p/m": {"X-Endpoint": "ep-1"}},
+		ModelSystemPrompts:   map[string]string{"p/m": "Answer in Chinese."},
+		ModelTiers:           map[string]string{"p/m": "ultrafast"},
 		RedactRules:          []redact.Rule{{Kind: "prefix", Prefix: "oc_sk_"}},
 		RedactActions:        map[string]string{"API_KEY": "block", "EMAIL": "warn"},
 		RedactAllow:          []string{"team@kelvarn.io"},
@@ -152,23 +157,34 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 		GitHubToken:          "ghp_kept",
 		RequestArchive:       true,
 		RequestArchiveMaxMB:  64,
+		RequestArchiveMB:     2048,
 		GatewayConversations: true,
 		QuotaLeft:            true,
 		UsageOrder:           []string{"kimi", "codex"},
+		PluginPageOrder:      []string{"plugin-b", "plugin-a"},
 		PanelUsageHidden:     []string{"deepseek"},
 		UsageAgentsHidden:    []string{"curl"},
 		UsageCardsHidden:     []string{"stepfun|balance"},
+		UsageWindowsHidden:   []string{"antigravity|Claude & GPT"},
 		ClientAgents:         map[string]string{"hermes-codex-thread-bridge": "codex"},
 		PlainNames:           true,
 		PlainOwnNames:        true,
+		AgentSuffix:          map[string]string{"pi": "off"},
 		BareModelIDs:         true,
 		CodexAgentsV1:        true,
 		CodexTitles:          "off",
 		CodexDescriptions:    "fake/m1",
 		CodexPredictions:     "off",
+		CodexSuggestions:     "fake/m1",
 		CodexAutoReview:      "fake/m1",
 		CodexSubagentModel:   "codex/gpt-6-astra",
+		CodexServiceTier:     "priority",
+		CodexClient:          "desktop",
+		CodexOpen:            "terminal",
 		DesktopSubagentModel: "fake/m2",
+		DesktopGateway:       "https://192.168.1.20:3425",
+		DshCompactModel:      "fake/m1",
+		CodexCompactModel:    "fake/m1",
 		ChinaMirror:          true,
 		NPMRegistry:          "https://npm.corp.example",
 		CodexAutoReset:       []string{"me@example.com"},
@@ -186,11 +202,14 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 		WindowAt:             []int{-1440, 120},
 		FullContext:          true,
 		DesktopLongest:       true,
+		DesktopIsolated:      true,
 		GuideHidden:          true,
 		GatewayMode:          "off",
 		QuotaReads:           "asked",
 		SearchAll:            true,
+		SearchCount:          9,
 		NoAccountDiscovery:   true,
+		AgentTelemetryOff:    true,
 		RedactModel:          true,
 		RedactModelName:      "astrlink-guard",
 		RedactModelScore:     map[string]float64{"astrlink-guard": 0.9},
@@ -198,16 +217,36 @@ func TestSettingsSaveKeepsWhatItDoesNotSend(t *testing.T) {
 	}
 	was.RedactModelOff, was.RedactModelAuto = true, true
 	was.DesktopSubagentEffort = "high"
+	was.DesktopIsolatedClaude, was.DesktopIsolatedClaudeChosen = true, true
 	was.ReplyModel = settings.ReplyMember // memberModel, its mirror, is kept with it
 	was.CodexAsyncCompact, was.CodexAsyncCompactPercent = true, 70
 	was.ClaudeRunsMost = 3
 	was.RequestArchiveLocal, was.RequestArchiveLocalMB = true, 256
 	was.ProxyCustom = "http://me:secret@proxy.example:8080"
+	was.PluginProxyCustom = "http://me:secret@plugins.example:8080"
+	was.UpdateProxyCustom = "http://me:secret@updates.example:8080"
 	was.PanelShortcut = "Ctrl+Alt+K"
+	was.Proxies = []settings.NamedProxy{{ID: "p1", Name: "Office", URL: "http://proxy.example:8080"}} // their own routes, /api/proxies/*
+	was.ProxyNames = map[string]string{"p1": "Office"}
+	was.ContextCap = 200000                           // its own route, POST /api/settings/context-cap
+	was.ContextCapAll = true                          // its own route, POST /api/settings/context-cap-mode
+	was.BareModelIDsOnly = true                       // its own route, POST /api/settings/bare-ids
 	was.SearcherThen = []string{"fake/m1", "fake/m2"} // set in its own row
 	was.RouterNote = "Los Angeles"                    // the Library's servers/hub-note
 	was.RouterAllTools = true                         // the Library's servers/hub-tools
+	was.RouterNoCode = true                           // the Library's servers/hub-code
 	was.BusyLoad = 150                                // the Routing page's busy-load
+	was.MTLS = true                                   // Network and sharing's settings/mtls
+	was.Wallpaper = 1700000000000                     // Settings > General's Background image, appearance/wallpaper
+	was.HTTPS = true                                  // Network and sharing's settings/https
+	was.OnTop = true                                  // the title bar's pin, window/ontop
+	was.ImageResolution = "4K"                        // Settings > Images' Resolution row, sent by that row alone
+	was.RedactModelDir = "/Volumes/models"            // Privacy's Advanced › models folder, moved by its own route
+	was.Name = "Tokyo box"                            // Network and sharing's Advanced › Name, sent by its own row alone
+	// Settings > Usage's Bark row has its own route (settings/bark)
+	was.BarkServer, was.BarkKey, was.BarkDaily = "https://bark.example.com", "kept", "21:30"
+	// the Routing groups page's defaults for every group (groups/defaults)
+	was.GroupSink, was.GroupFirstToken, was.GroupPatience = true, 30, 120
 	if err := settings.Save(was); err != nil {
 		t.Fatal(err)
 	}

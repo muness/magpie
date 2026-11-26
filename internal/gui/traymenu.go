@@ -2,15 +2,16 @@ package gui
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/uilang"
 )
 
 // trayZh is the tray menu in Chinese; the page has its own words
 // (i18n.js), and these few are all the menu and the icon's tooltip show
 // (#301).
 var trayZh = map[string]string{
+	"Restart magpie":                       "重启 magpie",
 	"Open magpie":                          "打开 magpie",
 	"Version %s":                           "版本 %s",
 	"Restart to Update":                    "重启以更新",
@@ -18,6 +19,9 @@ var trayZh = map[string]string{
 	"Quit magpie":                          "退出 magpie",
 	"Restart Now to Update":                "立即重启以更新",
 	"Restart Now to Update (%d in flight)": "立即重启以更新（%d 个进行中）",
+	// the gateway paused from the menu (gatewaypause.go)
+	"Pause Gateway":  "暂停网关",
+	"Resume Gateway": "恢复网关",
 	// the tray icon's tooltip (trayusage.go; yi_time on Discord)
 	"%s used":                             "已用 %s",
 	"%s left":                             "剩余 %s",
@@ -39,10 +43,13 @@ var trayZh = map[string]string{
 	"%s tokens (%s)":                      "%s token（%s）",
 	"Today: no requests yet":              "今天：还没有请求",
 	"Today: %s":                           "今天：%s",
+	// the tooltip's warning (trayEgressTip)
+	"Claude's way out to the internet is in %s, outside Anthropic's supported regions": "Claude 的网络出口在 %s，不在 Anthropic 支持的地区内",
 }
 
 // trayZhTW is the tray menu in Traditional Chinese, with Taiwan's words.
 var trayZhTW = map[string]string{
+	"Restart magpie":                       "重新啟動 magpie",
 	"Open magpie":                          "開啟 magpie",
 	"Version %s":                           "版本 %s",
 	"Restart to Update":                    "重新啟動以更新",
@@ -50,6 +57,9 @@ var trayZhTW = map[string]string{
 	"Quit magpie":                          "結束 magpie",
 	"Restart Now to Update":                "立即重新啟動以更新",
 	"Restart Now to Update (%d in flight)": "立即重新啟動以更新（%d 個進行中）",
+	// the gateway paused from the menu (gatewaypause.go)
+	"Pause Gateway":  "暫停閘道",
+	"Resume Gateway": "恢復閘道",
 	// the tray icon's tooltip (trayusage.go; yi_time on Discord)
 	"%s used":                             "已用 %s",
 	"%s left":                             "剩餘 %s",
@@ -71,10 +81,13 @@ var trayZhTW = map[string]string{
 	"%s tokens (%s)":                      "%s token（%s）",
 	"Today: no requests yet":              "今天：還沒有請求",
 	"Today: %s":                           "今天：%s",
+	// the tooltip's warning (trayEgressTip)
+	"Claude's way out to the internet is in %s, outside Anthropic's supported regions": "Claude 的網路出口在 %s，不在 Anthropic 支援的地區內",
 }
 
 // trayJa is the tray menu in Japanese.
 var trayJa = map[string]string{
+	"Restart magpie":                       "magpie を再起動",
 	"Open magpie":                          "magpie を開く",
 	"Version %s":                           "バージョン %s",
 	"Restart to Update":                    "再起動してアップデート",
@@ -82,6 +95,9 @@ var trayJa = map[string]string{
 	"Quit magpie":                          "magpie を終了",
 	"Restart Now to Update":                "今すぐ再起動してアップデート",
 	"Restart Now to Update (%d in flight)": "今すぐ再起動してアップデート（%d 件処理中）",
+	// the gateway paused from the menu (gatewaypause.go)
+	"Pause Gateway":  "ゲートウェイを一時停止",
+	"Resume Gateway": "ゲートウェイを再開",
 	// the tray icon's tooltip (trayusage.go; yi_time on Discord)
 	"%s used":                             "使用済み %s",
 	"%s left":                             "残り %s",
@@ -103,10 +119,13 @@ var trayJa = map[string]string{
 	"%s tokens (%s)":                      "%s トークン（%s）",
 	"Today: no requests yet":              "今日：まだリクエストはありません",
 	"Today: %s":                           "今日：%s",
+	// the tooltip's warning (trayEgressTip)
+	"Claude's way out to the internet is in %s, outside Anthropic's supported regions": "Claude のネットワーク出口が %s にあり、Anthropic のサポート対象地域外です",
 }
 
 // trayDe is the tray menu in German.
 var trayDe = map[string]string{
+	"Restart magpie":                       "magpie neu starten",
 	"Open magpie":                          "magpie öffnen",
 	"Version %s":                           "Version %s",
 	"Restart to Update":                    "Zum Aktualisieren neu starten",
@@ -114,6 +133,9 @@ var trayDe = map[string]string{
 	"Quit magpie":                          "magpie beenden",
 	"Restart Now to Update":                "Jetzt neu starten und aktualisieren",
 	"Restart Now to Update (%d in flight)": "Jetzt neu starten und aktualisieren (%d laufend)",
+	// the gateway paused from the menu (gatewaypause.go)
+	"Pause Gateway":  "Zugangspunkt pausieren",
+	"Resume Gateway": "Zugangspunkt fortsetzen",
 	// the tray icon's tooltip (trayusage.go; yi_time on Discord)
 	"%s used":                             "%s verbraucht",
 	"%s left":                             "%s übrig",
@@ -135,6 +157,8 @@ var trayDe = map[string]string{
 	"%s tokens (%s)":                      "%s Token (%s)",
 	"Today: no requests yet":              "Heute: noch keine Anfragen",
 	"Today: %s":                           "Heute: %s",
+	// the tooltip's warning (trayEgressTip)
+	"Claude's way out to the internet is in %s, outside Anthropic's supported regions": "Claudes Weg ins Internet führt über %s, außerhalb der von Anthropic unterstützten Regionen",
 }
 
 // trayWords are the tray menu's and the tray icon's tooltip's
@@ -145,38 +169,12 @@ var trayWords = map[string]map[string]string{"zh": trayZh, "zh-TW": trayZhTW, "j
 // language; set by the process that has the tray.
 var onLang func()
 
-// trayLang is the language the tray menu is in, as the page picks its own:
-// the setting, or with "system" (or none) the system's: Traditional Chinese
-// for Taiwan, Hong Kong, Macau and any zh-Hant (zh_TW.UTF-8, zh-Hant-TW),
-// Simplified for any other zh, Japanese for any ja, German for any de.
-func trayLang(pref string, system func() string) string {
-	switch pref {
-	case "en", "zh", "zh-TW", "ja", "de":
-		return pref
-	}
-	switch sys := strings.ReplaceAll(strings.ToLower(system()), "_", "-"); {
-	case zhTraditional(sys):
-		return "zh-TW"
-	case strings.HasPrefix(sys, "zh"):
-		return "zh"
-	case strings.HasPrefix(sys, "ja"):
-		return "ja"
-	case strings.HasPrefix(sys, "de"):
-		return "de"
-	}
-	return "en"
-}
+// trayLang is the language the tray menu is in, as the page picks its own
+// (uilang.Pick).
+func trayLang(pref string, system func() string) string { return uilang.Pick(pref, system) }
 
-// zhTraditional says a lowercased, dashed system tag is Traditional
-// Chinese, as the page's sysLocale does.
-func zhTraditional(sys string) bool {
-	for _, p := range []string{"zh-tw", "zh-hk", "zh-mo", "zh-hant"} {
-		if sys == p || strings.HasPrefix(sys, p+"-") || strings.HasPrefix(sys, p+".") || strings.HasPrefix(sys, p+"@") {
-			return true
-		}
-	}
-	return false
-}
+// systemLang is the system's language (uilang.System).
+func systemLang() string { return uilang.System() }
 
 // notesLang is the language release notes are asked in for lang: there are
 // no German ones, so German asks for the English, and Traditional Chinese
@@ -202,20 +200,26 @@ func trayText(lang, key string, args ...any) string {
 	return fmt.Sprintf(key, args...)
 }
 
-// trayLabels are the tray menu's lines: open, version, restart and quit.
-type trayLabels struct{ open, version, restart, quit string }
+// trayLabels are the tray menu's lines: open, pause (the gateway's, or
+// its resume), version, restart and quit.
+type trayLabels struct{ open, pause, version, restart, quit string }
 
 // trayMenuLabels are the lines in the language; update is the version
-// waiting for a restart, if there is one.
-func trayMenuLabels(lang, version, update string) trayLabels {
+// waiting for a restart, if there is one; paused, the gateway is.
+func trayMenuLabels(lang, version, update string, paused bool) trayLabels {
 	l := trayLabels{
 		open:    trayText(lang, "Open magpie"),
+		pause:   trayText(lang, "Pause Gateway"),
 		version: trayText(lang, "Version %s", version),
-		restart: trayText(lang, "Restart to Update"),
+		// no update waiting: magpie restarts as it is (restart.go)
+		restart: trayText(lang, "Restart magpie"),
 		quit:    trayText(lang, "Quit magpie"),
 	}
 	if update != "" {
 		l.restart = trayText(lang, "Restart to Update to %s", update)
+	}
+	if paused {
+		l.pause = trayText(lang, "Resume Gateway")
 	}
 	return l
 }
@@ -228,27 +232,4 @@ func trayRestartNow(lang string, b gateway.Busy) string {
 		return trayText(lang, "Restart Now to Update (%d in flight)", n)
 	}
 	return trayText(lang, "Restart Now to Update")
-}
-
-// envLang is the language the environment names: the first of LC_ALL,
-// LC_MESSAGES, LANG and LANGUAGE set to one.
-func envLang(getenv func(string) string) string {
-	for _, k := range []string{"LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"} {
-		if v := getenv(k); v != "" && v != "C" && v != "POSIX" && !strings.HasPrefix(v, "C.") {
-			return v
-		}
-	}
-	return ""
-}
-
-// firstAppleLang is the first entry `defaults read -g AppleLanguages`
-// prints: ( "zh-Hans-CN", "en-US" ), one to a line, quoted or not.
-func firstAppleLang(out string) string {
-	for _, line := range strings.Split(out, "\n") {
-		s := strings.Trim(strings.TrimSpace(line), `",`)
-		if s != "" && s != "(" && s != ")" {
-			return s
-		}
-	}
-	return ""
 }

@@ -303,3 +303,129 @@ func TestDesktopSubagentTurnLeavesTitleOnLead(t *testing.T) {
 		t.Fatalf("title after a subagent's turn: sent %q, want the lead's m1", got)
 	}
 }
+
+// Claude Code's WebSearch request as it goes out: 2.1.328's, captured
+// from the CLI against a fake server (2.1.317, 2.1.326 and 2.1.330 send
+// the same). Its option names web_search, but the request carries
+// tool_choice auto, with no thinking. The texts are cut short and the
+// user id made up; the keys, their order and the tool are as sent.
+const desktopWebSearchBody = `{"model":"fake/m1","messages":[{"role":"user","content":[{"type":"text","text":"Perform a web search for the query: Go release notes"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.328"},{"type":"text","text":"You are a Claude agent, built on Anthropic's Claude Agent SDK."},{"type":"text","text":"You run a web search for another Claude model"}],"tools":[{"type":"web_search_20250305","name":"web_search","max_uses":8}],"tool_choice":{"type":"auto"},"metadata":{"user_id":"{\"device_id\":\"d0\"}"},"max_tokens":128000,"output_config":{"effort":"max"},"stream":true}`
+
+func TestDesktopSearchCall(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       bool
+	}{
+		{"search", desktopWebSearchBody, true},
+		{"forced by name", strings.Replace(desktopWebSearchBody, `"tool_choice":{"type":"auto"}`, `"tool_choice":{"type":"tool","name":"web_search"}`, 1), true},
+		{"any tool", strings.Replace(desktopWebSearchBody, `"tool_choice":{"type":"auto"}`, `"tool_choice":{"type":"any"}`, 1), true},
+		{"new tool version", strings.ReplaceAll(desktopWebSearchBody, "20250305", "20260209"), true},
+		{"different prompt", strings.ReplaceAll(desktopWebSearchBody, "You run a web search for another Claude model", "Search the web"), true},
+		{"no prompt", `{"tools":[{"type":"web_search_20250305","name":"web_search"}],"tool_choice":{"type":"auto"}}`, true},
+		{"prompt only", `{"system":"You run a web search for another Claude model"}`, false},
+		{"no tools", `{"tool_choice":{"type":"auto"}}`, false},
+		{"empty tools", `{"tools":[],"tool_choice":{"type":"auto"}}`, false},
+		{"null tools", `{"tools":null,"tool_choice":{"type":"auto"}}`, false},
+		{"multiple tools", strings.ReplaceAll(desktopWebSearchBody, `"tools":[`, `"tools":[{"name":"Bash"},`), false},
+		{"another tool after it", strings.Replace(desktopWebSearchBody, `"max_uses":8}]`, `"max_uses":8},{"name":"Bash"}]`, 1), false},
+		{"client tool", strings.ReplaceAll(desktopWebSearchBody, `"type":"web_search_20250305",`, ""), false},
+		{"other server tool", strings.ReplaceAll(desktopWebSearchBody, "web_search_20250305", "web_fetch_20250910"), false},
+		{"no version prefix", strings.ReplaceAll(desktopWebSearchBody, "web_search_20250305", "web_search"), false},
+		{"other tool name", strings.Replace(desktopWebSearchBody, `"name":"web_search"`, `"name":"other"`, 1), false},
+		{"none", strings.Replace(desktopWebSearchBody, `"tool_choice":{"type":"auto"}`, `"tool_choice":{"type":"none"}`, 1), false},
+		{"other choice name", strings.Replace(desktopWebSearchBody, `"tool_choice":{"type":"auto"}`, `"tool_choice":{"type":"tool","name":"Bash"}`, 1), false},
+		{"no choice", strings.Replace(desktopWebSearchBody, `"tool_choice":{"type":"auto"},`, "", 1), false},
+		{"invalid json", desktopWebSearchBody[:len(desktopWebSearchBody)-1], false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := desktopSearchCall([]byte(tc.body)); got != tc.want {
+				t.Fatalf("desktopSearchCall = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDesktopWebSearchHaiku(t *testing.T) {
+	for _, sub := range []bool{false, true} {
+		t.Run(map[bool]string{false: "lead", true: "subagent"}[sub], func(t *testing.T) {
+			desktopSubagentSetup(t)
+			if err := SetDesktopTier("haiku", "fake/m2"); err != nil {
+				t.Fatal(err)
+			}
+			desktopTurn("fake/m1", []byte(`{"tools":[{"name":"Bash"}]}`), true, false)
+			if to, why := desktopMove("fake/m1", []byte(desktopWebSearchBody), true, sub); to != "fake/m2" || why != "desktop-search" {
+				t.Fatalf("WebSearch: %q by %q, want fake/m2 by desktop-search", to, why)
+			}
+		})
+	}
+}
+
+func TestDesktopWebSearchScope(t *testing.T) {
+	for _, tc := range []struct {
+		name, haiku string
+		code        bool
+	}{
+		{"unset haiku", "", true},
+		{"not Claude Code", "fake/m2", false},
+		{"same model", "fake/m1", true},
+		{"unserved haiku", "gone/m2", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			desktopSubagentSetup(t)
+			if err := SetDesktopTier("haiku", tc.haiku); err != nil {
+				t.Fatal(err)
+			}
+			desktopTurn("fake/m1", []byte(`{"tools":[{"name":"Bash"}]}`), true, false)
+			if to, why := desktopMove("fake/m1", []byte(desktopWebSearchBody), tc.code, false); to != "fake/m1" || why != "" {
+				t.Fatalf("WebSearch: %q by %q, want fake/m1 unchanged", to, why)
+			}
+		})
+	}
+}
+
+func TestDesktopWebSearchLeavesToolTurns(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"multiple tools", strings.ReplaceAll(desktopWebSearchBody, `"tools":[`, `"tools":[{"name":"Bash"},`)},
+		{"none", strings.Replace(desktopWebSearchBody, `"tool_choice":{"type":"auto"}`, `"tool_choice":{"type":"none"}`, 1)},
+		{"ordinary turn", `{"tools":[{"name":"Bash"}],"tool_choice":{"type":"auto"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			desktopSubagentSetup(t)
+			if err := SetDesktopTier("haiku", "fake/m2"); err != nil {
+				t.Fatal(err)
+			}
+			desktopTurn("fake/m1", []byte(`{"tools":[{"name":"Bash"}]}`), true, false)
+			if to, why := desktopMove("fake/m3", []byte(tc.body), true, false); to != "fake/m3" || why != "" {
+				t.Fatalf("tool turn: %q by %q, want fake/m3 unchanged", to, why)
+			}
+			if b, err := os.ReadFile(desktopPickedPath()); err != nil || strings.TrimSpace(string(b)) != "fake/m3" {
+				t.Fatalf("tool turn picked %q, want fake/m3 (%v)", b, err)
+			}
+		})
+	}
+}
+
+func TestDesktopWebSearchKeepsSessionPick(t *testing.T) {
+	desktopSubagentSetup(t)
+	if err := SetDesktopTier("haiku", "fake/m2"); err != nil {
+		t.Fatal(err)
+	}
+	desktopTurn("fake/m1", []byte(`{"tools":[{"name":"Bash"}]}`), true, false)
+	desktopPicked.Lock()
+	picked, at := desktopPicked.model, desktopPicked.at
+	desktopPicked.Unlock()
+	for _, asked := range []string{"fake/m1", "fake/m3"} {
+		if to, why := desktopMove(asked, []byte(desktopWebSearchBody), true, false); to != "fake/m2" || why != "desktop-search" {
+			t.Fatalf("WebSearch on %s: %q by %q", asked, to, why)
+		}
+		desktopPicked.Lock()
+		got, when := desktopPicked.model, desktopPicked.at
+		desktopPicked.Unlock()
+		if got != picked || !when.Equal(at) {
+			t.Fatalf("WebSearch replaced session pick %q at %v with %q at %v", picked, at, got, when)
+		}
+		if b, err := os.ReadFile(desktopPickedPath()); err != nil || strings.TrimSpace(string(b)) != picked {
+			t.Fatalf("WebSearch wrote session pick %q, want %q (%v)", b, picked, err)
+		}
+	}
+}

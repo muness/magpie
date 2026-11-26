@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>资源库 · magpie 文档</title>
+<title>资源库：所有 Agent 共用 MCP、技能、Hooks 和子代理 · magpie 文档</title>
 <meta name="description" content="magpie 资源库怎么工作：指令、MCP 服务器、技能、Hooks 和子代理写进每个 Agent 的哪里，子代理的模型怎么选。">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fafafa">
@@ -39,6 +39,54 @@
 <meta property="og:image" content="https://usemagpie.ai/img/og.png">
 <meta property="og:url" content="https://usemagpie.ai/docs/zh/library">
 <meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "TechArticle",
+   "headline": "资源库",
+   "description": "magpie 资源库怎么工作：指令、MCP 服务器、技能、Hooks 和子代理写进每个 Agent 的哪里，子代理的模型怎么选。",
+   "inLanguage": "zh-CN",
+   "url": "https://usemagpie.ai/docs/zh/library",
+   "about": {
+    "@type": "SoftwareApplication",
+    "name": "magpie",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS, Windows, Linux"
+   },
+   "publisher": {
+    "@type": "Organization",
+    "name": "magpie",
+    "url": "https://usemagpie.ai/"
+   }
+  },
+  {
+   "@type": "BreadcrumbList",
+   "itemListElement": [
+    {
+     "@type": "ListItem",
+     "position": 1,
+     "name": "magpie",
+     "item": "https://usemagpie.ai/zh/"
+    },
+    {
+     "@type": "ListItem",
+     "position": 2,
+     "name": "文档",
+     "item": "https://usemagpie.ai/docs/zh/start"
+    },
+    {
+     "@type": "ListItem",
+     "position": 3,
+     "name": "资源库",
+     "item": "https://usemagpie.ai/docs/zh/library"
+    }
+   ]
+  }
+ ]
+}
+</script>
 </head>
 <body>
 
@@ -55,6 +103,13 @@
     <a class="toc-only" href="/docs/zh/masking">本地脱敏</a>
     <a class="toc-only" href="/docs/zh/mcp-router">MCP 路由</a>
     <a class="toc-only" href="/docs/zh/library">资源库</a>
+    <a class="toc-only" href="/docs/zh/claude-code-models">Claude Code 接入其他模型</a>
+    <a class="toc-only" href="/docs/zh/codex-models">Codex 接入其他模型</a>
+    <a class="toc-only" href="/docs/zh/gemini-cli-models">Gemini CLI 接入其他模型</a>
+    <a class="toc-only" href="/docs/zh/subscriptions">订阅用于任意 Agent</a>
+    <a class="toc-only" href="/docs/zh/local-models">本地模型</a>
+    <a class="toc-only" href="/docs/zh/opencode-models">OpenCode 接入其他模型</a>
+    <a class="toc-only" href="/docs/zh/alternatives">与 CC Switch、CCR 对比</a>
     <a href="/docs/zh/import">Add to magpie</a>
     <a href="/docs/zh/integrate">接入应用</a>
     <a href="https://github.com/yetone/magpie-releases/releases">版本发布</a>
@@ -85,6 +140,7 @@
     <a href="#models">子代理的模型</a>
     <a href="#hooks">Hooks</a>
     <a href="#rtk">RTK</a>
+    <a href="#billion-context">billion-context</a>
     <a href="#touch">magpie 会改什么</a>
   </aside>
 
@@ -92,7 +148,7 @@
     <p class="eyebrow" id="overview">文档 · 资源库</p>
     <h1>资源库</h1>
     <p class="lede">magpie 的 <span class="ui">资源库</span> 把指令、MCP 服务器、技能、Hooks 和子代理放在一处，再把每一项写进你勾选的每个 Agent，用的是那个 Agent 自己的文件和格式。Agent 像平常一样读这些文件。magpie 不在 Agent 和这些内容之间加任何一层：什么时候用某个技能、某个 MCP 工具或某个子代理，由 Agent 自己决定。</p>
-    <p>页面有六个标签：<span class="ui">指令</span>、<span class="ui">MCP 服务器</span>、<span class="ui">技能</span>、<span class="ui">Hooks</span>、<span class="ui">子代理</span> 和 <span class="ui">RTK</span>。每一项下面有一排 Agent；勾上就给它，取消勾选就拿走。Agent 重启后读到改动。</p>
+    <p>页面有七个标签：<span class="ui">指令</span>、<span class="ui">MCP 服务器</span>、<span class="ui">技能</span>、<span class="ui">Hooks</span>、<span class="ui">子代理</span>、<span class="ui">RTK</span> 和 <span class="ui">billion-context</span>。每一项下面有一排 Agent；勾上就给它，取消勾选就拿走。Agent 重启后读到改动。</p>
 
     <h2 id="where"><a class="anchor" href="#where">存放位置</a></h2>
     <ul>
@@ -151,6 +207,7 @@ magpie library sync     # 重新写进各个 Agent</pre>
       <li><b>单独关掉工具。</b>Codex、Gemini CLI、Crush、Hermes Agent、Claude Code 和 OpenCode 可以逐个关掉工具，各自写进自己的设置。其他 Agent 拿到的是整个服务器。</li>
       <li><b>登录。</b>需要 OAuth 的服务器只在 magpie 里登录一次，之后 Agent 通过 magpie 网关的 <code>/mcp/&lt;name&gt;</code> 访问它。</li>
       <li><b>只在这台电脑。</b>不想同步到别处的服务器，关掉 <span class="ui">同步到其他电脑</span>（<code>magpie library mcp local &lt;name&gt; on</code>）。</li>
+      <li><b>这台电脑用另一条命令。</b>同步的服务器在这台电脑上的程序路径不同（比如 Mac 和 WSL），点命令下方的 <span class="ui">在这台电脑上用另一条命令</span>。名称、Agent 和备注照常同步，其他电脑仍运行它们自己的命令（<code>magpie library mcp here &lt;name&gt; &lt;命令…&gt;</code>）。</li>
     </ul>
     <p>打开 <a href="/docs/zh/mcp-router">MCP 路由</a> 后，每个 Agent 只拿到一个名为 <code>magpie</code> 的服务器来代替这些条目，命令型服务器由 magpie 为所有 Agent 只运行一份。它默认关闭。</p>
 
@@ -228,13 +285,20 @@ magpie library sync     # 重新写进各个 Agent</pre>
     <h2 id="rtk"><a class="anchor" href="#rtk">RTK</a></h2>
     <p>RTK 标签可以按 Agent 打开 <a href="https://www.rtk-ai.app/">RTK</a>：Agent 的 shell 命令经过 RTK 运行，输出被压短以节省 token。magpie 可以帮你安装 RTK；RTK 卸掉后也能关闭。</p>
 
+    <h2 id="billion-context"><a class="anchor" href="#billion-context">billion-context</a></h2>
+    <p>billion-context 标签可以按 Agent 打开 <a href="https://github.com/ranxianglei/billion-context">billion-context</a> 的插件：它把长会话里较早的对话折叠成模型可以再展开的摘要，让会话始终留在模型的上下文窗口内。支持 Pi、omp、OpenCode、Claude Code、Hermes、DeepSeek Harness 和 Zed，打开后它们的请求仍经过 magpie。magpie 可以帮你安装（<code>npm install -g billion-context --prefix=~/.local</code>），并运行它自己的安装和卸载命令；关闭时会把安装改动过的 Agent 设置恢复原样。在这里打开的 Agent 不能再同时使用 billion-context-pi 或 opencode-acp。</p>
+    <p>对 Claude Code，billion-context 的安装会关掉 Claude Code 自带的自动压缩。magpie 会把它重新打开，这样 billion-context 没有折叠的会话（比如 Claude 桌面版 Code 标签里的会话）会自动压缩，而不是停在 “Prompt is too long”。你自己设置的 <code>DISABLE_AUTO_COMPACT</code> 保持不变。</p>
+    <p>Zed 没有 billion-context 插件；Hermes 和 DeepSeek Harness 的插件只接管 HTTPS 流量，而 magpie 的本机地址不是 HTTPS。打开后，magpie 会运行 <code>bili start</code>，并把 Agent 里 magpie 提供方的地址改成 <code>http://127.0.0.1:8787/bili/</code> 加上 magpie 的地址，这是 billion-context 为任意客户端给出的接法；Hermes 和 DeepSeek Harness 的每个配置了 magpie 提供方的 profile 都会改。请先在 Agents 页给这个 Agent 选一个 magpie 的模型；打开或关闭后重启它。</p>
+    <p>卡片会显示 billion-context 节省了多少 token，用的是它自己的统计：它的面板上的净节省，已扣除折叠后的重建和摘要的开销，并附上折叠次数和会话数，覆盖这台电脑上它运行过的所有会话。magpie 向正在运行的 billion-context 读取这些数字（<code>/__bili/overview</code>）；它没在运行时，卡片显示上次读到的数字和时间。billion-context 为 Agent 运行过之前，这里不显示数字。</p>
+
     <h2 id="touch"><a class="anchor" href="#touch">magpie 会改什么</a></h2>
     <ul>
       <li>只改它自己写的：标记之间的文字、它记录过的条目、它标记为自己的文件。</li>
       <li>从不碰你自己的同名文件、条目或技能。页面会显示冲突，让你选择。</li>
       <li>被替换的内容都会先进备份。</li>
     </ul>
-    <p>项目也可以拿到技能和 MCP 服务器，放在项目自己的目录里（比如 <code>.claude/skills</code>、<code>.agents/skills</code>、<code>.mcp.json</code> 或 <code>.codex/config.toml</code>）。</p>
+    <p>项目也可以拿到技能和 MCP 服务器，放在项目自己的目录里（比如 <code>.claude/skills</code>、<code>.agents/skills</code>、<code>.mcp.json</code> 或 <code>.codex/config.toml</code>）。在终端里，<code>magpie library project add .</code> 添加当前目录，<code>magpie library project skill add . pdf docx</code> 给它技能，<code>magpie library project skill rm . pdf</code> 拿走一个，<code>magpie library project skills .</code> 列出它的技能。<code>magpie library project plugin on . superpowers</code> 只为这个目录打开 Claude Code 装好的插件（或库里的插件），<code>magpie library project plugin off . superpowers</code> 再关掉，<code>magpie library project plugin .</code> 列出哪些已打开。想在终端里把插件放进库里（和「查找插件」再「安装」一样），运行 <code>magpie library plugin import ./my-plugin</code>，后面跟一个目录（Claude 插件、Pi 包或 marketplace）、<code>owner/repo</code> 或 git 地址；加 <code>agents=none</code> 则只留给项目用，<code>magpie library plugin</code> 列出库里已有的插件。</p>
+    <p>项目也可以有自己的指令，这样全局指令只留下处处适用的规则。在指令页，展开共享指令下面的项目，写下只有它需要的内容。magpie 会把它写进每个智能体在该项目里读取的文件，放在两行标记之间：Claude Code 是 <code>CLAUDE.md</code>，Codex、Cursor 和多数智能体是 <code>AGENTS.md</code>，Gemini CLI 是 <code>GEMINI.md</code>。文件其余内容仍归你。magpie 新建的文件不会进入 git，关掉某个智能体时它那一段会被拿掉。在终端里：<code>magpie library project instructions . text "这里用 pnpm。"</code>，以及 <code>… agents claude,codex</code> 或 <code>… agents none</code>。</p>
   </article>
 </main>
 
@@ -251,6 +315,13 @@ magpie library sync     # 重新写进各个 Agent</pre>
     <a href="/docs/zh/masking">本地脱敏</a>
     <a href="/docs/zh/mcp-router">MCP 路由</a>
     <a href="/docs/zh/library">资源库</a>
+    <a href="/docs/zh/claude-code-models">Claude Code 接入其他模型</a>
+    <a href="/docs/zh/codex-models">Codex 接入其他模型</a>
+    <a href="/docs/zh/gemini-cli-models">Gemini CLI 接入其他模型</a>
+    <a href="/docs/zh/subscriptions">订阅用于任意 Agent</a>
+    <a href="/docs/zh/local-models">本地模型</a>
+    <a href="/docs/zh/opencode-models">OpenCode 接入其他模型</a>
+    <a href="/docs/zh/alternatives">与 CC Switch、CCR 对比</a>
     <a href="/docs/zh/import">Add to magpie</a>
     <a href="/docs/zh/integrate">接入应用</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>

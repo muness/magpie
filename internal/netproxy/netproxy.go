@@ -4,14 +4,17 @@
 // that is only reachable through a proxy hangs until the agent gives up.
 //
 // In order: the proxy set in magpie's settings (or "direct" for none), the
-// usual *_PROXY variables, then the system's proxy (macOS network
-// settings, Windows Internet Options). Loopback is never proxied, nor,
-// unless a provider has a proxy of its own, a host on the user's own
-// network (lan.go).
+// usual *_PROXY variables, the system's proxy (macOS network settings,
+// Windows Internet Options, a Linux desktop's GNOME gsettings or KDE
+// kioslaverc), then the login shell's *_PROXY (shell.go). Loopback is
+// never proxied, nor, unless a provider has a proxy of its own, a host on
+// the user's own network (lan.go).
 package netproxy
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -27,7 +30,7 @@ import (
 // Install routes http.DefaultTransport (and so http.DefaultClient) through
 // Func, and http.DefaultClient's requests made on a provider's behalf
 // (With) through a transport of that provider's proxy (Dispatch). Its
-// HTTP/2 connections are checked as the gateway's are (HTTP2Health), and
+// HTTP/2 connections are checked by Go's own pings (HTTP2Health), and
 // the requests magpie sends on its own are written down (probelog).
 func Install() {
 	if t, ok := http.DefaultTransport.(*http.Transport); ok {
@@ -61,7 +64,10 @@ var PingAfter, PingWait = 10 * time.Second, 10 * time.Second
 // (#2843). A ping finds it, and the requests on it fail, so a group moves
 // on and the next request dials anew. A live vendor answers a ping
 // whatever its streams are doing, so a long wait for a first byte is
-// never cut by it.
+// never cut by it. But a ping's answer restarts the clock, so a wait of
+// minutes is pinged every PingAfter, which Google's front end ends the
+// connection for: the gateway's transports ping by CalmHTTP2 instead, and
+// this is for http.DefaultTransport's short requests.
 func HTTP2Health() *http.HTTP2Config {
 	return &http.HTTP2Config{SendPingTimeout: PingAfter, PingTimeout: PingWait}
 }
@@ -119,17 +125,45 @@ func Held(ctx context.Context) error {
 // "direct", #1522) goes through its own provider's proxy, never the one
 // it was made under. A provider's leave not to check its certificate
 // (WithUncheckedTLS) goes the same way: it is the outer provider's, and
-// dropped here.
+// dropped here, and so is its ask for HTTP/1.1 (WithHTTP1), its own
+// TLS identity (WithClientCert) and its host rules (WithResolve).
 func With(ctx context.Context, choice string) context.Context {
-	if choice = strings.TrimSpace(choice); choice == "" && choiceOf(ctx) == "" && uncheckedOf(ctx) == nil {
+	if choice = strings.TrimSpace(choice); choice == "" && choiceOf(ctx) == "" && uncheckedOf(ctx) == nil && http1Of(ctx) == nil && clientCertOf(ctx) == nil && resolveOf(ctx) == nil {
 		return ctx
 	}
 	ctx = context.WithValue(ctx, choiceKey{}, choice)
+	if clientCertOf(ctx) != nil {
+		ctx = context.WithValue(ctx, clientCertKey{}, (*clientCert)(nil))
+	}
 	if uncheckedOf(ctx) != nil {
 		ctx = context.WithValue(ctx, uncheckedKey{}, map[string]bool(nil))
 	}
+	if http1Of(ctx) != nil {
+		ctx = context.WithValue(ctx, http1Key{}, map[string]bool(nil))
+	}
+	if resolveOf(ctx) != nil {
+		ctx = context.WithValue(ctx, resolveKey{}, map[string][]string(nil))
+	}
 	return ctx
 }
+
+// Downloads is ctx for magpie's downloads of plugins — the plugins list,
+// npm's registry, GitHub, the plugins repo's dist branch, Bun itself —
+// which go through the proxy Settings sets for them (PluginProxy) when it
+// names one (JonahFu on X: GitHub reached only through a proxy, the
+// vendors without). Its "" leaves ctx as it is, so they follow the
+// global proxy as every other request does.
+func Downloads(ctx context.Context) context.Context {
+	if c := strings.TrimSpace(settings.Shared().PluginProxy); c != "" {
+		return With(ctx, c)
+	}
+	return ctx
+}
+
+// EnvDownloads is Env for a program magpie starts to download plugins
+// (bun add and update, git): plugin downloads' proxy (Downloads), or,
+// when that names none, Env's.
+func EnvDownloads(env []string) []string { return EnvWith(settings.Shared().PluginProxy, env) }
 
 // Choice is the proxy ctx names (With), "" when it names none — for a CLI
 // run on a provider's behalf, whose *_PROXY is set from it (EnvWith).
@@ -141,6 +175,19 @@ func choiceOf(ctx context.Context) string {
 	}
 	c, _ := ctx.Value(choiceKey{}).(string)
 	return c
+}
+
+// Resolve is a proxy choice as the proxy it stands for: a saved proxy
+// (settings.NamedProxy, "@id") as its address with its login, any other
+// choice as it is. A reference to a proxy that isn't there is kept as it
+// is, and Parse refuses it: a request meant for a proxy never goes
+// direct for want of one.
+func Resolve(choice string) string {
+	choice = strings.TrimSpace(choice)
+	if a, ok := settings.ResolveProxy(choice); ok {
+		return a
+	}
+	return choice
 }
 
 // forChoice is the proxy a provider's own choice names; nil for "direct".
@@ -157,6 +204,13 @@ func forChoice(c string) (*url.URL, error) {
 // its transport.
 var HTTP1 func(u *url.URL) bool
 
+// Elsewhere sends a request that Go's own TLS can't carry another way,
+// before a transport of Dispatch's dials it: ok false leaves the request
+// to the transport. internal/provider sets it for OpenCode Zen's free
+// tier, which answers a client that isn't Bun's 429 (zen_bun.go); nil
+// leaves every request to its transport.
+var Elsewhere func(req *http.Request) (res *http.Response, ok bool, err error)
+
 // Dispatch is a RoundTripper sending a request through base, unless its
 // context names a provider's own proxy (With): then through a clone of
 // base kept for that proxy alone. Connections are so reused among the
@@ -165,12 +219,18 @@ var HTTP1 func(u *url.URL) bool
 // through, among them. A move of the global proxy (the settings) drops
 // the idle connections the old one dialled, which a transport, pooling
 // by target host alone, would have carried over the switch (#4523). A
-// request HTTP1 names goes through a clone kept for HTTP/1.1
-// (http1Only), and one to a host whose certificate the provider's user
+// request HTTP1 names, one to a host its provider asked HTTP/1.1 of
+// (WithHTTP1), every request under OverHTTP1 (a download trying again
+// after its HTTP/2 transfer broke off), and one to a host whose HTTP/2
+// connection carried a TLS record that didn't decrypt (recordError, for h2Broken after) go
+// through a clone kept for HTTP/1.1 (http1Only), and one to a host whose certificate the provider's user
 // said not to check (WithUncheckedTLS) through a clone kept for that
-// host alone (uncheckTLS). A host whose IPv6 is taken but goes nowhere
-// is dialed over IPv4 (v4Fallback).
+// host alone (uncheckTLS), and one made with a provider's own TLS
+// identity (WithClientCert) through a clone kept for it (clientTLS). A host whose IPv6 is taken but goes nowhere
+// is dialed over IPv4 (v4Fallback), and one on the user's own network
+// is given lanDial to connect (lanDialCap).
 func Dispatch(base *http.Transport) http.RoundTripper {
+	lanDialCap(base)
 	v4Fallback(base)
 	return &dispatch{base: base, own: map[route]*http.Transport{}, moved: Watch()}
 }
@@ -191,18 +251,57 @@ type dispatch struct {
 type route struct {
 	choice    string
 	h1        bool
+	whole     bool // wholeRecords
 	unchecked string
+	client    string // clientRoute
+	resolve   string // resolveRoute
 }
 
 func (d *dispatch) RoundTrip(req *http.Request) (*http.Response, error) {
+	if f := Elsewhere; f != nil {
+		if res, ok, err := f(req); ok {
+			return res, err
+		}
+	}
+	if res, ok, err := failingOver(req, d.send); ok {
+		return res, err
+	}
+	return d.send(req)
+}
+
+// send is RoundTrip at one address.
+func (d *dispatch) send(req *http.Request) (*http.Response, error) {
 	if d.moved() {
 		d.CloseIdleConnections()
 	}
-	r := route{choice: choiceOf(req.Context()), h1: HTTP1 != nil && HTTP1(req.URL), unchecked: uncheckedHost(req)}
-	if r == (route{}) {
-		return v4Retry(d.base, req)
+	broken := h2BrokenFor(req)
+	r := route{choice: Resolve(choiceOf(req.Context())), h1: HTTP1 != nil && HTTP1(req.URL) || http1Asked(req) || overHTTP1(req.Context()) || broken, whole: broken, unchecked: uncheckedHost(req), client: clientRoute(req), resolve: resolveRoute(req)}
+	t := d.base
+	if r != (route{}) {
+		t = d.transport(r)
 	}
-	return v4Retry(d.transport(r), req)
+	if r.resolve != "" {
+		// a rule is for a connection made direct: through a proxy, the
+		// proxy connects to the name itself
+		if u, err := proxyOf(t, req); err == nil && u == nil {
+			req = req.WithContext(context.WithValue(req.Context(), directKey{}, true))
+		}
+	}
+	res, err := v4Retry(t, req)
+	if err != nil {
+		if recordError(err) {
+			// over HTTP/1.1 too: the tries after it go in whole records
+			markH2Broken(req)
+		}
+		return res, err
+	}
+	if r.h1 {
+		return res, err
+	}
+	if res.ProtoMajor == 2 && res.Body != nil && res.Body != http.NoBody {
+		res.Body = h2Watch{ReadCloser: res.Body, req: req}
+	}
+	return res, err
 }
 
 // Watch is a check a transport of its own makes before each request: it
@@ -223,7 +322,7 @@ func Watch() func() bool {
 	var seen bool
 	return func() bool {
 		// Shared, not Load: this runs on every request
-		now := strings.TrimSpace(settings.Shared().Proxy)
+		now := Resolve(settings.Shared().Proxy)
 		mu.Lock()
 		defer mu.Unlock()
 		moved := seen && proxy != now
@@ -259,8 +358,25 @@ func (d *dispatch) transport(r route) *http.Transport {
 	if r.h1 {
 		http1Only(t)
 	}
+	if r.whole {
+		wholeRecords(t)
+	}
 	if r.unchecked != "" {
 		uncheckTLS(t)
+	}
+	if r.client != "" {
+		clientTLS(t, r.client)
+	}
+	if r.resolve != "" {
+		resolveTLS(t, r.resolve)
+	}
+	if isCalm(d.base) {
+		// a clone shares base's HTTP/2 connections, dialled through
+		// base's proxy, until it is given its own
+		t.TLSNextProto = nil
+		if !r.h1 {
+			CalmHTTP2(t)
+		}
 	}
 	d.own[r] = t
 	return t
@@ -279,6 +395,26 @@ func http1Only(t *http.Transport) {
 	}
 }
 
+// wholeRecords has t, a clone, write a request in TLS records as large as
+// TLS allows, as OpenSSL does (curl, Python): Go starts each connection
+// on records of about one TCP segment and grows them a segment a record
+// for its first 128KB (DynamicRecordSizingDisabled), and net/http hands
+// TLS a request's head and first bytes 4KB at a time (WriteBufferSize),
+// so a 70KB body went out as a dozen or more small records, each its own
+// write. Behind a fake-IP proxy whose path mangled
+// Go's requests ("tls: bad record MAC", over HTTP/1.1 too) while curl and
+// Python's were answered every time (#7567, k0ngk0ng), the requests to a
+// host after a record error (h2Broken) go out in the shape that got
+// through: a 64KB buffer, written as 16KB records. Nothing else of the
+// connection changes: its hello, its ciphers, its protocol.
+func wholeRecords(t *http.Transport) {
+	if t.TLSClientConfig == nil {
+		t.TLSClientConfig = &tls.Config{}
+	}
+	t.TLSClientConfig.DynamicRecordSizingDisabled = true
+	t.WriteBufferSize = 64 << 10
+}
+
 // CloseIdleConnections closes base's and every proxy's own.
 func (d *dispatch) CloseIdleConnections() {
 	d.base.CloseIdleConnections()
@@ -291,7 +427,7 @@ func (d *dispatch) CloseIdleConnections() {
 
 // For is the proxy a request to u goes through; nil means direct.
 func For(u *url.URL) (*url.URL, error) {
-	switch s := strings.TrimSpace(settings.Load().Proxy); s {
+	switch s := strings.TrimSpace(settings.Shared().Proxy); s {
 	case "direct":
 		return nil, nil
 	case "":
@@ -301,8 +437,11 @@ func For(u *url.URL) (*url.URL, error) {
 	if p, err := fromEnv(u); p != nil || err != nil {
 		return p, err
 	}
-	sys := System()
-	if sys.URL == "" || bypassed(u.Hostname(), sys.Bypass) {
+	sys, _ := liveSystem()
+	if sys.URL == "" {
+		return fromShell(u), nil
+	}
+	if bypassed(u.Hostname(), sys.Bypass) {
 		return nil, nil
 	}
 	return Parse(sys.URL)
@@ -328,7 +467,13 @@ func EnvWith(choice string, env []string) []string {
 	var bypass []string
 	s := strings.TrimSpace(choice)
 	if s == "" {
-		s = strings.TrimSpace(settings.Load().Proxy)
+		s = strings.TrimSpace(settings.Shared().Proxy)
+	}
+	if settings.IsProxyRef(s) {
+		// a saved proxy that is gone: the CLI goes nowhere, not direct
+		if _, ok := settings.ResolveProxy(s); !ok {
+			return withProxy(env, DeadProxy, nil)
+		}
 	}
 	switch s {
 	case "direct":
@@ -340,11 +485,13 @@ func EnvWith(choice string, env []string) []string {
 				return env
 			}
 		}
-		sys := System()
-		if sys.URL == "" {
-			return env
-		}
+		sys, _ := liveSystem()
 		p, bypass = sys.URL, sys.Bypass
+		if p == "" {
+			if p, bypass = shellProxy(); p == "" {
+				return env
+			}
+		}
 	default:
 		u, err := Parse(s)
 		if err != nil {
@@ -388,9 +535,23 @@ func withProxy(env []string, p string, bypass []string) []string {
 		"ALL_PROXY="+p, "all_proxy="+p, "NO_PROXY="+nos, "no_proxy="+nos)
 }
 
-// Parse reads a proxy address; a bare host:port is an HTTP proxy.
+// DeadProxy is where a CLI is sent for a saved proxy that is gone: a port
+// nothing listens on, so its requests fail where a missing proxy would
+// have sent them straight out.
+const DeadProxy = "http://127.0.0.1:9"
+
+// Parse reads a proxy address; a bare host:port is an HTTP proxy. A saved
+// proxy ("@id") is read as the address it stands for, its login in it;
+// one that is gone is an error.
 func Parse(s string) (*url.URL, error) {
 	s = strings.TrimSpace(s)
+	if settings.IsProxyRef(s) {
+		a, ok := settings.ResolveProxy(s)
+		if !ok {
+			return nil, fmt.Errorf("the saved proxy %q isn't on this computer (deleted, or never synced here); pick another in Settings", settings.ProxyLabel(settings.ProxyID(s)))
+		}
+		s = a
+	}
 	if !strings.Contains(s, "://") {
 		s = "http://" + s
 	}
@@ -400,7 +561,7 @@ func Parse(s string) (*url.URL, error) {
 // Describe says, for the settings page, what a request to u would use.
 func Describe() (proxy, source string) {
 	defer func() { proxy = Redact(proxy) }()
-	switch s := strings.TrimSpace(settings.Load().Proxy); s {
+	switch s := strings.TrimSpace(settings.Shared().Proxy); s {
 	case "direct":
 		return "", "off"
 	case "":
@@ -411,8 +572,17 @@ func Describe() (proxy, source string) {
 	if p, _ := fromEnv(u); p != nil {
 		return p.String(), "environment"
 	}
-	if sys := System(); sys.URL != "" {
+	sys, dead := liveSystem()
+	if sys.URL != "" {
 		return sys.URL, "system"
+	}
+	if p := fromShell(u); p != nil {
+		return p.String(), "environment"
+	}
+	if dead != "" {
+		// the system's proxy is set, but nothing listens on its port:
+		// requests go direct until something does (liveSystem)
+		return dead, "down"
 	}
 	return "", "none"
 }
@@ -428,6 +598,14 @@ func Redact(raw string) string {
 	if err != nil {
 		return ""
 	}
+	if settings.IsProxyRef(raw) {
+		if a := sshShown(raw); a != "" {
+			return a
+		}
+		// a saved proxy shown as its address, with no login
+		u.User = nil
+		return u.String()
+	}
 	if u.User == nil {
 		return raw
 	}
@@ -437,6 +615,18 @@ func Redact(raw string) string {
 		address = strings.TrimPrefix(address, "http://")
 	}
 	return address
+}
+
+// sshShown is how a saved SSH proxy (a reference) is shown: its server's
+// address, not the tunnel's on loopback; "" for any other proxy.
+func sshShown(ref string) string {
+	id := settings.ProxyID(ref)
+	for _, p := range settings.Shared().Proxies {
+		if p.ID == id && p.IsSSH() {
+			return strings.TrimSpace(p.URL)
+		}
+	}
+	return ""
 }
 
 // fromEnv is the proxy the environment names for u: HTTPS_PROXY or
@@ -563,6 +753,29 @@ func System() Proxy {
 	return sysCache.p
 }
 
+// liveSystem is System as Auto takes it, for magpie's own requests and
+// the CLIs and plugin hosts it starts: a system proxy on this computer's
+// loopback that nothing listens on is none, and dead is its address. A
+// VPN or proxy app that quits without clearing Windows' Internet Options
+// (or the system's on macOS and Linux) leaves 127.0.0.1:port there, and
+// every request failed with "proxy not reachable", a restart of magpie
+// too, until the user set the proxy Off (@bitssly on X). The login
+// shell's proxy is taken so already (shell.go). The environment's
+// *_PROXY, set for this process by whoever started it, and a proxy set
+// in magpie are never taken around: a dead one fails, so it shows. A
+// port is looked at again within 2 seconds while down (listening), so
+// the proxy app coming back is followed at once.
+func liveSystem() (p Proxy, dead string) {
+	p = System()
+	if p.URL == "" {
+		return p, ""
+	}
+	if u, err := Parse(p.URL); err == nil && u.Hostname() != "" && !listening(u) {
+		return Proxy{}, p.URL
+	}
+	return p, ""
+}
+
 // refreshSystem reads the system proxy into sysCache, then closes done.
 // A read that fails keeps what was read before, if anything was.
 func refreshSystem(done chan struct{}) {
@@ -606,4 +819,12 @@ func bypassed(host string, list []string) bool {
 		}
 	}
 	return false
+}
+
+// proxyOf is the proxy t sends req through, nil for none.
+func proxyOf(t *http.Transport, req *http.Request) (*url.URL, error) {
+	if t.Proxy == nil {
+		return nil, nil
+	}
+	return t.Proxy(req)
 }

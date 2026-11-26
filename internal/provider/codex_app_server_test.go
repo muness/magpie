@@ -49,13 +49,15 @@ func stubCodexApp(t *testing.T) *codexAppStub {
 		codexApp.ended, codexApp.backBy, codexApp.spent, codexApp.why = nil, time.Time{}, false, ""
 		codexApp.back, codexApp.backAt = nil, time.Time{}
 		codexApp.crashSince, codexApp.crashBy, codexApp.snag, codexApp.snagPids = time.Time{}, time.Time{}, false, nil
+		codexApp.crashSpent, codexApp.desk = false, time.Time{}
 		codexApp.Unlock()
 	}
-	oldCrashed, oldRelaunch := CodexAppCrashed, CodexAppRelaunch
+	oldCrashed, oldRelaunch, oldOff := CodexAppCrashed, CodexAppRelaunch, CodexTakeoverOff
+	CodexTakeoverOff = nil
 	t.Cleanup(func() {
 		CodexAppRoute, codexAppServersOn, endCodexAppServer, codexTurnRunning = oldOn, oldList, oldEnd, oldTurn
 		CodexAppOpen, CodexAppReopen, codexSessionsQuiet, codexRestartsApp = oldOpen, oldReopen, oldQuiet, oldRestarts
-		CodexAppCrashed, CodexAppRelaunch = oldCrashed, oldRelaunch
+		CodexAppCrashed, CodexAppRelaunch, CodexTakeoverOff = oldCrashed, oldRelaunch, oldOff
 		reset()
 	})
 	// the app's logs as tests find them: no error page, and never reopened
@@ -1059,6 +1061,49 @@ func TestCodexHandSwitchOffAHeldAccountIsSpent(t *testing.T) {
 	}
 }
 
+// Codex keeps a session's file open while its app-server runs the
+// thread, and Windows stamps a file in its folder listing only as it is
+// closed. Read by the listing's time, a turn running in a thread opened
+// more than codexTurnWindow before counted as none, and the sessions as
+// quiet, so magpie ended the app-server under the turn (bitssly on X).
+// The file is held open here as Codex holds it, its stamp set back and
+// written to after, which on Windows leaves the listing on the old stamp
+// (red there on a listing's time).
+func TestCodexSessionHeldOpenReadAtItsOwnTime(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, "sessions", "2026", "11", "06")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "rollout-2026-11-06T09-00-00-held.jsonl")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	started := `{"type":"event_msg","payload":{"type":"task_started","turn_id":"1"}}` + "\n"
+	done := `{"type":"event_msg","payload":{"type":"task_complete","turn_id":"1"}}` + "\n"
+	if _, err := f.WriteString(started + done); err != nil {
+		t.Fatal(err)
+	}
+	opened := time.Now().Add(-codexTurnWindow - time.Hour)
+	if err := os.Chtimes(p, opened, opened); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(started); err != nil {
+		t.Fatal(err)
+	}
+	// quiet first: reading the file, as codexTurnOpen does, closes a
+	// handle on it, and Windows brings the listing up to date then
+	now := time.Now()
+	if codexSessionsQuietFor(home, now, time.Minute) {
+		t.Fatal("a session Codex wrote to just now, held open: quiet")
+	}
+	if !codexTurnOpen(home, now, time.Time{}) {
+		t.Fatal("a turn running in a file Codex holds open: not open")
+	}
+}
+
 // codexSessionsQuietFor reads the sessions' write times: a file written
 // within d is not quiet, an older one or none is, and a sessions folder
 // that can't be read is not.
@@ -1134,21 +1179,30 @@ func TestCodexAppLeftRunningForMagpiesOwnChanges(t *testing.T) {
 	s.on = false
 	none("magpie gave Codex back its account at the reset")
 
-	// a switch the user made, alone or after one of magpie's
+	// a switch the user made among accounts with room, alone or beside
+	// one of magpie's: the app's projects are kept per ChatGPT identity,
+	// and a restart onto the new one hid them (Michael25651150 on X)
 	codexAppSwitched(false, true)
 	codexAppAccountSwitched()
-	ends("switched by the user after magpie", 101)
+	none("switched by the user after magpie")
 	codexAppAccountSwitched()
 	codexAppSwitched(false, true)
-	ends("switched by the user, then magpie", 102)
+	none("switched by the user, then magpie")
+	codexAppAccountSwitched()
+	none("switched by the user")
+	// one off a used-up account: the app greys Send till it restarts
+	codexAppSpentSwitch()
+	ends("switched by the user off a used-up account", 101)
 	// a Connect: where Codex's config sends it changed, not by the takeover
 	s.route = "connected"
-	ends("connected", 103)
+	ends("connected", 102)
 
-	// ticked: magpie's changes the app works without restart it as well
+	// ticked: the changes the app works without restart it as well
 	restarts = true
 	codexAppSwitched(false, true)
-	ends("RestartApp on, magpie switched back", 104)
+	ends("RestartApp on, magpie switched back", 103)
+	codexAppAccountSwitched()
+	ends("RestartApp on, switched by the user", 104)
 	s.on = true
 	ends("RestartApp on, magpie took over", 105)
 	s.on = false
@@ -1244,4 +1298,190 @@ func TestCodexAppBackSaidTillItRestarts(t *testing.T) {
 	if !CodexAppBack() {
 		t.Fatal("a failed listing read as the app-server gone")
 	}
+}
+
+// The takeover turned off by the user (the takeover note's Keep on
+// ChatGPT, the sign-in's Always ChatGPT, a Disconnect) restarts the Codex
+// app's app-server with Restart the Codex app to follow off too, once no
+// Codex turn runs: the one the takeover started shows no account, so the
+// app's ChatGPT projects and chats stayed gone after the user turned it
+// off to have them back (Herzz____ on X, the Windows app). The reset,
+// magpie's own end of it, still leaves the app running and says so
+// (CodexAppBack). Whether it was turned off is asked only as the takeover
+// ends, not at every look.
+func TestCodexAppRestartedWhenTheTakeoverIsTurnedOff(t *testing.T) {
+	signIn(t)
+	s := stubCodexApp(t)
+	codexRestartsApp = func() bool { return false }
+	off, asked := false, 0
+	CodexTakeoverOff = func() bool { asked++; return off }
+	now := time.Now()
+	idle := func() (int, time.Time) { return 0, now.Add(-time.Minute) }
+	step := func(busy func() (int, time.Time)) []int { return codexAppStep(context.Background(), now, busy) }
+
+	s.running = []int{60}
+	for range 3 {
+		if got := step(idle); got != nil {
+			t.Fatalf("on its account: ended %v", got)
+		}
+	}
+	s.on = true
+	if got := step(idle); !slices.Equal(got, []int{60}) {
+		t.Fatalf("the takeover: ended %v, want [60]", got)
+	}
+	step(idle)
+	if asked != 0 {
+		t.Fatalf("asked whether the takeover is off %d times while it ran", asked)
+	}
+
+	// Keep on ChatGPT, with a Codex request in flight: held till it ends
+	off, s.on = true, false
+	if got := step(func() (int, time.Time) { return 1, now.Add(-time.Minute) }); got != nil {
+		t.Fatalf("a Codex request in flight: ended %v", got)
+	}
+	if got := step(idle); !slices.Equal(got, []int{100}) {
+		t.Fatalf("the takeover turned off by hand: ended %v, want [100]", got)
+	}
+	if CodexAppBack() {
+		t.Fatal("restarted, and still said to be left on the takeover")
+	}
+	if asked != 1 {
+		t.Fatalf("asked %d times, want once as the takeover ended", asked)
+	}
+	for range 3 {
+		if got := step(idle); got != nil {
+			t.Fatalf("after: ended %v", got)
+		}
+	}
+	if asked != 1 {
+		t.Fatalf("asked %d times after the takeover ended, want once in all", asked)
+	}
+
+	// taken over again, and ended by the reset: left running, and said
+	off = false
+	s.on = true
+	if got := step(idle); !slices.Equal(got, []int{101}) {
+		t.Fatalf("the takeover again: ended %v, want [101]", got)
+	}
+	s.on = false
+	if got := step(idle); got != nil {
+		t.Fatalf("the reset with Restart off: ended %v", got)
+	}
+	if !CodexAppBack() {
+		t.Fatal("the app left on the takeover's app-server at the reset isn't said")
+	}
+}
+
+// The chat open in the Codex app is moved to the provider Codex is on by
+// CodexBeforeAppEnd, and that happens before the app-server is ended, since
+// the next app-server resumes the chat at once.
+func TestCodexRouteChangeMovesOpenChatsFirst(t *testing.T) {
+	signIn(t)
+	s := stubCodexApp(t)
+	now := time.Now()
+	idle := func() (int, time.Time) { return 0, now.Add(-time.Minute) }
+	step := func() []int { return codexAppStep(context.Background(), now, idle) }
+	var order []string
+	old := CodexBeforeAppEnd
+	CodexBeforeAppEnd = func(string) { order = append(order, "move") }
+	t.Cleanup(func() { CodexBeforeAppEnd = old })
+	oldEnd := endCodexAppServer
+	endCodexAppServer = func(int) error { order = append(order, "end"); return nil }
+	t.Cleanup(func() { endCodexAppServer = oldEnd })
+
+	s.running = []int{60}
+	s.route = "openai_base_url=http://127.0.0.1:3425/backend-api/codex"
+	step()
+	s.route = "openai_base_url="
+	if got := step(); !slices.Equal(got, []int{60}) {
+		t.Fatalf("ended %v, want [60]", got)
+	}
+	if !slices.Equal(order, []string{"move", "end"}) {
+		t.Fatalf("order %v, want the chats moved before the app-server ends", order)
+	}
+}
+
+// not_4O4 on X: magpie's models never reached the Windows app's picker,
+// in a new window or a new project on D: either. The app-server reads
+// model_catalog_json only as it starts, and the app keeps one for all its
+// windows, running from login: an app-server that started before magpie
+// named its list (CodexAppDesk) is restarted for it, once for each naming,
+// as for a Connect, RestartApp off too. One that started after, or whose
+// start can't be read, is left; and so is the takeover's, where the list
+// is named again as the reset ends it (#4550).
+func TestCodexAppRestartedForTheListNamed(t *testing.T) {
+	signIn(t)
+	s := stubCodexApp(t)
+	codexRestartsApp = func() bool { return false }
+	oldDesk, oldStart := CodexAppDesk, codexServerStart
+	t.Cleanup(func() { CodexAppDesk, codexServerStart = oldDesk, oldStart })
+	var desk time.Time
+	CodexAppDesk = func() time.Time { return desk }
+	starts := map[int]time.Time{}
+	codexServerStart = func(pid int) (time.Time, error) {
+		if at, ok := starts[pid]; ok {
+			return at, nil
+		}
+		return time.Time{}, errors.New("unknown")
+	}
+	now := time.Now()
+	idle := func() (int, time.Time) { return 0, now.Add(-time.Minute) }
+	step := func() []int { return codexAppStep(context.Background(), now, idle) }
+	none := func(what string) {
+		t.Helper()
+		for range 2 {
+			if got := step(); got != nil {
+				t.Fatalf("%s: ended %v", what, got)
+			}
+		}
+	}
+	ends := func(what string, want int) {
+		t.Helper()
+		if got := step(); !slices.Equal(got, []int{want}) {
+			t.Fatalf("%s: ended %v, want [%d]", what, got, want)
+		}
+		none("after " + what)
+	}
+	tick := now.Add(-time.Hour)
+	later := func() time.Time { tick = tick.Add(time.Minute); return tick }
+
+	s.running = []int{60}
+	starts[60] = later()
+	none("no list named")
+	desk = later()
+	starts[100] = later()
+	ends("the list named after the app-server started", 60)
+	// named again (a Disconnect and a Connect): the app-server from
+	// before that naming lists the old way
+	desk = later()
+	starts[101] = later()
+	ends("named again", 100)
+	// one that started after the naming read it
+	desk = starts[101].Add(-time.Second)
+	none("named before the app-server started")
+	// a start that can't be read is left
+	desk = later()
+	delete(starts, 101)
+	none("start unknown")
+	starts[101] = tick.Add(-time.Second)
+
+	// the takeover: magpie Codex's provider, its own list named and the
+	// app's taken out; the reset ends it and names the app's again, in the
+	// same look or a later one, and the app is left on the takeover's
+	// app-server till the user restarts it (#4550)
+	desk = time.Time{}
+	s.on = true
+	starts[102] = later()
+	ends("magpie took over", 101)
+	s.on = false
+	desk = later()
+	none("the reset ended the takeover and named the list in one look")
+	s.on = true
+	desk = time.Time{}
+	starts[103] = later()
+	ends("magpie took over again", 102)
+	s.on = false
+	none("the reset ended the takeover")
+	desk = later()
+	none("the list named a look after the reset")
 }

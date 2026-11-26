@@ -123,3 +123,42 @@ func TestDayTalliesSayWhenSignInWasRefused(t *testing.T) {
 		t.Errorf("after an answer: refused at %d, answered at %d", a.AuthAt, a.Last)
 	}
 }
+
+// A refusal the vendor called a rate limit until a time it named is
+// counted as one in the day's tally (taoxiaoxin on Discord: WorkBuddy's
+// "您的使用量已超出频率限制，将在 … (UTC+8) 重置" was tallied "额度用尽"); a
+// quota used up stays one.
+func TestDayTalliesCountARateLimitAsOne(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	now := historyNoon(t)
+	route := func(i int, rest *Rest) Route {
+		w := Weighed{ID: "workbuddy@b", Provider: "workbuddy", Name: "WorkBuddy", Kind: "account", Who: "b@example.com", Model: "deepseek-v4.1-flash"}
+		tr := Try{ID: w.ID, Start: now.Add(time.Duration(i) * time.Minute), Done: true, Millis: 100, Status: 429, Fail: failQuota, Rest: rest}
+		return Route{ID: int64(i + 1), Time: tr.Start, Done: true, Model: w.Model, Provider: "workbuddy", Order: []Weighed{w}, Tries: []Try{tr}}
+	}
+	saveRoute(route(0, &Rest{Why: failQuota, By: "resets", Rate: true, Model: "deepseek-v4.1-flash"}))
+	saveRoute(route(1, &Rest{Why: failQuota, By: "resets", Model: "deepseek-v4.1-flash"}))
+	saveRoute(route(2, nil))
+	a := DayTallies()[`["workbuddy","b@example.com"]`]
+	if a.Fails[failRate] != 1 || a.Fails[failQuota] != 2 {
+		t.Errorf("tallied %v, want 1 rate and 2 quota", a.Fails)
+	}
+}
+
+// Two seats of one email on different plans are two accounts in the day's
+// tallies, as the Routing page's list keys them (RayYanOnline on X); a
+// seat with no plan keeps the two-part key.
+func TestTallyKeyTellsPlansApart(t *testing.T) {
+	seat := func(plan string) Weighed {
+		return Weighed{ID: "codex", Provider: "codex", Kind: "account", Who: "Jd@Example.com", Plan: plan}
+	}
+	if a, b := tallyKey(seat("team")), tallyKey(seat("prolite")); a == b {
+		t.Errorf("a Team seat and a Pro Lite login share the key %s", a)
+	}
+	if got, want := tallyKey(seat("")), `["codex","jd@example.com"]`; got != want {
+		t.Errorf("a seat with no plan: %s, want %s", got, want)
+	}
+	if got, want := tallyKey(seat(" Team ")), `["codex","jd@example.com","team"]`; got != want {
+		t.Errorf("a plan: %s, want %s", got, want)
+	}
+}

@@ -10,12 +10,14 @@ import (
 	"net"
 	"net/http"
 	"path"
-	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/tidwall/gjson"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -63,14 +65,48 @@ type cRequest struct {
 	Stop                json.RawMessage `json:"stop,omitempty"`
 	Stream              bool            `json:"stream,omitempty"`
 	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
-	ParallelToolCalls   *bool           `json:"parallel_tool_calls,omitempty"`
-	ServiceTier         string          `json:"service_tier,omitempty"`
-	PromptCacheKey      string          `json:"prompt_cache_key,omitempty"`
-	ResponseFormat      json.RawMessage `json:"response_format,omitempty"`
+	// the level in the other places a relay or a client puts it: new-api
+	// and OpenRouter's reasoning object, a Claude client's output_config
+	// and thinking budget (chatEffort)
+	Reasoning         json.RawMessage `json:"reasoning,omitempty"`
+	OutputConfig      json.RawMessage `json:"output_config,omitempty"`
+	Thinking          json.RawMessage `json:"thinking,omitempty"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
+	ServiceTier       string          `json:"service_tier,omitempty"`
+	PromptCacheKey    string          `json:"prompt_cache_key,omitempty"`
+	ResponseFormat    json.RawMessage `json:"response_format,omitempty"`
 	// not a Chat field: OpenCode merges a model's options into its body
 	// whichever API it speaks, and a Codex model it asks on Chat is asked
 	// on Responses (Request.AccessPrograms)
 	AccessPrograms json.RawMessage `json:"access_programs,omitempty"`
+}
+
+// chatEffort is the level a Chat request asks: reasoning_effort, and when
+// it names none, the places a relay puts the level of a Claude client's
+// request it turned into Chat (reasoning.effort, output_config.effort, a
+// thinking budget). reasoning_effort, when there, is the client's word.
+func chatEffort(c *cRequest) string {
+	if e := effortOf(c.ReasoningEffort); e != "" || strings.TrimSpace(c.ReasoningEffort) != "" {
+		return e
+	}
+	var o struct {
+		Effort string `json:"effort"`
+	}
+	for _, raw := range []json.RawMessage{c.Reasoning, c.OutputConfig} {
+		if len(raw) > 0 && decodeJSON(raw, &o) == nil {
+			if e := effortOf(o.Effort); e != "" {
+				return e
+			}
+		}
+	}
+	var th struct {
+		Type   string `json:"type"`
+		Budget int    `json:"budget_tokens"`
+	}
+	if len(c.Thinking) > 0 && decodeJSON(c.Thinking, &th) == nil && th.Type == "enabled" {
+		return effortOfBudget(th.Budget)
+	}
+	return ""
 }
 
 func parseChat(body []byte) (*Request, error) { return readChat(body, false) }
@@ -92,7 +128,7 @@ func readChat(body []byte, facts bool) (*Request, error) {
 		return nil, fmt.Errorf("invalid request: %v", err)
 	}
 	r := &Request{Model: c.Model, MaxTokens: c.MaxCompletionTokens, Temp: c.Temperature, TopP: c.TopP,
-		Stream: c.Stream, Effort: effortOf(c.ReasoningEffort), Parallel: c.ParallelToolCalls, Fast: c.ServiceTier == "priority" || c.ServiceTier == "ultrafast", Ultrafast: c.ServiceTier == "ultrafast", Tier: c.ServiceTier,
+		Stream: c.Stream, Effort: chatEffort(&c), Parallel: c.ParallelToolCalls, Fast: c.ServiceTier == "priority" || c.ServiceTier == "ultrafast", Ultrafast: c.ServiceTier == "ultrafast", Tier: c.ServiceTier,
 		CacheKey: c.PromptCacheKey, Format: openAIFormat(c.ResponseFormat), AccessPrograms: c.AccessPrograms}
 	if r.MaxTokens == 0 {
 		r.MaxTokens = c.MaxTokens
@@ -112,6 +148,7 @@ func readChat(body []byte, facts bool) (*Request, error) {
 		switch m.Role {
 		case "system", "developer":
 			sys = append(sys, stringOrText(m.Content))
+			r.systemRaw = append(r.systemRaw, m.Content)
 		case "user":
 			r.Messages = append(r.Messages, Message{Role: "user", Parts: chatParts(m.Content)})
 		case "assistant":
@@ -141,15 +178,28 @@ func readChat(body []byte, facts bool) (*Request, error) {
 				r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: m.ToolCallID}}})
 				continue
 			}
-			out, images := toolOutput(m.Content)
-			r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: m.ToolCallID, Text: out, Images: images}}})
+			out, images, audio := toolOutput(m.Content)
+			r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: ToolResult, CallID: m.ToolCallID, Text: out, Images: images, Audio: audio}}})
 		}
 	}
 	r.System = strings.Join(sys, "\n\n")
 	r.WebSearch = len(c.WebSearchOptions) > 0 && string(c.WebSearchOptions) != "null"
-	for _, t := range c.Tools {
+	for i, t := range c.Tools {
 		if strings.HasPrefix(t.Type, "web_search") {
 			r.WebSearch = true
+		}
+		if t.Function.Name == "" {
+			// Google's own tools as Gemini spells them, which LiteLLM's
+			// and Gemini's other OpenAI-shaped clients send among the
+			// tools — {"googleSearch":{}}, {"url_context":{}} — or by
+			// type, {"type":"url_context"}: googleSearch is the web
+			// search, the rest go on to a Gemini upstream (GoogleTools).
+			// Read as functions, they went out as tools with no name.
+			if search, kept, ok := chatGoogleTool(gjson.GetBytes(body, "tools."+strconv.Itoa(i))); ok {
+				r.WebSearch = r.WebSearch || search
+				r.GoogleTools = append(r.GoogleTools, kept...)
+				continue
+			}
 		}
 		if t.Type != "" && t.Type != "function" {
 			continue
@@ -194,6 +244,18 @@ func chatParts(raw json.RawMessage) []Part {
 			FileID   string `json:"file_id"`
 			Filename string `json:"filename"`
 		} `json:"file"`
+		VideoURL struct {
+			URL string `json:"url"`
+		} `json:"video_url"`
+		InputAudio struct {
+			Data   string `json:"data"`
+			Format string `json:"format"`
+		} `json:"input_audio"`
+		// the AI SDK's file part, flat (#4101: ZCode's), whose video
+		// alone is read here
+		Data      string `json:"data"`
+		MediaType string `json:"mediaType"`
+		Filename  string `json:"filename"`
 	}
 	decodeJSON(raw, &items)
 	var out []Part
@@ -208,10 +270,44 @@ func chatParts(raw json.RawMessage) []Part {
 		case "file":
 			if p, ok := chatFile(it.File.FileData, it.File.FileID, it.File.Filename); ok {
 				out = append(out, p)
+			} else if strings.HasPrefix(strings.ToLower(it.MediaType), "video/") {
+				if v, ok := videoPart(it.Data, it.MediaType, it.Filename); ok {
+					out = append(out, v)
+				}
+			}
+		case "video_url":
+			// a video, as DashScope's, Kimi's and OpenRouter's Chat take
+			// one (#4101, #6135): left out before, and the model answered
+			// for the words alone
+			if v, ok := videoPart(it.VideoURL.URL, "", ""); ok {
+				out = append(out, v)
+			}
+		case "input_audio":
+			// a recording, as OpenAI's Chat takes one ({data, format}):
+			// left out before, so Gemini answered for the words alone
+			// (Parlevent_ on X); a Gemini upstream is given it inline
+			if it.InputAudio.Data != "" {
+				out = append(out, Part{Kind: File, MediaType: audioType(it.InputAudio.Format), Data: it.InputAudio.Data})
 			}
 		}
 	}
 	return out
+}
+
+// audioType is the media type of a Chat input_audio's format: wav and mp3
+// are OpenAI's, a type given whole is kept, and the others are taken as
+// audio/<format>, as Gemini names them (audio/aac, audio/flac, audio/ogg).
+func audioType(format string) string {
+	f := strings.ToLower(strings.TrimSpace(format))
+	switch {
+	case f == "":
+		return "audio/wav"
+	case strings.Contains(f, "/"):
+		return f
+	case f == "mpeg":
+		return "audio/mp3"
+	}
+	return "audio/" + f
 }
 
 // chatFile is a Chat Completions file part (a PDF, say) as a file of the
@@ -301,7 +397,7 @@ func buildHost(p provider.Provider) string {
 			return id
 		}
 	}
-	return p.Host()
+	return p.VendorHost()
 }
 
 // failedAsText are the plugins whose vendor has no failed mark on a tool
@@ -315,8 +411,28 @@ var failedAsText = map[string]bool{"devin": true, "qoder": true, "qoder-cn": tru
 // deepseek-v4.1-flash, whose host doesn't say so), Command Code's
 // plugin, which replays it for a Go key as the built-in did to
 // /alpha/generate, and Qoder's, which sends it on as Qoder's own client
-// does (uk.jent on Discord; plugin 0.2.42).
+// does (uk.jent on Discord; plugin 0.2.42). Each of these is sent
+// noReasoning on a tool turn that has none (chatWantsReasoning).
+//
+// Devin's plugin reads it too (0.1.36, plugins#703) and gives it to a
+// model that isn't Claude as the turn's thinking: swe-2 thinks on a tool
+// loop's later steps only when the steps before carry theirs. Measured
+// 2026-11-25 on swe-2-high through magpie, five read_file steps then the
+// next: a streamed Chat request with each step's reasoning_content
+// thought 5 of 5, the same without it 0 of 5, and a Codex Responses body
+// with each step's reasoning item, built here without it, 0 of 5
+// (@Anotiaww on X). Devin is sent no noReasoning: the plugin would give
+// swe-2 a thought it never had.
 func chatReplaysReasoning(host, model string) bool {
+	return chatWantsReasoning(host, model) || host == "devin"
+}
+
+// chatWantsReasoning is whether a Chat upstream that has a turn's
+// reasoning back (chatReplaysReasoning) wants some on every tool turn,
+// noReasoning when the client kept none: DeepSeek refuses a request
+// without it (#1462), and Command Code's and Qoder's plugins read the
+// space as none.
+func chatWantsReasoning(host, model string) bool {
 	return strings.Contains(host, "deepseek") || strings.Contains(strings.ToLower(model), "deepseek") || host == provider.CommandCodePlanID || host == "qoder" || host == "qoder-cn"
 }
 
@@ -345,7 +461,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 	if r.System != "" {
 		msgs = append(msgs, map[string]any{"role": "system", "content": r.System})
 	}
-	replay := chatReplaysReasoning(host, model)
+	replay, wants := chatReplaysReasoning(host, model), chatWantsReasoning(host, model)
 	// MiniMax's own Chat API gives a model's thinking in the text, between
 	// <think> tags, and wants it back there on the turns after (its
 	// interleaved thinking): the decoder takes it out as thinking (#1267),
@@ -409,14 +525,13 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 					names[id] = p.Name
 					call := map[string]any{"id": id, "type": "function",
 						"function": map[string]any{"name": p.Name, "arguments": argsString(p)}}
-					if gemini {
-						// a later call of a signed step goes without: Gemini
-						// signs the first
-						if sig := p.Signature; sig != "" {
-							call["extra_content"] = googleExtra(sig)
-						} else if !signed {
-							call["extra_content"] = googleExtra(skipSignature)
-						}
+					if sig := p.Signature; sig != "" && (gemini || r.signer != "" && signerOf(sig) == r.signer) {
+						// Gemini's, or a relay's that gave it there
+						call["extra_content"] = googleExtra(sig)
+					} else if gemini && !signed {
+						// a later call of a signed step goes without:
+						// Gemini signs the first
+						call["extra_content"] = googleExtra(skipSignature)
 					}
 					calls = append(calls, call)
 				case Thinking:
@@ -452,7 +567,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 				}
 			} else if think != "" && replay {
 				am["reasoning_content"] = think
-			} else if replay && (len(calls) > 0 || afterTool) {
+			} else if wants && (len(calls) > 0 || afterTool) {
 				// a tool call with no thinking (another model's turn), or a
 				// reply to a tool result with none, which DeepSeek turns the
 				// whole request away for (#1462, #1822)
@@ -489,6 +604,14 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 			case Text:
 				content = append(content, map[string]any{"type": "text", "text": p.Text})
 			case File:
+				if isVideo(p) && !r.videoOff {
+					plain = false
+					content = append(content, chatVideo(p))
+					break
+				}
+				// told of, not carried: Chat upstreams' file support is
+				// uneven, and a 400 here loses the whole turn (#934) — the
+				// Responses and Messages tongues carry it whole (#5452)
 				content = append(content, map[string]any{"type": "text", "text": attachmentText(p)})
 			case Image:
 				plain = false
@@ -633,13 +756,20 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 //     reasoning — is dropped inside a pending exchange, where it would
 //     sit between calls and their answers. One with neither text nor
 //     calls was taken out before, wherever it stood
-//     (withoutSilentAssistants, #2599).
+//     (withoutSilentAssistants, #2599);
+//   - a system or developer message between the calls and their tool
+//     messages goes after them: DeepSeek takes it for the message after
+//     the calls and refuses the request ("tool_use ids were found
+//     without tool_result blocks immediately after"), and read as the
+//     turn after them it gave the calls synthetic results and the real
+//     ones went as user text.
 func pairToolMessages(msgs []map[string]any) []map[string]any {
 	out := make([]map[string]any, 0, len(msgs))
 	var pending []string          // calls of the last assistant message with tool_calls
 	order := map[string]int{}     // a pending call's place among them
 	answered := map[string]bool{} // pending calls a tool message answered
 	var tools []map[string]any    // answers to pending, held for sorting
+	var held []map[string]any     // system messages after pending's calls
 
 	flushTools := func() {
 		if len(tools) == 0 {
@@ -660,6 +790,8 @@ func pairToolMessages(msgs []map[string]any) []map[string]any {
 			}
 		}
 		pending, order, answered = nil, map[string]int{}, map[string]bool{}
+		out = append(out, held...)
+		held = nil
 	}
 	// toolAsUser turns a tool message that answers no pending call into a
 	// user message carrying its result. A user message just emitted takes
@@ -715,6 +847,15 @@ func pairToolMessages(msgs []map[string]any) []map[string]any {
 			}
 			answered[id] = true
 			tools = append(tools, m)
+		case "system", "developer":
+			if len(pending) > 0 {
+				// between the calls and their tool messages, which must
+				// follow them at once (DeepSeek, Kimi): it goes after
+				// them, and the results it stood before stay results
+				held = append(held, m)
+				continue
+			}
+			out = append(out, m)
 		default:
 			flushPending()
 			out = append(out, m)
@@ -921,7 +1062,7 @@ func geminiCompat(host, model string) bool {
 // thinking's type, and where the gateway and every other Chat API read it.
 // A request that says reasoning_effort itself is left as it is.
 func thinkingEffort(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`"effort"`)) {
+	if !bodyHas(body, `"effort"`) {
 		return body
 	}
 	var v struct {
@@ -937,6 +1078,38 @@ func thinkingEffort(body []byte) []byte {
 	}
 	delete(v.Thinking, "effort")
 	return withFields(body, map[string]any{"reasoning_effort": effort, "thinking": v.Thinking})
+}
+
+// cacheKeyCamel names OpenCode 1's camelCase promptCacheKey, which it
+// writes into a Chat body when its provider sets setCacheKey (#5468), as
+// the prompt_cache_key every Chat API reads: a key of the request's own,
+// for every route, and no field an upstream doesn't know. A
+// prompt_cache_key the body has already is the one kept.
+func cacheKeyCamel(body []byte) []byte {
+	if !bodyHas(body, `"promptCacheKey"`) {
+		return body
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var m map[string]any
+	if dec.Decode(&m) != nil {
+		return body
+	}
+	key, ok := m["promptCacheKey"]
+	if !ok {
+		return body
+	}
+	delete(m, "promptCacheKey")
+	if _, has := m["prompt_cache_key"]; !has && key != nil {
+		m["prompt_cache_key"] = key
+	}
+	var out bytes.Buffer
+	enc := json.NewEncoder(&out)
+	enc.SetEscapeHTML(false) // <, > and & as the agent wrote them
+	if enc.Encode(m) != nil {
+		return body
+	}
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n"))
 }
 
 // thinkingConfigField is Gemini's thinking_config as unfit remembers a
@@ -957,7 +1130,7 @@ var gemini3Levels = []string{"minimal", "low", "medium", "high"}
 // thinking_level minimal alike; and gemini-3.1-pro-preview's
 // "thinking_level MINIMAL is not supported by this model" at its
 // generateContent.
-var geminiLevelRefused = regexp.MustCompile(`(?i)thinking[ _]level\W+(?:(minimal|low|medium|high)\W+is not supported|is unsupported\W+thinking_level_(minimal|low|medium|high))`)
+var geminiLevelRefused = lazyre.New(`(?i)thinking[ _]level\W+(?:(minimal|low|medium|high)\W+is not supported|is unsupported\W+thinking_level_(minimal|low|medium|high))`)
 
 // geminiRefusedLevel is the thinking level Gemini turned away in body
 // (geminiLevelRefused), or "".
@@ -976,7 +1149,7 @@ func refusesThinkingConfig(status int, body []byte) bool {
 		return false
 	}
 	b := bytes.ToLower(body)
-	return bytes.Contains(b, []byte("extra_body")) || bytes.Contains(b, []byte("thinking")) || bytes.Contains(b, []byte("include_thoughts"))
+	return bodyHas(b, "extra_body") || bodyHas(b, "thinking") || bodyHas(b, "include_thoughts")
 }
 
 // aiStudioThinking is the thinking_config asking Gemini for its thoughts at
@@ -1015,11 +1188,19 @@ type cUsage struct {
 	CompletionTokensDetails *struct {
 		ReasoningTokens int `json:"reasoning_tokens"`
 	} `json:"completion_tokens_details,omitempty"`
+	// ReasoningTokens is Copilot's count of them, at the top of its usage
+	// beside completion_tokens, which counts them too (probed live on
+	// gemini-4-hydrogen: "completion_tokens":88, "reasoning_tokens":48)
+	ReasoningTokens int `json:"reasoning_tokens"`
 	// what others say was read from their cache, when prompt_tokens_details
-	// doesn't: DeepSeek's hits, Moonshot's cached_tokens, and Anthropic's
-	// own names from relays in front of Claude
+	// doesn't: DeepSeek's hits, Moonshot's cached_tokens, Mistral's
+	// num_cached_tokens (its older top-level count, which its API still
+	// sends beside or instead of prompt_tokens_details, counted in
+	// prompt_tokens as OpenAI's is), and Anthropic's own names from relays
+	// in front of Claude
 	PromptCacheHitTokens     int `json:"prompt_cache_hit_tokens"`
 	CachedTokens             int `json:"cached_tokens"`
+	NumCachedTokens          int `json:"num_cached_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 	// Credit is what WorkBuddy says the request cost in its plan's credits
@@ -1046,7 +1227,7 @@ func (u cUsage) usage() Usage {
 	if d := u.PromptTokensDetails; d != nil {
 		out.CacheRead, out.CacheWrite = d.CachedTokens, d.CacheWriteTokens
 	}
-	for _, n := range []int{u.PromptCacheHitTokens, u.CachedTokens} {
+	for _, n := range []int{u.PromptCacheHitTokens, u.CachedTokens, u.NumCachedTokens} {
 		if out.CacheRead == 0 {
 			out.CacheRead = n
 		}
@@ -1064,6 +1245,9 @@ func (u cUsage) usage() Usage {
 	}
 	if u.CompletionTokensDetails != nil {
 		out.Reasoning = u.CompletionTokensDetails.ReasoningTokens
+	}
+	if out.Reasoning == 0 {
+		out.Reasoning = u.ReasoningTokens
 	}
 	if c := u.Credit; c != nil && *c >= 0 {
 		out.Credits = c
@@ -1126,10 +1310,10 @@ const leadSpace = " \t\r\n"
 
 // thoughtTags are the tags a leading block of thinking comes between in a
 // Chat reply's text, by its opening tag.
-var thoughtTags = map[string]string{"<thought>": "</thought>", "<think>": "</think>"}
+var thoughtTags = map[string]string{"<thought>": "</thought>", "<thinking>": "</thinking>", "<think>": "</think>"}
 
-// text sends a piece of the reply's text, a leading <thought> or <think>
-// block of it as thinking.
+// text sends a piece of the reply's text, a leading <thought>, <thinking> or
+// <think> block of it as thinking.
 func (d *chatDecoder) text(s string, emit func(Event)) {
 	if !d.past && !d.thought {
 		d.lead += s
@@ -1244,16 +1428,22 @@ func (m *mdCode) find(s, close string, last bool) (at, hold int) {
 	return -1, 0
 }
 
-// afterThought is t without a leading <think>…</think> block, a whole
-// reply's thinking where its API leaves it in the text; t when it has none.
+// afterThought is t without a leading thinking block (any of thoughtTags,
+// as a streamed reply's is read), a whole reply's thinking where its API
+// leaves it in the text; t when it has none. No opening tag is a prefix of
+// another's whole tag, so at most one matches.
 func afterThought(t string) string {
-	rest, ok := strings.CutPrefix(strings.TrimLeft(t, leadSpace), "<think>")
-	if !ok {
+	lead := strings.TrimLeft(t, leadSpace)
+	for open, end := range thoughtTags {
+		rest, ok := strings.CutPrefix(lead, open)
+		if !ok {
+			continue
+		}
+		var m mdCode
+		if i, _ := m.find(rest, end, true); i >= 0 {
+			return strings.TrimSpace(rest[i+len(end):])
+		}
 		return t
-	}
-	var m mdCode
-	if i, _ := m.find(rest, "</think>", true); i >= 0 {
-		return strings.TrimSpace(rest[i+len("</think>"):])
 	}
 	return t
 }
@@ -1685,4 +1875,29 @@ func renderChat(res Result, model string) []byte {
 		"choices": []map[string]any{{"index": 0, "message": msg, "finish_reason": stopToChat(res.Stop)}},
 		"usage":   res.Usage.chat()})
 	return b
+}
+
+// chatGoogleTool reads a Chat request's tool that is one of Google's own,
+// keyed by its name ({"googleSearch":{}}) or typed with it
+// ({"type":"url_context"}, its settings under the same name if any): ok
+// when it is one.
+func chatGoogleTool(t gjson.Result) (search bool, kept []json.RawMessage, ok bool) {
+	var m map[string]json.RawMessage
+	if !t.IsObject() || json.Unmarshal([]byte(t.Raw), &m) != nil {
+		return false, nil, false
+	}
+	if typ := snakeToCamel(t.Get("type").String()); typ != "" {
+		if !googleSearchTools[typ] && !googleToolNames[typ] {
+			return false, nil, false
+		}
+		v := m[t.Get("type").String()]
+		if len(v) == 0 {
+			v = m[typ]
+		}
+		search, kept = googleTools(map[string]json.RawMessage{typ: v}, true)
+		return search, kept, true
+	}
+	delete(m, "type")
+	search, kept = googleTools(m, true)
+	return search, kept, search || len(kept) > 0
 }

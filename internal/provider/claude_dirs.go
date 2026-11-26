@@ -10,6 +10,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -145,12 +146,22 @@ var claudeRunWait = 90 * time.Second
 
 var claudeRunSeq atomic.Int64
 
+// runMarkTag tells this process's run marks from another's with its pid.
+var runMarkTag = func() string {
+	b := make([]byte, 4)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}()
+
 // claudeRunMarks matches the lock files of the runs in user's directory.
 func claudeRunMarks(user string) string { return claudeAccountDir(user) + ".run-*.lock" }
 
 // markClaudeRun holds a lock file of this run's own, released as it ends.
 func markClaudeRun(user string) (release func()) {
-	path := fmt.Sprintf("%s.run-%d-%d.lock", claudeAccountDir(user), os.Getpid(), claudeRunSeq.Add(1))
+	// named past the pid and the count: another pod's magpie on the same
+	// volume has pid 1 too, and would take this one's name, fail its lock
+	// and remove the file this run holds
+	path := fmt.Sprintf("%s.run-%d-%d-%s.lock", claudeAccountDir(user), os.Getpid(), claudeRunSeq.Add(1), runMarkTag)
 	unlock, held := filelock.Lock(path, 0)
 	if !held {
 		_ = os.Remove(path)
@@ -261,6 +272,12 @@ func claudeSavedDir(user string) (string, error) {
 	if i < 0 {
 		return "", fmt.Errorf("no saved claude account %q", user)
 	}
+	if ls[i].Held {
+		// Claude Code's own, though a read just now found it signed in to
+		// none (claudeSignInUnsure): put here too, a second Claude Code
+		// would refresh the refresh token it holds and sign it out
+		return "", fmt.Errorf(errClaudeHeld, user)
+	}
 	if claudeSetupToken(ls[i].Auth) != "" {
 		// no sign-in to put there: the token goes in Claude Code's
 		// environment (ClaudeDirToken)
@@ -294,6 +311,12 @@ func claudeSavedDir(user string) (string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
+	// the sign-in that was there is out first, so the one the saved login
+	// has is the directory's only holder: an older one left in the
+	// directory's keychain item would shadow the fresh file on a Mac, and
+	// be read back over it the next look. Nothing there, this removes
+	// nothing.
+	clearClaudeDir(dir)
 	if err := writePrivate(filepath.Join(dir, ".credentials.json"), append(b, '\n')); err != nil {
 		return "", err
 	}
@@ -353,11 +376,11 @@ func claudeOnboarded(dir string, acct map[string]any) {
 var claudeTrustMu sync.Mutex
 
 // ClaudeTrustFolder records, in saved account config directory dir, that
-// Claude Code may work in magpie's own folder, which keys names as Claude
-// Code keys its projects (2.1.316: the folder's path, on Windows with
-// forward slashes, "C:/Users/<me>/AppData/Local/Temp/magpie-claude-work"),
-// as Claude Code itself records it once the trust question is answered
-// yes. On mydosu's Windows (#4830) a saved account's directory had no
+// Claude Code may work in a folder (magpie's own, or a caller's), which
+// keys names as Claude Code keys its projects (2.1.316: the folder's
+// path, on Windows with forward slashes,
+// "C:/Users/<me>/AppData/Local/Temp/magpie-claude-work"), as Claude Code
+// itself records it once the trust question is answered yes. On mydosu's Windows (#4830) a saved account's directory had no
 // such entry, and every /usage read of that account waited out its time
 // on the question.
 // Only a directory of magpie's saved accounts is written, never the
@@ -429,6 +452,17 @@ func syncClaudeDir(l *savedLogin) (has, changed bool, err error) {
 	c, ok := readClaudeDir(claudeAccountDir(l.User))
 	switch {
 	case ok:
+		// a directory sign-in older than the saved one (#6391): the
+		// directory was made again behind a switch (#4750) and the holder
+		// the agent itself runs on refreshed meanwhile, so the directory's
+		// is spent. Taking it would replace the fresh sign-in with the
+		// spent one, and the next refresh in the directory would empty it,
+		// the account signed out. has=false has claudeSavedDir make the
+		// directory from the saved one instead, as when it holds none.
+		if old, ook := parseClaudeCredentials(l.Auth); ook && old.OAuth.ExpiresAt > 0 &&
+			c.OAuth.ExpiresAt > 0 && c.OAuth.ExpiresAt < old.OAuth.ExpiresAt {
+			return false, false, nil
+		}
 		changed, err = takeClaudeDir(l, c)
 		return true, changed, err
 	case c.cleared():
@@ -438,23 +472,58 @@ func syncClaudeDir(l *savedLogin) (has, changed bool, err error) {
 }
 
 // takeClaudeDir puts the sign-in Claude Code keeps in an account's config
-// directory into its saved login, and says whether that changed it.
+// directory into its saved login, and says whether that changed it. A
+// sign-in Claude Code renewed only the plan of, its tokens the same,
+// changes it too: Claude Code writes the tier its profile read now beside
+// the tokens it holds, and the account's plan is read from it
+// (claudePlanShown), with the plan name Claude Code kept in the
+// directory's profile.
 func takeClaudeDir(l *savedLogin, c claudeCredentials) (bool, error) {
-	if old, ok := parseClaudeCredentials(l.Auth); ok && old.OAuth.AccessToken == c.OAuth.AccessToken &&
-		old.OAuth.RefreshToken == c.OAuth.RefreshToken {
+	plan := l.Plan
+	if c.OAuth.SubscriptionType != "" {
+		var acct map[string]any
+		if len(l.Profile) > 0 {
+			_ = json.Unmarshal(l.Profile, &acct)
+		}
+		shown := claudeShownPlan(acct)
+		if s := claudeDirShownPlan(claudeAccountDir(l.User)); s != "" {
+			shown = s
+		}
+		plan = claudePlanShown(c.OAuth.SubscriptionType, c.OAuth.RateLimitTier, shown)
+	}
+	old, ok := parseClaudeCredentials(l.Auth)
+	renewed := !ok || old.OAuth.AccessToken != c.OAuth.AccessToken || old.OAuth.RefreshToken != c.OAuth.RefreshToken
+	if !renewed && old.OAuth.SubscriptionType == c.OAuth.SubscriptionType &&
+		old.OAuth.RateLimitTier == c.OAuth.RateLimitTier && plan == l.Plan {
 		return false, nil
 	}
 	b, err := c.marshal()
 	if err != nil {
 		return false, err
 	}
-	l.Auth = b
-	if c.OAuth.SubscriptionType != "" {
-		l.Plan = c.OAuth.SubscriptionType
+	l.Auth, l.Plan = b, plan
+	if renewed {
+		l.Renewed = time.Now().UTC().Truncate(time.Second)
+		l.Lapsed, l.Refused = "", ""
 	}
-	l.Renewed = time.Now().UTC().Truncate(time.Second)
-	l.Lapsed, l.Refused = "", ""
 	return true, nil
+}
+
+// claudeDirShownPlan is the plan name Claude Code keeps in config
+// directory dir's profile (claudeShownPlan): "" when it keeps none, or
+// the file can't be read.
+func claudeDirShownPlan(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, ".claude.json"))
+	if err != nil {
+		return ""
+	}
+	var p struct {
+		Account map[string]any `json:"oauthAccount"`
+	}
+	if json.Unmarshal(b, &p) != nil {
+		return ""
+	}
+	return claudeShownPlan(p.Account)
 }
 
 // claudeStandIn is the saved account served in the place of Claude Code's
@@ -525,6 +594,94 @@ const legacyClaudeLogoutLapse = "Claude Code's /logout signed it out (it revokes
 // claudeGoneLapse is why a saved Claude account with no sign-in kept can't
 // be used.
 const claudeGoneLapse = "its sign-in is gone; sign in again"
+
+// errClaudeHeld is why the account Claude Code itself is signed in to gets
+// no config directory of magpie's.
+const errClaudeHeld = "Claude Code itself is signed in to %s; magpie runs it there, not in a folder of its own"
+
+// claudeUnsureGrace is how long a sign-in of Claude Code's that can't be
+// read is taken for one being written. Claude Code on Windows rewrites
+// .credentials.json and .claude.json in place while magpie has the file
+// open (its rename over it gets EPERM), and a read between the truncate
+// and the write finds it empty or cut short. A write takes milliseconds;
+// one unreadable for longer is gone.
+var claudeUnsureGrace = 2 * time.Minute
+
+var claudeUnsure struct {
+	sync.Mutex
+	since time.Time
+}
+
+// claudeSignInUnsure says, once liveLogin found Claude Code signed in to
+// no account, that this isn't known: what it keeps its sign-in in can't be
+// read whole now (claudeSignInUnread), and has been so for less than
+// claudeUnsureGrace. The account it held stays its own meanwhile, neither
+// lapsed (claudeLoggedOut) nor run elsewhere (claudeSavedDir). A sign-in in
+// the Mac's keychain is read whole or not at all, and is left as it was.
+func claudeSignInUnsure() bool {
+	if settings.AccountDiscoveryOff() || claudeKeychain {
+		return false
+	}
+	unread := claudeSignInUnread()
+	claudeUnsure.Lock()
+	defer claudeUnsure.Unlock()
+	if !unread {
+		claudeUnsure.since = time.Time{}
+		return false
+	}
+	now := time.Now()
+	if claudeUnsure.since.IsZero() {
+		claudeUnsure.since = now
+	}
+	return now.Sub(claudeUnsure.since) < claudeUnsureGrace
+}
+
+// claudeSignInUnread says Claude Code's sign-in isn't known to be gone:
+// gone is no credentials file, one Claude Code emptied, `claude auth
+// status` saying it is logged out, or no account named for it. A file
+// that can't be read or isn't whole JSON is one being written, and so is
+// a sign-in read whole now, which a read a moment ago (claudeCredential's)
+// didn't find.
+func claudeSignInUnread() bool {
+	b, err := readAccountFile(claudeCredentialsPath())
+	if err != nil {
+		return !os.IsNotExist(err)
+	}
+	c, ok := parseClaudeCredentials(b)
+	if c.raw == nil {
+		return true
+	}
+	if !ok {
+		return false
+	}
+	user, _, signedOut := claudeIdentity()
+	if signedOut {
+		return false
+	}
+	b, err = os.ReadFile(claudeProfilePath())
+	if err != nil {
+		return !os.IsNotExist(err) || user != ""
+	}
+	var m struct {
+		OAuthAccount map[string]any `json:"oauthAccount"`
+	}
+	if json.Unmarshal(b, &m) != nil {
+		return true
+	}
+	email, _ := m.OAuthAccount["emailAddress"].(string)
+	return strings.TrimSpace(email) != "" || user != ""
+}
+
+// claudeHeldUser is the account Claude Code was signed in to when last
+// looked at, "" for none.
+func claudeHeldUser(ls []savedLogin) string {
+	for _, l := range ls {
+		if l.Agent == "claude" && l.Held {
+			return l.User
+		}
+	}
+	return ""
+}
 
 // claudeLoggedOut marks the account Claude Code held, now that it holds no
 // sign-in, as lapsed: magpie's copy of that account is the same sign-in,

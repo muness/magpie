@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Get started · magpie docs</title>
+<title>Get started: pick a model for Claude Code, Codex and every agent · magpie</title>
 <meta name="description" content="How magpie fits together and how to set it up: add the providers you have, pick a model for each agent, and optionally route one model over several accounts.">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fafafa">
@@ -39,6 +39,54 @@
 <meta property="og:image" content="https://usemagpie.ai/img/og.png">
 <meta property="og:url" content="https://usemagpie.ai/docs/start">
 <meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "TechArticle",
+   "headline": "Get started",
+   "description": "How magpie fits together and how to set it up: add the providers you have, pick a model for each agent, and optionally route one model over several accounts.",
+   "inLanguage": "en",
+   "url": "https://usemagpie.ai/docs/start",
+   "about": {
+    "@type": "SoftwareApplication",
+    "name": "magpie",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS, Windows, Linux"
+   },
+   "publisher": {
+    "@type": "Organization",
+    "name": "magpie",
+    "url": "https://usemagpie.ai/"
+   }
+  },
+  {
+   "@type": "BreadcrumbList",
+   "itemListElement": [
+    {
+     "@type": "ListItem",
+     "position": 1,
+     "name": "magpie",
+     "item": "https://usemagpie.ai/"
+    },
+    {
+     "@type": "ListItem",
+     "position": 2,
+     "name": "Docs",
+     "item": "https://usemagpie.ai/docs/start"
+    },
+    {
+     "@type": "ListItem",
+     "position": 3,
+     "name": "Get started",
+     "item": "https://usemagpie.ai/docs/start"
+    }
+   ]
+  }
+ ]
+}
+</script>
 </head>
 <body>
 
@@ -55,6 +103,13 @@
     <a class="toc-only" href="/docs/masking">Privacy masking</a>
     <a class="toc-only" href="/docs/mcp-router">MCP router</a>
     <a class="toc-only" href="/docs/library">Library</a>
+    <a class="toc-only" href="/docs/claude-code-models">Models in Claude Code</a>
+    <a class="toc-only" href="/docs/codex-models">Models in Codex</a>
+    <a class="toc-only" href="/docs/gemini-cli-models">Models in Gemini CLI</a>
+    <a class="toc-only" href="/docs/subscriptions">Subscriptions in any agent</a>
+    <a class="toc-only" href="/docs/local-models">Local models</a>
+    <a class="toc-only" href="/docs/opencode-models">Models in OpenCode</a>
+    <a class="toc-only" href="/docs/alternatives">magpie vs CC Switch vs CCR</a>
     <a href="/docs/import">Add to magpie</a>
     <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie-releases/releases">Releases</a>
@@ -154,6 +209,8 @@
       <tr><td>Claude Code</td><td><code>~/.claude/settings.json</code>: <code>ANTHROPIC_BASE_URL</code>, <code>ANTHROPIC_AUTH_TOKEN</code> and the model variables in its <code>env</code> block</td></tr>
       <tr><td>Codex</td><td><code>~/.codex/config.toml</code>: a <code>[model_providers.magpie]</code> table and the model, with the list in <code>magpie-models.json</code>. Your ChatGPT sign-in is left alone</td></tr>
       <tr><td>OpenCode, MiMo Code, DevEco Code, Pi, Crush</td><td>A <code>magpie</code> provider entry, and <code>magpie/provider/model</code></td></tr>
+      <tr><td>Open Code Review</td><td><code>~/.opencodereview/config.json</code>: a <code>magpie</code> custom provider, made the one <code>ocr</code> uses</td></tr>
+      <tr><td>Kigi</td><td><code>~/.kigi/config.toml</code>: a <code>[model."magpie/…"]</code> table per model, the one picked made the default</td></tr>
       <tr><td>AtomCode</td><td><code>~/.atomcode/config.toml</code>: a <code>magpie</code> provider account and one model entry per catalog model</td></tr>
       <tr><td>Snow CLI</td><td><code>~/.snow/profiles/magpie.json</code>: a <code>magpie</code> profile, made the active one (Snow App takes it in with "Sync Snow CLI API config")</td></tr>
       <tr><td>QwenPaw</td><td>A <code>magpie</code> provider in <code>~/.qwenpaw.secret/providers/custom/magpie.json</code>, and each agent's <code>active_model</code> in its <code>agent.json</code>. Restart QwenPaw after the first connect</td></tr>
@@ -161,6 +218,7 @@
     </table></div>
     <p><b>A running session keeps the model it started with.</b> Agents read their config when they start, so the change applies to the next session. Codex builds its model list at start-up too: restart the Codex app and open <code>codex</code> sessions after a switch.</p>
     <div class="callout"><b>Paseo, editor extensions and other front-ends</b> that run Claude Code or Codex for you start the same CLI, which reads the same <code>~/.claude</code> or <code>~/.codex</code> config. Set the model once in magpie and they get it too, from their next session.</div>
+    <div class="callout"><b><code>claude-magpie</code>: Claude Code through magpie, <code>claude</code> left as it is.</b> To keep a plain <code>claude</code> on your own Claude account and start magpie's Claude Code only when you ask for it, leave Claude Code unconnected and run <code>claude-magpie</code> instead. It starts the same <code>claude</code> with magpie's settings over yours for that session (the gateway, the model and its tiers), so <code>~/.claude/settings.json</code> is never rewritten. Every argument goes to Claude Code: <code>claude-magpie --resume</code>, <code>claude-magpie -p "…"</code>. magpie puts it beside the <code>magpie</code> command when you add that in <span class="ui">Settings › Command line</span>; with the command there already, run <code>magpie claude launcher add</code> once. <code>magpie claude run</code> does the same. A model you pick with <code>/model</code> in it is kept for the next <code>claude-magpie</code>, and your own <code>claude</code> keeps its model. magpie has to be running.</div>
 
     <h2 id="routing"><a class="anchor" href="#routing">3 · Optional: routing groups</a></h2>
     <p>With one account per provider you can skip this. It matters once you have several: two ChatGPT accounts, or the same model from a subscription and from a key.</p>
@@ -183,12 +241,14 @@
       <tr><td>Smart <code>smart</code></td><td>The default. Over the members’ accounts and keys together (a group in the group as one, see below): of the subscriptions with quota to spare, the one whose allowance renews soonest. The week decides; an account with five hours and no week (Claude Enterprise) goes by its five hours, so ahead of every week renewing later. Credits with no reset (WorkBuddy’s packages, each ending on its own day) count as renewing when the soonest of those left run out, so the WorkBuddy account whose credits end first goes first; accounts renewing together (free ones at the month’s end) go by whose credits left end first after that. One resting after a failure goes last.</td></tr>
       <tr><td>In order <code>order</code></td><td>The first model until it can’t answer, then the next.</td></tr>
       <tr><td>Until used up <code>drain</code></td><td>One account or key until it is used up, then the next, which keeps the requests: one before it that renews meanwhile doesn’t take them back. One rate limited or failing is passed over only while it rests.</td></tr>
-      <tr><td>In turn <code>rotate</code></td><td>Each conversation’s next turn goes to the next member’s account or key, spreading the load.</td></tr>
+      <tr><td>Before expiry, one by one <code>pace-drain</code></td><td>The account with the most of its allowance left per hour until it is lost, as Use before expiry picks it, takes every request until it is used up or fails; then the next is picked the same way. One picked keeps the requests while its pace falls below another’s, and one that renews meanwhile doesn’t take them back.</td></tr>
+      <tr><td>In turn <code>rotate</code></td><td>Each message you send goes to the next member’s account or key; the agent’s tool calls for it stay on the same one. With Stays on Session, a whole conversation stays on one instead.</td></tr>
       <tr><td>Least used <code>usage</code></td><td>The account or key with the most of its allowance left.</td></tr>
       <tr><td>Use before expiry <code>pace</code></td><td>The account with the most of its week left per hour until it renews — the one with the most to lose at its reset — so less of each member’s week is lost at its reset; an account with five hours and no week (Claude Enterprise) by what its five hours have left per hour until they renew, so almost always first. Credits in an account that expire before it resets count too: those that expire first, per hour until they do, when that is the more (WorkBuddy’s check-in credits). One at 90% or more waits until the others can’t answer. A key by the tokens sent it lately.</td></tr>
       <tr><td>By weight <code>weight</code></td><td>Each model takes its share of the requests by the weight set beside it in the group editor (1 to 1000, 1 if unset): one weighing 3 takes three for every one a model weighing 1 takes, spread out rather than in bursts. Each model is tried whole over its own accounts or keys, as its provider routes them, and a group in the group counts as one. One resting after a failure leaves the round; the next model is the fallback when one fails.</td></tr>
       <tr><td>Speed first <code>fast</code></td><td>The member, account or key that answered this model fastest lately: the time to its first token and how fast it writes, newer answers counting more. Those within a tenth of each other keep their order. One not measured in the last hour gets one request in five, so a channel that was slow once is tried again; one resting after a failure goes last. Only streamed replies are measured, and a restart measures again from scratch.</td></tr>
       <tr><td>Cheapest first <code>cheap</code></td><td>Groups only. The member whose model costs least now, by its price a million tokens in and out at this hour as Usage counts it: your own price for it, else its list price, at the provider’s price rate and rate windows. DeepSeek’s own API, Command Code’s and OpenCode Go’s DeepSeek models cost double in their peak hours (weekdays 01:00–04:00 and 06:00–10:00 UTC), and Ollama Cloud’s DeepSeek V4.1 Flash and V4 Pro in its own (weekdays 12:00–18:00 UTC, half price the rest of the time), so a DeepSeek model listed on two providers goes to the one cheaper at that hour. Members that cost the same keep their order; one with no known price goes last.</td></tr>
+      <tr><td>Small context first <code>fit</code></td><td>Groups only. Each request goes to the member with the smallest context window that holds it, so the big ones are kept for long requests. A member whose window the request is longer than is left out, as under every routing. Members of one size go as Smart orders them, and one whose window isn’t known goes last.</td></tr>
     </table></div>
     <div class="table-wrap"><table>
       <tr><th>Stays</th><th>How long a conversation stays with the account or key that answered it</th></tr>
@@ -204,7 +264,7 @@
       <li>A rule decides as a turn begins, and the turn stays on that model while the agent sends tool results back, so what the vendor cached isn’t lost halfway. The one exception: a turn that grows past its model’s context moves to a member that takes it.</li>
       <li>Tokens are estimated from the request’s size, or what the vendor counted for the conversation’s last request, whichever is more. Leave some margin: a rule at 150k for a 200k model, not 199k.</li>
       <li>A subagent is a conversation of its own, so a rule can send it elsewhere while its agent keeps where it is.</li>
-      <li>An intent is a few words for what the user asks for — “writing or fixing tests”, “a quick question”. As a turn begins, the group’s classifier — any model magpie has; a small, fast one without reasoning is best — is asked once which of the intents that could match the user’s message is. Only the message is sent, not the conversation. If it fails, exceeds the configured timeout (8 s by default; set in Settings → Models → Replies → Intent classifier timeout) or can’t say, no intent matches and the turn goes by the other rules. It isn’t asked when a rule without an intent would decide anyway, and the same message isn’t asked about twice. Its calls show in Usage as magpie’s own. Exactly what it is asked, how its answer is used and what happens when it fails: <a href="/docs/intent">Intent routing</a>.</li>
+      <li>An intent is a few words for what the user asks for — “writing or fixing tests”, “a quick question”. As a turn begins, the group’s classifier — any model magpie has; a small, fast one without reasoning is best — is asked once which of the intents that could match the user’s message is. Only the message is sent, not the conversation. If it fails, exceeds the configured timeout (15 s by default; set in Settings → Models → Replies → Intent classifier timeout) or can’t say, no intent matches and the turn goes by the other rules. It isn’t asked when a rule without an intent would decide anyway, and the same message isn’t asked about twice. Its calls show in Usage as magpie’s own. Exactly what it is asked, how its answer is used and what happens when it fails: <a href="/docs/intent">Intent routing</a>.</li>
       <li><span class="ui">compacting</span> matches an agent compacting its conversation — Claude Code’s <code>/compact</code> and auto-compact, Codex, OpenCode, Pi, Gemini CLI, Qwen Code, Kimi Code — so a cheaper, faster model writes the summary while the conversation stays on its own. A compaction is decided on its own: the turn it happens in, and its cache, stay where they were. When the conversation is longer than the rule’s model takes, the next rule that matches, or the group’s order, decides instead.</li>
       <li><b>Hours and days.</b> A rule can hold only at some hours, on some days, by this computer’s clock — a vendor’s peak hours, say. A rule that sends those turns elsewhere still leaves the vendor’s model behind it for failover. To keep a model out entirely, choose <span class="ui">Pause the model instead</span> from the rule’s <span class="ui">⋯</span> menu: while it holds (its hours and days, its agents), that model is left out of the group — never first, never a fallback, not kept for the conversation it was in — and it is back once they end. A pause holds by hours, days and agents only; if every model of the group is paused, the agent is told so.</li>
       <li><b>Folders.</b> <span class="ui">in folder</span> matches a turn from an agent working in one of the folders you list, or a folder inside one: <code>~/work/acme</code> takes <code>~/work/acme/web</code>, not <code>~/work/acme-old</code>. The folder is the one the agent tells its model in the request — Claude Code, Codex, OpenCode and Pi say it — so an agent that doesn’t say its folder matches no folder rule. <code>~</code> is your home folder, <code>C:\work</code> is also WSL’s <code>/mnt/c/work</code>, and on macOS and Windows case doesn’t count.</li>
@@ -239,6 +299,8 @@ magpie group rule add opus-anywhere use=deepseek/deepseek-v4-flash compact  <spa
 magpie group rule add opus-anywhere use=kimi/kimi-k2.6 folders=~/oss,<span class="s">"~/My Project"</span>  <span class="c"># turns in those projects to it first</span>
 magpie group rule add opus-anywhere pause=copilot/claude-opus-5.5 time=14:00-18:00 days=mon-fri  <span class="c"># left out in those hours</span>
 magpie group rule add opus-anywhere pause=claude/claude-opus-5-5 except-folders=~/big-task  <span class="c"># the model kept for the task in ~/big-task: left out of every other folder</span>
+magpie group rule add opus-anywhere use=deepseek/deepseek-v4-flash when=<span class="s">"effort is off"</span> when=<span class="s">"not subagent"</span>  <span class="c"># reasoning off, not a subagent</span>
+magpie group rule add opus-anywhere use=deepseek/deepseek-v4-flash when=<span class="s">"system matches ^你是对话标题命名"</span>  <span class="c"># a harness's title call, told by its system prompt</span>
 magpie group set coder models+=group/opus-anywhere  <span class="c"># a group in a group</span>
 magpie group rule opus-anywhere      <span class="c"># its rules; rule rm|mv &lt;n&gt;, rule classifier &lt;group&gt; &lt;model&gt;</span>
 magpie group copy opus-anywhere <span class="s">"Opus test"</span>  <span class="c"># the same models, routing and rules, to change on its own</span>
@@ -270,6 +332,7 @@ magpie claude group/opus-anywhere    <span class="c"># use it</span></pre>
       <tr><td><code>magpie providers</code></td><td>Your providers: host, key, models, who uses them</td></tr>
       <tr><td><code>magpie models</code></td><td>Every model agents can pick, as <code>provider/model</code></td></tr>
       <tr><td><code>magpie claude codex/gpt-5.5</code></td><td>Set an agent’s model</td></tr>
+      <tr><td><code>claude-magpie</code></td><td>Claude Code through magpie for one session, a plain <code>claude</code> left on your account (<code>magpie claude run</code>; <code>magpie claude launcher add</code> puts it on PATH)</td></tr>
       <tr><td><code>magpie codex effort high</code></td><td>Set another field</td></tr>
       <tr><td><code>magpie codex default</code></td><td>Back to the agent’s own default, magpie’s wiring removed</td></tr>
       <tr><td><code>magpie save work</code> · <code>use work</code></td><td>Save and apply a profile</td></tr>
@@ -278,6 +341,8 @@ magpie claude group/opus-anywhere    <span class="c"># use it</span></pre>
       <tr><td><code>magpie tray</code></td><td>Start with the menu bar icon only</td></tr>
       <tr><td><code>magpie log</code> · <code>magpie log -f</code></td><td>Where magpie’s logs are, to send with a report; <code>-n 200</code> prints the app log’s last lines, <code>-f</code> follows it</td></tr>
     </table></div>
+
+    <p><a href="/docs/sync">Keep magpie in sync across computers: WebDAV, S3 and GitHub</a></p>
 
     <h2 id="faq"><a class="anchor" href="#faq">FAQ</a></h2>
     <h3>Do I need to export <code>OPENAI_BASE_URL</code> or <code>ANTHROPIC_BASE_URL</code>?</h3>
@@ -291,7 +356,10 @@ magpie claude group/opus-anywhere    <span class="c"># use it</span></pre>
     <h3>Does editing the agent’s config by hand break anything?</h3>
     <p>No. magpie reads the files each time and touches only the keys it sets, so your other settings and comments stay. Providers brought over with <span class="ui">Import…</span> are copies: later changes in the agent’s settings aren’t copied again.</p>
     <h3>Installing or updating behind a firewall, or without access to GitHub?</h3>
-    <p>Give the installer and <code>magpie update</code> a proxy: <code>curl -fsSL https://usemagpie.ai/install.sh | sh -s -- --proxy http://127.0.0.1:7890</code>, or <code>magpie update --proxy socks5://127.0.0.1:1080</code> (http, https, socks5 and socks5h; <code>HTTPS_PROXY</code> and <code>ALL_PROXY</code> are honoured too). <code>--mirror &lt;prefix&gt;</code> fetches the release file from a GitHub download mirror you choose, as <code>&lt;prefix&gt;https://github.com/…</code>; <code>magpie update mirror &lt;prefix&gt;</code> keeps it for every update, the app’s too, and <code>magpie update mirror off</code> removes it. No mirror is used unless you give one, and the file’s SHA-256 still comes from usemagpie.ai, never from the mirror: a file the mirror changed is refused. The app’s own updates go through <span class="ui">Settings</span> → <span class="ui">Proxy</span>.</p>
+    <p>Give the installer and <code>magpie update</code> a proxy: <code>curl -fsSL https://usemagpie.ai/install.sh | sh -s -- --proxy http://127.0.0.1:7890</code>, or <code>magpie update --proxy socks5://127.0.0.1:1080</code> (http, https, socks5 and socks5h; <code>HTTPS_PROXY</code> and <code>ALL_PROXY</code> are honoured too). Release files come from usemagpie.ai (Cloudflare R2), and from github.com when that fails. <code>--mirror &lt;prefix&gt;</code> fetches the release file from a GitHub download mirror you choose, as <code>&lt;prefix&gt;https://github.com/…</code>, when the site’s copy fails; <code>magpie update mirror &lt;prefix&gt;</code> keeps it for every update, the app’s too, and <code>magpie update mirror off</code> removes it. No mirror is used unless you give one, and the file’s SHA-256 still comes from usemagpie.ai, never from the mirror: a file the mirror changed is refused. The app’s own updates go through <span class="ui">Settings</span> → <span class="ui">Proxy</span>.</p>
+
+    <h3 id="verify-download"><a class="anchor" href="#verify-download">How do I check that a download was built by GitHub Actions?</a></h3>
+    <p>Every file on <a href="https://github.com/yetone/magpie-releases/releases">yetone/magpie-releases</a> carries a SLSA build provenance attestation, signed through Sigstore with the GitHub Actions run’s own identity and no key of ours. With the <a href="https://cli.github.com">GitHub CLI</a>: <code>gh attestation verify magpie-darwin-arm64.dmg -R yetone/magpie-releases</code>. It shows the workflow and run that built the file, and fails for a file that run didn’t produce. The same command works on the copy in yetone/magpie’s Releases. From v0.1.3891 on. The attestation names the magpie-releases repo and its commit, not the source commit in yetone/magpie. The app’s own updates check both: the release’s SHA-256 list carries an ed25519 signature, checked against a key built into magpie (offline, and also for a file from usemagpie.ai’s mirror), and from v0.1.3891 on the app also checks the file’s attestation and refuses a file that has none or whose attestation is not from this repo’s release workflow. A file downloaded from usemagpie.ai has its attestation taken from usemagpie.ai too (the <code>attestations.jsonl</code> below), and from GitHub when the mirror doesn’t have it; wherever it comes from, it is checked the same way, against Sigstore’s root built into magpie, so the mirror only carries it. When it can’t be had, the update goes on on the signature alone and the log says so. The same attestations are kept on usemagpie.ai, beside the mirrored files, so they are there when GitHub is not: <code>https://usemagpie.ai/files/v&lt;version&gt;/attestations.jsonl</code> holds one bundle per line for every file of the release. Download it with the file and check offline of the attestation API: <code>gh attestation verify magpie-darwin-arm64.dmg -R yetone/magpie-releases --bundle attestations.jsonl</code> (the bundles are Sigstore bundles; a release that is not among the newest on the mirror falls back to the command above).</p>
 
     <h3 id="linux-build"><a class="anchor" href="#linux-build">Which build does the installer put on Linux?</a></h3>
     <p>The desktop app (window, tray icon and a menu entry) when GTK 3 and WebKitGTK 4.1 are installed. On a computer with a desktop but without them, the installer installs WebKitGTK 4.1 with your package manager (apt, dnf, pacman or zypper), through <code>sudo</code>, which asks for your password, and then the app; it says what it installs before it asks. Run without a terminal (CI, a Dockerfile), without <code>sudo</code>, on another distribution or when that install fails, it installs the terminal build (<code>magpie tui</code>, <code>magpie web</code> and the CLI) and ends with the command that installs them, such as <code>sudo apt install libwebkit2gtk-4.1-0</code> on Debian and Ubuntu or <code>sudo dnf install webkit2gtk4.1</code> on Fedora; run the installer again afterwards for the app. A desktop counts whether you run it there or over ssh: a graphical session, your graphical login, or a desktop installed to log in to. A server without one gets the terminal build. To choose yourself, add <code>--gui</code> (the app even when its libraries can't be installed now) or <code>--tui</code> (the terminal build, and no package installed): <code>curl -fsSL https://usemagpie.ai/install.sh | sh -s -- --tui</code>.</p>
@@ -302,13 +370,14 @@ magpie claude group/opus-anywhere    <span class="c"># use it</span></pre>
 
     <h3 id="data-folder"><a class="anchor" href="#data-folder">Can magpie keep its files on another disk, so reinstalling the system doesn’t lose them?</a></h3>
     <p>Installed, magpie keeps its settings, providers, usage and library in <code>~/.config/magpie</code> (<code>C:\Users\&lt;you&gt;\.config\magpie</code> on Windows). It backs them up by itself once a day, into <code>auto-backups</code> in that same folder, so a reinstalled system loses the backups too; <span class="ui">Settings</span> → <span class="ui">Sync and backup</span> says so under <span class="ui">Backup folder</span>. Click <span class="ui">Change…</span> there and pick a folder on another disk (<code>D:\magpie-backups</code>) or one a cloud drive syncs. After a reinstall, install magpie, pick the same folder there and <span class="ui">Restore…</span> the newest version. Backups hold no API keys; <span class="ui">Sign-ins in backups</span> adds subscription accounts and plugin sign-ins, sealed with a passphrase. To carry the keys too, sync to a WebDAV folder, an S3 bucket or a GitHub repository, sealed with a passphrase, in the same place.</p>
+    <p>To keep magpie’s own files on that disk (an external SSD, say), click <span class="ui">Move…</span> beside <span class="ui">Data folder</span> in the same place and pick a folder there. magpie restarts, moves its files and cache into a folder named <code>magpie</code> inside it, and leaves a link where they were, so nothing else changes. Keep the disk connected: without it magpie won’t open until it is back. <span class="ui">Move back</span> brings them home. <code>magpie data move &lt;folder&gt;</code> does the same from a terminal.</p>
     <p>To keep everything on that disk, run magpie portable: put <code>magpie.exe</code> in a folder there with an empty folder named <code>data</code> beside it (<code>D:\magpie\magpie.exe</code> and <code>D:\magpie\data</code>). magpie then keeps everything in <code>data</code>, its caches and log too, and writes nothing of its own to your user folder; <span class="ui">Settings</span> → <span class="ui">About</span> → <span class="ui">Config folder</span> says Portable. Open it, and restore a backup into it as above. After a reinstall, open <code>D:\magpie\magpie.exe</code> again. The agents’ own configs (<code>~/.claude</code>, <code>~/.codex</code>…) stay where each agent reads them.</p>
 
     <h3 id="log">Where is magpie’s log?</h3>
     <p>The app (its window, the menu bar or tray icon and the panel, however it was opened) writes <code>app.log</code>: <code>~/Library/Logs/magpie/app.log</code> on macOS, <code>%LOCALAPPDATA%\magpie\logs\app.log</code> on Windows, <code>~/.local/state/magpie/app.log</code> on Linux (<code>$XDG_STATE_HOME/magpie</code> when that is set), and <code>logs</code> in a portable magpie’s data folder. <span class="ui">Settings</span> → <span class="ui">About</span> → <span class="ui">Log</span> has its path and an <span class="ui">Open</span> that shows its folder; <code>magpie log</code> prints it, and <code>magpie log -f</code> follows it. At 5 MiB it becomes <code>app.old.log</code> beside it, so two files at most are kept. It holds what magpie did and the errors it met (a provider refusing a request, a retry, a plugin that failed to start), not your keys, prompts or replies; what looks like a key or token is masked anyway. <code>magpie serve</code> run as a service logs elsewhere: <code>~/Library/Logs/magpie/serve.log</code> on macOS, <code>journalctl --user -u magpie</code> on Linux; <code>magpie log</code> names it too.</p>
 
     <h3 id="privacy">What does magpie send about me?</h3>
-    <p>Your prompts, replies, keys and accounts go only to the providers you use; magpie has no server of its own in the path. Once a day a released magpie tells us it is in use, so we know how many people use it and what to look after first: a random id made up on your computer, magpie’s version and your system, and which agents, providers and models it is used with, by magpie’s own ids (<code>claude</code>, <code>deepseek</code>, <code>deepseek/deepseek-v4</code>) with how many of each. A provider you added yourself, and a model on it, is only <code>custom</code>. For each partner listed first in the add sheet, how many times a day it was shown, opened and added from goes with them, as counts only. No names, base URLs, accounts, keys, prompts or usage are sent. <span class="ui">Settings</span> → <span class="ui">Privacy</span> → <span class="ui">Share the agents, providers and models I use</span> leaves out the agents, providers and models, and the partner counts; <span class="ui">Count me as a user</span>, <code>DO_NOT_TRACK=1</code> or <code>MAGPIE_NO_STATS=1</code> turns it all off. Builds from source never send it. A partner's website and key-page links go through <code>usemagpie.ai/go/…</code>, which counts the click (the partner, which link, and a country) before sending you on, and usemagpie.ai counts how many times the partner list is fetched. The server sees these whatever the settings say, as any website sees its visits; no id, address or account is kept with them. Icons named by a plugin, an import link or the library are fetched through <code>usemagpie.ai/api/icon</code>, so their hosts see Cloudflare's address, not yours; the server only passes the picture on, and counts and keeps nothing. The <a href="/docs/privacy">Privacy page</a> lists everything magpie sends by itself, with an example of the daily count, the files it keeps and every switch.</p>
+    <p>Your prompts, replies, keys and accounts go only to the providers you use; magpie has no server of its own in the path. Once a day a released magpie tells us it is in use, so we know how many people use it and what to look after first: a random id made up on your computer, magpie’s version and your system, and which agents, providers and models it is used with, by magpie’s own ids (<code>claude</code>, <code>deepseek</code>, <code>deepseek/deepseek-v4</code>) with how many of each. A provider you added yourself, and a model on it, is only <code>custom</code>. For each partner listed first in the add sheet, how many times a day it was shown, opened and added from goes with them, as counts only. No names, base URLs, accounts, keys, prompts or usage are sent. <span class="ui">Settings</span> → <span class="ui">Privacy</span> → <span class="ui">Share the agents, providers, models and plugins I use</span> leaves out the agents, providers and models, the partner counts and which of Discover’s plugins are installed and which of the Library market’s MCP servers are used (for their counts of who uses and likes each); <span class="ui">Count me as a user</span>, <code>DO_NOT_TRACK=1</code> or <code>MAGPIE_NO_STATS=1</code> turns it all off. Builds from source never send it. A partner's website and key-page links go through <code>usemagpie.ai/go/…</code>, which counts the click (the partner, which link, and a country) before sending you on, and usemagpie.ai counts how many times the partner list is fetched. The server sees these whatever the settings say, as any website sees its visits; no id, address or account is kept with them. Icons named by a plugin, an import link or the library are fetched through <code>usemagpie.ai/api/icon</code>, so their hosts see Cloudflare's address, not yours; the server only passes the picture on, and counts and keeps nothing. The <a href="/docs/privacy">Privacy page</a> lists everything magpie sends by itself, with an example of the daily count, the files it keeps and every switch.</p>
 
     <h3 id="proxy-loopback">The agent gets 502 or can’t connect, and nothing shows in magpie’s Routing tab?</h3>
     <p>A proxy app (Surge, Clash, mihomo and the like, with system proxy, TUN or enhanced mode on) has taken the agent’s request to <code>http://127.0.0.1:3425</code> and sent it somewhere else, so it never reaches magpie. The bypass list (<code>skip-proxy</code>, “bypass”) isn’t always enough: some agents, Codex among them, send it through the proxy anyway. Add rules that send the local addresses direct, ahead of your other rules:</p>
@@ -350,7 +419,7 @@ IP-CIDR6,::1/128,DIRECT,no-resolve</pre>
     </ol>
     <p>The model id is magpie’s (<code>magpie models</code>). Sharing lets other computers on your network in with a gateway key; see <a href="/docs/remote#share">Remote magpie</a>.</p>
 
-    <p style="margin-top:48px">Stuck, or have a setup worth sharing? Ask on <a href="https://discord.gg/vGSnD3ZKQF">Discord</a>. Vendors who want to hand their users a ready-made provider: see <a href="/docs/import">Add to magpie</a>.</p>
+    <p style="margin-top:48px">An error from the gateway? See <a href="/docs/troubleshooting">Fixing common errors</a>. Stuck, or have a setup worth sharing? Ask on <a href="https://discord.gg/vGSnD3ZKQF">Discord</a>. Chatting in Cherry Studio? See <a href="/docs/cherry-studio">Every model in Cherry Studio</a>. Vendors who want to hand their users a ready-made provider: see <a href="/docs/import">Add to magpie</a>.</p>
   </article>
 </main>
 
@@ -366,6 +435,13 @@ IP-CIDR6,::1/128,DIRECT,no-resolve</pre>
     <a href="/docs/masking">Privacy masking</a>
     <a href="/docs/mcp-router">MCP router</a>
     <a href="/docs/library">Library</a>
+    <a href="/docs/claude-code-models">Models in Claude Code</a>
+    <a href="/docs/codex-models">Models in Codex</a>
+    <a href="/docs/gemini-cli-models">Models in Gemini CLI</a>
+    <a href="/docs/subscriptions">Subscriptions in any agent</a>
+    <a href="/docs/local-models">Local models</a>
+    <a href="/docs/opencode-models">Models in OpenCode</a>
+    <a href="/docs/alternatives">magpie vs CC Switch vs CCR</a>
     <a href="/docs/import">Add to magpie</a>
     <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>

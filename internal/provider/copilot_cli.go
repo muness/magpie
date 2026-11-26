@@ -66,11 +66,22 @@ var CopilotWSLDirs func() []string
 // read: its files are read over WSL's file share, slower than a disk's.
 var copilotWSLAge = 20 * time.Second
 
+// copilotWSLWait is how long a request waits for a distro's sign-in to
+// be read the first time, from when that read started (a read again
+// answers the last one meanwhile): one read at a time, outside
+// copilotWSL's lock, and a read WSL holds up answers the sign-in read
+// before. Held under the lock, a hung WSL queued every request behind
+// the first, and the gateway sent 504s after 30s (vsoullai on X, #6167).
+// A var for tests.
+var copilotWSLWait = 2 * time.Second
+
 var copilotWSL struct {
 	sync.Mutex
-	at  time.Time
-	app copilotApp
-	ok  bool
+	at    time.Time
+	app   copilotApp
+	ok    bool
+	done  chan struct{} // closed when the read in flight ends
+	start time.Time     // when it started
 }
 
 // copilotCLILogin is the account the Copilot CLI is signed in to, with its
@@ -90,18 +101,46 @@ func copilotCLILogin() (copilotApp, bool) {
 	}
 	c := &copilotWSL
 	c.Lock()
-	defer c.Unlock()
 	if !c.at.IsZero() && time.Since(c.at) < copilotWSLAge {
+		defer c.Unlock()
 		return c.app, c.ok
 	}
-	c.app, c.ok = copilotApp{}, false
-	for _, dir := range CopilotWSLDirs() {
-		if app, ok := copilotCLILoginIn(dir, nil); ok {
-			c.app, c.ok = app, true
-			break
-		}
+	if c.done == nil {
+		done, dirs := make(chan struct{}), CopilotWSLDirs
+		c.done, c.start = done, time.Now()
+		go func() {
+			var found copilotApp
+			ok := false
+			for _, dir := range dirs() {
+				if app, in := copilotCLILoginIn(dir, nil); in {
+					found, ok = app, true
+					break
+				}
+			}
+			c.Lock()
+			c.app, c.ok, c.at, c.done = found, ok, time.Now(), nil
+			c.Unlock()
+			close(done)
+		}()
 	}
-	c.at = time.Now()
+	if !c.at.IsZero() {
+		// what was read before is answered while it is read again: each
+		// read waiting for it held a page's first ask (the Sessions page's,
+		// on a slow WSL) copilotWSLWait every copilotWSLAge (shangyuan0818
+		// on X)
+		defer c.Unlock()
+		return c.app, c.ok
+	}
+	done, start := c.done, c.start
+	c.Unlock()
+	t := time.NewTimer(time.Until(start.Add(copilotWSLWait)))
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+	}
+	c.Lock()
+	defer c.Unlock()
 	return c.app, c.ok
 }
 
@@ -226,7 +265,7 @@ func copilotDirect(ctx context.Context, app copilotApp) (copilotSession, error) 
 	}
 	req.Header.Set("Authorization", "token "+github)
 	req.Header.Set("Accept", "application/json")
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return copilotSession{}, errors.New("Copilot sign-in: " + err.Error())
 	}

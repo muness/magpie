@@ -182,12 +182,17 @@ func TestWSLAgentsElsewhere(t *testing.T) {
 // whose files were opened.
 func fakeWSL(t *testing.T, installed, running string, probes, roots map[string]string) (asked, opened *[]string) {
 	t.Helper()
+	// the fake stands in for wsl.exe, so there is WSL to look in: the
+	// stand-in and classifier paths of a request are gated on wslLooks
+	// (#4872) and must run here as they do on Windows
+	on := wslOn
+	wslOn = true
 	run, root := wslRun, wslRoot
 	reset := func() {
 		wsl.seen, wsl.at, wsl.runAt, wsl.names, wsl.running, wsl.dirty = nil, time.Time{}, time.Time{}, nil, nil, false
 		wsl.runOK = false
 	}
-	t.Cleanup(func() { wslRun, wslRoot = run, root; reset() })
+	t.Cleanup(func() { wslRun, wslRoot, wslOn = run, root, on; reset() })
 	reset()
 	asked, opened = &[]string{}, &[]string{}
 	wslRun = func(_ time.Duration, args ...string) ([]byte, error) {
@@ -322,7 +327,7 @@ func TestWSLListFails(t *testing.T) {
 // requests it made. None of them opens the stopped distro, which would
 // start it: its fields read as last seen, and the next look neither probes
 // #2341: wsl.exe failing to say which distros run (a hung WSL times out
-// after 10s, under wsl's lock) is asked again only after
+// after 10s) is asked again only after
 // wslRunningFailedAge, not every wslRunningAge; an answer still lasts only
 // wslRunningAge.
 func TestWSLRunningFailedKept(t *testing.T) {

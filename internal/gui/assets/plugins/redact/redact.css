@@ -1,19 +1,23 @@
 /* Insights › Masking (page.js): what masking kept from vendors, in a
    short band over the requests it changed, and one request opened. Flat
-   only: hairlines, one thin number, the accent kept for what left this
+   only: hairlines, one number, the accent kept for what left this
    computer as placeholders */
 #view-masking { container-type: inline-size; }
 #view-masking .grow { flex: 1; }
 .msk-card { position: relative; padding: 16px 20px 14px; border-radius: 14px; border: 1px solid var(--line); background: var(--card); }
 .msk-card[hidden], .msk-list[hidden], .msk-one[hidden] { display: none; }
-.msk-head { display: flex; align-items: flex-start; gap: 12px; }
-.msk-title { min-width: 0; }
+.msk-head { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px 12px; }
+/* its buttons go under the words before they squeeze them */
+.msk-title { flex: 1 1 16em; min-width: 0; }
 .msk-title h2 { margin: 0; font-size: 13px; font-weight: 600; color: var(--fg); }
 .msk-sub { display: block; margin-top: 3px; font-size: 12px; line-height: 1.4; color: var(--muted); }
 .msk-band { display: grid; grid-template-columns: minmax(0, 240px) minmax(0, 1fr); gap: 36px; align-items: center; margin-top: 12px; }
 .msk-sk-num { height: 92px; border-radius: 10px; }
 .msk-sk-flow { height: 102px; border-radius: 10px; }
-.msk-num { font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, system-ui, sans-serif; font-size: 52px; font-weight: 100; line-height: .9; letter-spacing: -.045em; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--fg); }
+/* the interface's font at the weight and tracking of the app's other big
+   numbers (.si-pct b, .kpi b), not a thin display face (CHENGJIAHEGOXIS on
+   X: 「瘦长的比较别扭」) */
+.msk-num { font-size: 52px; font-weight: 600; line-height: .9; letter-spacing: -.035em; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--fg); }
 .msk-unit { margin-top: 6px; font-size: 12.5px; color: var(--fg-2); }
 .msk-stats { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; font-size: 11.5px; color: var(--muted); }
 .msk-stats b { margin-right: 4px; font-weight: 600; color: var(--fg); font-variant-numeric: tabular-nums; }
@@ -71,6 +75,8 @@
 .mo-dot.out { fill: var(--accent); }
 .mo-cap { margin-top: 8px; text-align: center; font-size: 11px; letter-spacing: .12em; color: var(--muted); }
 .mo-node.on { background: var(--accent-soft); }
+.msk-checked { display: flex; flex-wrap: wrap; gap: 2px 6px; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.msk-checked .mo-node { max-width: 100%; }
 .mo-node .nm { line-height: 16px; }
 .mo-node .ct { line-height: 13px; }
 .msk-hub { position: absolute; left: 50%; top: 50%; width: 30px; height: 30px; margin: -15px 0 0 -15px; display: flex; align-items: center; justify-content: center; border-radius: 50%; background: var(--card); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent), 0 0 0 5px var(--card); color: var(--accent); }
@@ -86,12 +92,11 @@
 
 /* the list: a bar, facets that narrow it, a day at a time */
 .msk-list { margin-top: 14px; }
-.msk-prefs { margin-top: 14px; border-radius: 14px; }
 .msk-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .msk-live { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--muted); }
 .msk-live i { width: 6px; height: 6px; border-radius: 50%; background: var(--green, var(--accent)); animation: msk-live 2.4s ease-in-out; }
 @keyframes msk-live { 50% { opacity: .35; } }
-.msk-facets { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+.msk-facets { display: flex; flex-wrap: wrap; gap: 6px; margin: var(--find-gap) 0 4px; }
 .msk-facet { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px; border: 1px solid var(--line); border-radius: 99px; background: var(--card); color: var(--fg-2); font: inherit; font-size: 12px; cursor: default; white-space: nowrap; }
 .msk-facet:hover { background: var(--pill); }
 .msk-facet[aria-pressed="true"] { border-color: transparent; background: var(--accent-soft); color: var(--accent); }
@@ -127,6 +132,26 @@
 .msk-chev { flex: none; display: inline-flex; color: var(--faint); }
 .msk-none { padding: 26px 12px; text-align: center; font-size: 12.5px; color: var(--muted); }
 .msk-none.err { color: var(--red); }
+/* the search: a field at the bar's end, across it when the window is
+   narrow; a find's kind is inked, and what it couldn't look at is said
+   under the list */
+.msk-q { flex: 0 1 200px; width: auto; min-width: 120px; }
+@media (max-width: 560px) { .msk-q { flex: 1 1 100%; } }
+/* on a phone's page, where a search takes a line of its own, an empty
+   one waits as a magnifier at the bar's end, so the requests still start
+   where they did; tapped or holding a word, it is the line */
+@media (max-width: 760px), (pointer: coarse) and (max-width: 1024px) {
+  body.web .msk-bar > .msk-q:placeholder-shown:not(:focus) {
+    order: 0; flex: 0 0 30px; width: 30px; min-width: 0; height: 30px; min-height: 0; padding: 0; cursor: pointer;
+    background: var(--card) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='7' cy='7' r='4.5' fill='none' stroke='%238e8e93' stroke-width='1.6'/%3E%3Cpath d='M10.4 10.4 14 14' stroke='%238e8e93' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E") center / 14px no-repeat;
+  }
+  body.web .msk-bar > .msk-q:placeholder-shown:not(:focus)::placeholder { color: transparent; }
+}
+.msk-kind.hit { border-color: var(--accent-soft); background: var(--accent-soft); color: var(--accent); }
+.msk-kind.hit b { color: inherit; }
+.msk-qnone > div:first-child { overflow-wrap: anywhere; }
+.msk-qsub { margin-top: 4px; font-size: 11.5px; }
+.msk-qnote { margin: 10px 2px 0; font-size: 11.5px; color: var(--muted); }
 .msk-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 12px; padding: 0 2px; font-size: 11.5px; color: var(--muted); }
 .msk-foot > span { flex: 1; min-width: 0; }
 .msk-vhead { display: flex; align-items: baseline; gap: 10px; margin: 12px 2px 5px; font-size: 11.5px; color: var(--muted); }
@@ -198,6 +223,7 @@ body.window .msk-onebar::before { inset: -6px calc(var(--bar, 0px) - 16px) -6px 
 .msk-gap { color: var(--faint); }
 .msk-ph, .msk-orig { --k: var(--accent); padding: 1px 4px; border-radius: 4px; font: inherit; color: var(--fg); background: color-mix(in srgb, var(--k) 16%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--k) 30%, transparent); outline: none; cursor: default; transition: opacity .15s, box-shadow .15s; }
 .msk-ph:hover, .msk-ph:focus-visible, .msk-orig:hover, .msk-orig:focus-visible { background: color-mix(in srgb, var(--k) 26%, transparent); }
+.msk-ph.acts, .msk-orig.acts { cursor: pointer; }
 .msk-orig { background: transparent; box-shadow: inset 0 -1.5px 0 var(--k); border-radius: 2px; }
 .msk-orig.gone { color: var(--faint); }
 .msk-one.picking mark[data-p]:not(.lit) { opacity: .4; }
@@ -383,3 +409,17 @@ body.window .msk-onebar::before { inset: -6px calc(var(--bar, 0px) - 16px) -6px 
 .word-import-bar { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; min-width: 0; }
 .word-import-bar .grow { flex: 1; }
 .word-import-count { min-width: 0; }
+/* Import… and Copy on the Masking rules row (ruleBulk in settings.js):
+   beside its words, the fields and the box under them across the row */
+.row.pref.rule-row.rule-bulk .who { flex: 1 1 0; }
+.rule-tools { display: flex; align-items: center; gap: 2px; flex: none; }
+/* a button taller than the name (a phone's 44px) reaches over the row's
+   padding, so the row is no taller than before */
+.rule-tools .text { margin-block: -12px; }
+.rule-import { flex: 1 1 100%; }
+.rule-import-list { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-size: 12px; }
+.rule-import-line { display: flex; gap: 8px; min-width: 0; }
+.rule-import-line b { flex: none; font-weight: 600; color: var(--fg-2); }
+.rule-import-line code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.word-import-count.err { color: var(--red); overflow-wrap: anywhere; }
+.rule-import .word-import-bar .segs { margin-left: 0; }

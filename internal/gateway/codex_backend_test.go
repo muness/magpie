@@ -39,11 +39,17 @@ func chatgpt(t *testing.T, h http.HandlerFunc) *httptest.Server {
 func codexPost(t *testing.T, body string) (int, string) {
 	t.Helper()
 	rec := httptest.NewRecorder()
+	codexServe(rec, body)
+	return rec.Code, rec.Body.String()
+}
+
+// codexServe sends body to a new Server's Codex path as Codex does, its
+// reply to w.
+func codexServe(w http.ResponseWriter, body string) {
 	req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer chatgpt-token")
 	req.Header.Set("chatgpt-account-id", "acct-1")
-	New().Handler().ServeHTTP(rec, req)
-	return rec.Code, rec.Body.String()
+	New().Handler().ServeHTTP(w, req)
 }
 
 // One of Codex's own models goes on to the ChatGPT backend as it came, the
@@ -1354,8 +1360,12 @@ func TestCodexOwnSignInTellsWhereItsTimeWent(t *testing.T) {
 	if n == nil {
 		t.Fatal("no timing for a turn on Codex's own sign-in")
 	}
+	// The backend starts its hold once it has read the body, which can be
+	// before the client's WroteRequest fires: the hold is in Send and Wait
+	// together, and most of it in Wait (on a busy Linux box, Send 4 and
+	// Wait 196.9 for a 200ms hold).
 	holdMs := float64(hold.Milliseconds())
-	if n.Asks != 1 || n.Wait < holdMs-1 || n.Head < n.Wait {
+	if n.Asks != 1 || n.Send+n.Wait < holdMs-1 || n.Wait < holdMs/2 || n.Head < n.Wait {
 		t.Fatalf("timing %+v for a %v hold", *n, hold)
 	}
 }
@@ -1386,7 +1396,15 @@ func TestCodexOwnSignInKeepsItsMaskingTime(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", CodexPath+"/responses", strings.NewReader(`{"model":"gpt-5.5","stream":true,"input":"hi"}`))
 	req.Header.Set("Authorization", "Bearer chatgpt-token")
+	req.Header.Set("User-Agent", "codex_cli_rs/0.140.0")
+	who := agentOf(req) // as its record would name it
+	looked := checkedOf(who).Looked
 	s.Handler().ServeHTTP(rec, req)
+	// and is counted as looked over for the Masking page, nothing masked
+	// in it (eiyuuzaki2333 on X)
+	if c := checkedOf(who); c.Looked != looked+1 || c.Whole != 0 {
+		t.Fatalf("Codex's turn counted %+v, %d before", c, looked)
+	}
 	st := s.Trace(t.Context(), 0, 0)
 	if rec.Code != 200 || len(st.Routes) != 1 {
 		t.Fatalf("%d %+v", rec.Code, st.Routes)
@@ -1397,5 +1415,66 @@ func TestCodexOwnSignInKeepsItsMaskingTime(t *testing.T) {
 	recs := usage.Load(time.Time{})
 	if len(recs) == 0 || recs[len(recs)-1].Masking != st.Routes[0].Masking {
 		t.Fatalf("usage records %+v, route's masking %d", recs, st.Routes[0].Masking)
+	}
+}
+
+// Show Codex's own models turned off (iiiiiimone on X: with the Codex
+// subscription provider off, the switch left Codex's own models in its
+// picker) leaves them out of the list the gateway hands Codex, so the picker
+// offers magpie's alone. The model Codex is set to and a hidden job stay.
+func TestCodexListWithOwnModelsOff(t *testing.T) {
+	codexSignedIn(t)
+	if err := provider.Save(provider.Provider{ID: "codex", Off: true}); err != nil {
+		t.Fatal(err)
+	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		io.WriteString(w, `{"models":[{"slug":"gpt-6-sol","priority":1,"visibility":"list"},{"slug":"gpt-5.5","priority":2,"visibility":"list"},{"slug":"codex-auto-review","priority":3,"visibility":"hide"}]}`)
+	}))
+	defer up.Close()
+	was := provider.CodexBase
+	provider.CodexBase = up.URL + "/backend-api/codex"
+	defer func() { provider.CodexBase = was }()
+	list := func() (map[string]bool, string) {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", CodexPath+"/models", nil)
+		req.Header.Set("Authorization", "Bearer chatgpt-token")
+		New().Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("%d %s", rec.Code, rec.Body)
+		}
+		var got struct {
+			Models []map[string]any `json:"models"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &got)
+		out := map[string]bool{}
+		for _, m := range got.Models {
+			slug, _ := m["slug"].(string)
+			out[slug] = true
+		}
+		return out, rec.Header().Get("ETag")
+	}
+	got, before := list()
+	if !got["gpt-6-sol"] || !got["gpt-5.5"] || !got["codex-auto-review"] {
+		t.Fatalf("listed: %v", got)
+	}
+	if err := provider.SetOwnModelsHidden("codex", true); err != nil {
+		t.Fatal(err)
+	}
+	got, after := list()
+	if got["gpt-6-sol"] || got["gpt-5.5"] || !got["codex-auto-review"] || after == before {
+		t.Errorf("own models off: %v, ETag %q then %q", got, before, after)
+	}
+	wasNow := CodexModelNow
+	CodexModelNow = func() string { return "gpt-5.5" }
+	defer func() { CodexModelNow = wasNow }()
+	if got, _ = list(); got["gpt-6-sol"] || !got["gpt-5.5"] {
+		t.Errorf("set to gpt-5.5: %v", got)
+	}
+	if err := provider.SetOwnModelsHidden("codex", false); err != nil {
+		t.Fatal(err)
+	}
+	if got, back := list(); !got["gpt-6-sol"] || !got["gpt-5.5"] || back != before {
+		t.Errorf("switched on again: %v, ETag %q, was %q", got, back, before)
 	}
 }

@@ -41,10 +41,8 @@ var quitAgents = func() []quitAgentJSON {
 // wiredAgents is the agents of as with magpie in their config.
 func wiredAgents(as []*agent.Agent) []quitAgentJSON {
 	out := []quitAgentJSON{}
-	for _, a := range as {
-		if a.Wired() {
-			out = append(out, quitAgentJSON{ID: a.ID, Name: a.Name, Icon: a.Icon})
-		}
+	for _, a := range wiredOf(as) {
+		out = append(out, quitAgentJSON{ID: a.ID, Name: a.Name, Icon: a.Icon})
 	}
 	return out
 }
@@ -74,7 +72,7 @@ func quitNow(asked int64, now time.Time, wired int) bool {
 // user said not to ask (settings.QuitNoAsk, the question's "Don't ask
 // again"), or quitNow. A settings file that can't be read asks.
 func quitAtOnce(asked int64, now time.Time) bool {
-	if s, err := settings.LoadChecked(); err == nil && s.QuitNoAsk {
+	if s, err := settings.LoadChecked(); err == nil && (s.QuitNoAsk || s.RestoreOnQuit) {
 		return true
 	}
 	return quitNow(asked, now, len(quitAgents()))

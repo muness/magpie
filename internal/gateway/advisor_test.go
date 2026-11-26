@@ -28,7 +28,8 @@ func advisorTurn(model, advisor string) string {
 // turned away whole and the advisor never ran (JackChou on Discord). The
 // advisor's model now goes as the upstream's own name for it when it is
 // the same provider's Claude model; one the upstream can't run (another
-// provider's, a vendor's model asked) is left out and the turn still
+// provider's, a vendor's model asked) is run by magpie (advisor_serve.go),
+// and one magpie doesn't serve either is left out and the turn still
 // answered.
 func TestAdvisorModelAsTheUpstreamNamesIt(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -38,6 +39,7 @@ func TestAdvisorModelAsTheUpstreamNamesIt(t *testing.T) {
 		{ID: "relay", Name: "Relay", Key: "k", Anthropic: url, Models: []string{"claude-opus-5-5", "claude-sonnet-5-5"}},
 		{ID: "other", Name: "Other", Key: "k", Anthropic: url, Models: []string{"claude-opus-5-5"}},
 		{ID: "ds", Name: "DeepSeek", Key: "k", Anthropic: url, Models: []string{"deepseek-v4.1-flash"}},
+		{ID: "dot", Name: "Dotted", Key: "k", Anthropic: url, Models: []string{"claude-opus-5.5", "claude-fable-5.2"}},
 	} {
 		if err := provider.Save(p); err != nil {
 			t.Fatal(err)
@@ -53,13 +55,19 @@ func TestAdvisorModelAsTheUpstreamNamesIt(t *testing.T) {
 		return out
 	}
 	for _, c := range []struct {
-		name, model, advisor, want string // want "" = left out
+		name, model, advisor, want string // want "" = not sent upstream
+		served                     bool   // run by magpie
 	}{
-		{"same provider", "relay/claude-sonnet-5-5", "relay/claude-opus-5-5", "claude-opus-5-5"},
-		{"1M mark", "relay/claude-sonnet-5-5", "relay/claude-opus-5-5[1m]", "claude-opus-5-5"},
-		{"Claude's own id", "relay/claude-sonnet-5-5", "claude-opus-5-5", "claude-opus-5-5"},
-		{"another provider", "relay/claude-sonnet-5-5", "other/claude-opus-5-5", ""},
-		{"a vendor's model", "ds/deepseek-v4.1-flash", "relay/claude-opus-5-5", ""},
+		{"same provider", "relay/claude-sonnet-5-5", "relay/claude-opus-5-5", "claude-opus-5-5", false},
+		{"1M mark", "relay/claude-sonnet-5-5", "relay/claude-opus-5-5[1m]", "claude-opus-5-5", false},
+		{"Claude's own id", "relay/claude-sonnet-5-5", "claude-opus-5-5", "claude-opus-5-5", false},
+		{"another provider", "relay/claude-sonnet-5-5", "other/claude-opus-5-5", "", true},
+		{"a vendor's model", "ds/deepseek-v4.1-flash", "relay/claude-opus-5-5", "", true},
+		{"a model magpie doesn't serve", "ds/deepseek-v4.1-flash", "nobody/claude-opus-5-5", "", false},
+		{"2M mark", "relay/claude-sonnet-5-5", "relay/claude-opus-5-5[2m]", "claude-opus-5-5", false},
+		// Claude Code is given a dotted id with dashes, and names the
+		// advisor so (Refeccd on Discord)
+		{"a dotted id as Claude Code names it", "dot/claude-opus-5-5", "dot/claude-fable-5-2", "claude-fable-5.2", false},
 	} {
 		claudeCodeSends(t, advisorTurn(c.model, c.advisor))
 		b := u.last(t)
@@ -70,6 +78,14 @@ func TestAdvisorModelAsTheUpstreamNamesIt(t *testing.T) {
 		}
 		if !strings.Contains(b, `"name":"Read"`) {
 			t.Errorf("%s: the agent's own tool lost: %s", c.name, b)
+		}
+		if c.served {
+			// offered as the model's own tool, Claude Code's instructions
+			// for it as written
+			if !strings.Contains(b, `"name":"advisor"`) || !strings.Contains(b, "You have access to an `advisor` tool") || strings.Contains(b, advisorGone) {
+				t.Errorf("%s: advisor not offered as magpie's: %s", c.name, b)
+			}
+			continue
 		}
 		advisorSaid(t, c.name, b, c.want != "")
 	}

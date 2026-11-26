@@ -41,6 +41,9 @@ func assetsDir() string {
 
 func staticFS() fs.FS { return os.DirFS(assetsDir()) }
 
+// staticFixed: the UI's files are read from disk, and change under it.
+const staticFixed = false
+
 // stamp is the newest modification time under assets, as a string.
 func stamp() string {
 	var newest time.Time
@@ -245,6 +248,9 @@ func (c remoteWindows) TintTitleBar(rgba [4]uint8, dark bool) bool {
 func (c remoteWindows) SetTextSize(percent int) {
 	c.post("textsize", url.Values{"arg": {strconv.Itoa(percent)}})
 }
+func (c remoteWindows) SetOnTop(on bool) {
+	c.post("ontop", url.Values{"arg": {strconv.FormatBool(on)}})
+}
 
 // backendClient waits out a backend's restart: a request made while the old
 // one is gone connects to the new one once it listens.
@@ -315,6 +321,8 @@ func devShell(h *host) http.Handler {
 			if n, g, ok := parseFit(q); ok {
 				h.FitPanel(n, g)
 			}
+		case "ontop":
+			h.SetOnTop(arg == "true")
 		case "textsize":
 			if n, err := strconv.Atoi(arg); err == nil {
 				h.SetTextSize(n)

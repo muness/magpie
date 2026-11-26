@@ -12,13 +12,14 @@ func init() {
 	pluginrt.Register(pluginrt.Manifest{
 		ID: "warmups", API: "^1", Requires: []string{"window", "settings"},
 		Name: "Warm-up and check-in", Sub: "Start a subscription's usage window at a time you pick, and claim vendors' daily check-in credits",
-		One: "1 warm-up or check-in on", Many: "{n} warm-ups and check-ins on",
+		Opens: "providers",
+		One:   "1 warm-up or check-in on", Many: "{n} warm-ups and check-ins on",
 		InUse: func() (int, error) {
 			s, err := settings.LoadChecked()
 			if err != nil {
 				return 0, err
 			}
-			n := count(s.CodexWarmup != "", s.ClaudeWarmup != "", s.CodexWarmAt != "" || len(s.CodexWarmAts) > 0,
+			n := count(s.CodexWarmup != "", s.ClaudeWarmup != "", s.AgyWarmup != "", s.CodexWarmAt != "" || len(s.CodexWarmAts) > 0,
 				s.ClaudeWarmAt != "" || len(s.ClaudeWarmAts) > 0, s.WorkBuddyCheckin, s.TraeCheckin, s.MiniMaxCheckin, s.QoderCheckin)
 			n += len(s.CodexWarmAtOf)
 			for _, on := range s.PluginCheckins {

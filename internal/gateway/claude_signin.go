@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
+
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // Claude Code signed in to claude.ai, its base URL magpie's and no key
@@ -81,7 +82,7 @@ func (w *signInWriter) Write(b []byte) (int, error) {
 		}
 		code := w.held
 		w.held = 0
-		if code != http.StatusUnauthorized && (code != http.StatusForbidden || !bytes.Contains(b, []byte("OAuth token has been revoked"))) {
+		if code != http.StatusUnauthorized && (code != http.StatusForbidden || !bodyHas(b, "OAuth token has been revoked")) {
 			// any other error, at its status
 			if xAPIKey.Match(b) {
 				b = xAPIKey.ReplaceAll(b, []byte("API key"))
@@ -100,7 +101,7 @@ func (w *signInWriter) Write(b []byte) (int, error) {
 		w.wrote = true
 		_, err := w.ResponseWriter.Write(body)
 		return n, err
-	case bytes.HasPrefix(b, []byte("event: error\n")) && bytes.Contains(bytes.ToLower(b), []byte("x-api-key")):
+	case bytes.HasPrefix(b, []byte("event: error\n")) && bodyHas(bytes.ToLower(b), "x-api-key"):
 		// a stream's error, after its 200 went
 		b = xAPIKey.ReplaceAll(b, []byte("API key"))
 	}
@@ -111,7 +112,7 @@ func (w *signInWriter) Write(b []byte) (int, error) {
 	return n, nil
 }
 
-var xAPIKey = regexp.MustCompile(`(?i)x-api-key`)
+var xAPIKey = lazyre.New(`(?i)x-api-key`)
 
 // refusedMessage is a provider's refusal of magpie's credential, as a
 // Claude Code signed in to claude.ai is told it: b is magpie's error,

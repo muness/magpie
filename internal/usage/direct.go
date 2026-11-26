@@ -16,7 +16,7 @@ import (
 // their own (Kumo31 on Discord: Codex used outside magpie was on the
 // window's Usage tab but not in magpie usage).
 func Direct(p Period) Summary {
-	now := Clock()
+	now := localNow()
 	return direct(p, now, directRows(p, now))
 }
 
@@ -28,7 +28,7 @@ func Direct(p Period) Summary {
 // few, and the summary of a long history is then kept rather than worked
 // out again.
 func Summaries(p Period) (Summary, Summary) {
-	now := Clock()
+	now := localNow()
 	return topSummary(p, now, summaryCacheSessions), direct(p, now, directRows(p, now))
 }
 
@@ -44,7 +44,7 @@ func directRows(p Period, now time.Time) []Row {
 	if reader == nil {
 		reader = sessions.Calls
 	}
-	logs, others := reader(since), sharedRecords(since)
+	logs, others := ownCalls(reader(since)), sharedRecords(since)
 	matched := map[int]bool{}
 	actors := map[int]string{}
 	_, _, compactions := duplicateCodexCalls(logs)
@@ -101,6 +101,9 @@ func direct(p Period, now time.Time, rows []Row) Summary {
 		s.Totals.addRow(r)
 		id := ReportedAs(r.Agent)
 		put(agents, id, Group{ID: id}, r)
+		if a := agents[id]; r.Time.After(a.Last) {
+			a.Last = r.Time
+		}
 		model := r.Model
 		if alias != nil {
 			model = alias(model)

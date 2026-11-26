@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MCP router · magpie docs</title>
+<title>MCP router: one MCP server for every agent and app · magpie</title>
 <meta name="description" content="What magpie's MCP router does: one magpie MCP server per agent in place of the Library's servers, command servers run once, and one address for other apps.">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fafafa">
@@ -39,6 +39,54 @@
 <meta property="og:image" content="https://usemagpie.ai/img/og.png">
 <meta property="og:url" content="https://usemagpie.ai/docs/mcp-router">
 <meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "TechArticle",
+   "headline": "MCP router",
+   "description": "What magpie's MCP router does: one magpie MCP server per agent in place of the Library's servers, command servers run once, and one address for other apps.",
+   "inLanguage": "en",
+   "url": "https://usemagpie.ai/docs/mcp-router",
+   "about": {
+    "@type": "SoftwareApplication",
+    "name": "magpie",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS, Windows, Linux"
+   },
+   "publisher": {
+    "@type": "Organization",
+    "name": "magpie",
+    "url": "https://usemagpie.ai/"
+   }
+  },
+  {
+   "@type": "BreadcrumbList",
+   "itemListElement": [
+    {
+     "@type": "ListItem",
+     "position": 1,
+     "name": "magpie",
+     "item": "https://usemagpie.ai/"
+    },
+    {
+     "@type": "ListItem",
+     "position": 2,
+     "name": "Docs",
+     "item": "https://usemagpie.ai/docs/start"
+    },
+    {
+     "@type": "ListItem",
+     "position": 3,
+     "name": "MCP router",
+     "item": "https://usemagpie.ai/docs/mcp-router"
+    }
+   ]
+  }
+ ]
+}
+</script>
 </head>
 <body>
 
@@ -55,6 +103,13 @@
     <a class="toc-only" href="/docs/masking">Privacy masking</a>
     <a class="toc-only" href="/docs/mcp-router">MCP router</a>
     <a class="toc-only" href="/docs/library">Library</a>
+    <a class="toc-only" href="/docs/claude-code-models">Models in Claude Code</a>
+    <a class="toc-only" href="/docs/codex-models">Models in Codex</a>
+    <a class="toc-only" href="/docs/gemini-cli-models">Models in Gemini CLI</a>
+    <a class="toc-only" href="/docs/subscriptions">Subscriptions in any agent</a>
+    <a class="toc-only" href="/docs/local-models">Local models</a>
+    <a class="toc-only" href="/docs/opencode-models">Models in OpenCode</a>
+    <a class="toc-only" href="/docs/alternatives">magpie vs CC Switch vs CCR</a>
     <a href="/docs/import">Add to magpie</a>
     <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie-releases/releases">Releases</a>
@@ -79,6 +134,7 @@
     <a href="#overview">Overview</a>
     <a href="#on">Turn it on</a>
     <a href="#apps">Other apps</a>
+    <a href="#away">From another computer</a>
     <a href="#kept">Agents that keep their own entries</a>
     <a href="#when">When to use it</a>
   </aside>
@@ -90,7 +146,7 @@
     <ul>
       <li><b>Set up once.</b> A server written once in the Library reaches every agent and app through one entry.</li>
       <li><b>Run once.</b> A command server (one started as a program, such as <code>npx …</code>) runs once in magpie, not once in each agent. A server with no calls for 10 minutes is stopped and starts again on the next call.</li>
-      <li><b>One address for other apps.</b> Cursor, VS Code, Windsurf or an app on another computer can connect to magpie and use every Library server.</li>
+      <li><b>One address for other apps.</b> Cursor, VS Code, Windsurf or an app on another computer can connect to magpie and use the Library’s servers (an app on another computer gets <a href="#away">some of them</a>).</li>
     </ul>
     <p>Tools appear in the agent as <code>server__tool</code>. Only tools are served (no resources or prompts), and a tool you turned off in the Library is neither listed nor run.</p>
 
@@ -109,9 +165,30 @@ magpie library mcp router off</pre>
     </div>
     <p><code>magpie library</code> lists which agents are given the router and which keep their own entries, with why.</p>
 
+    <h2 id="on-demand"><a class="anchor" href="#on-demand">Tools on demand</a></h2>
+    <p>Every tool an agent is given goes out, with its whole parameter schema, on every request. So an agent given more than 10 tools through the router is given two in their place, and this is <b>on by default</b>:</p>
+    <ul>
+      <li><b><code>find_tools</code></b> takes the words of what the task needs and gives the tools that match: the best 5 with their description and parameters, then up to 15 more by name. Its own description names each server and its tools, so the model knows what there is to find.</li>
+      <li><b><code>call_tool</code></b> runs a tool by name, with its arguments.</li>
+    </ul>
+    <p>An agent that searches its MCP tools itself is given every tool, and its own search keeps them out of each request: Claude Code, Claude Desktop, Codex, Pi, Droid and omp. So is an agent given 10 tools or fewer, and an app at the <a href="#apps">Other apps</a> address, since magpie can’t tell which app that is. An app there that doesn’t search its tools itself can ask for them on demand: add <code>?tools=on-demand</code> to the address, as in <code>http://127.0.0.1:3425/mcp/magpie/hub?tools=on-demand</code>.</p>
+    <p>To give every agent every tool instead, turn off <span class="ui">Tools on demand</span> under <span class="ui">MCP router</span> in <span class="ui">Library</span> → <span class="ui">MCP</span>, then restart your agents.</p>
+
     <h2 id="apps"><a class="anchor" href="#apps">Other apps</a></h2>
-    <p>With the router on, the <span class="ui">Other apps</span> row shows an address ending in <code>/mcp/magpie/hub</code>, which serves every server in the Library. <span class="ui">Connect…</span> opens a sheet with a ready entry to copy for Cursor, VS Code, Windsurf or any app that takes a JSON MCP config; in the app window, Cursor and VS Code also have <span class="ui">Add</span>, which opens the app to confirm. An app on another computer needs a gateway key, as every request from your network does (see <a href="/docs/remote">Remote magpie</a>).</p>
-    <div class="callout"><b>Command servers run on this computer.</b> Anyone holding a gateway key on your network can call them through the router, with your rights here. Only share keys with people you trust.</div>
+    <p>With the router on, the <span class="ui">Other apps</span> row shows an address ending in <code>/mcp/magpie/hub</code>, which serves every server in the Library. <span class="ui">Connect…</span> → <span class="ui">Other apps</span> also gives the address with <code>?tools=on-demand</code>, for an app that should get its tools <a href="#on-demand">on demand</a>. <span class="ui">Connect…</span> opens a sheet with a ready entry to copy for Cursor, VS Code, Windsurf or any app that takes a JSON MCP config; in the app window, Cursor and VS Code also have <span class="ui">Add</span>, which opens the app to confirm. An app on another computer needs a gateway key, as every request from your network does (see <a href="/docs/remote">Remote magpie</a>).</p>
+    <div class="callout"><b>Command servers run on this computer.</b> Anyone holding a gateway key with no model, account or spend limit on your network can call them through the router, with your rights here. Only share keys with people you trust.</div>
+
+    <h2 id="away"><a class="anchor" href="#away">From another computer</a></h2>
+    <p>An app on another computer is given less than an app on the computer magpie runs on. That includes an app that comes through a tunnel or proxy, and one on the host of a Docker magpie, since it reaches the container from outside.</p>
+    <ul>
+      <li><b>Servers that run as programs here</b> (a command such as <code>npx …</code> or <code>uvx …</code>, or a plugin’s tools) are given only to a gateway key with no model, account or spend limit. A key with any of those limits gets the Library’s URL servers alone.</li>
+      <li><b>Servers that act as you here</b> are never given: magpie’s image and sessions servers, and another magpie’s router. For images, call <code>/mcp/magpie/image</code> with the key, which keeps to the key’s limits.</li>
+      <li><b>Magpie Browser</b> is given to any gateway key, and reaches only a browser connected with that same key.</li>
+      <li><b>Magpie Memory</b> is given only to a key allowed to use it (see <a href="/docs/remote#memory">Memory from other computers</a>).</li>
+      <li>A key allowed only some MCP servers gets only those.</li>
+    </ul>
+    <p>The app is told what it didn’t get. magpie’s instructions to it end with a line for each kind left out, <code>Not given to this caller: …</code>, naming the servers, why, and what lets them through, and a call of one of their tools gets the same reason. Servers the key isn’t allowed to use are only counted, never named.</p>
+    <p><b>To get every server</b>, give the app a gateway key with no model, account or spend limit (<span class="ui">Gateway</span> → <span class="ui">Gateway keys</span>), or run it on the computer magpie runs on. The servers that act as you stay on that computer either way.</p>
 
     <h2 id="kept"><a class="anchor" href="#kept">Agents that keep their own entries</a></h2>
     <p>These agents keep each server’s own entry, and the Library page says which and why:</p>
@@ -142,6 +219,13 @@ magpie library mcp router off</pre>
     <a href="/docs/masking">Privacy masking</a>
     <a href="/docs/mcp-router">MCP router</a>
     <a href="/docs/library">Library</a>
+    <a href="/docs/claude-code-models">Models in Claude Code</a>
+    <a href="/docs/codex-models">Models in Codex</a>
+    <a href="/docs/gemini-cli-models">Models in Gemini CLI</a>
+    <a href="/docs/subscriptions">Subscriptions in any agent</a>
+    <a href="/docs/local-models">Local models</a>
+    <a href="/docs/opencode-models">Models in OpenCode</a>
+    <a href="/docs/alternatives">magpie vs CC Switch vs CCR</a>
     <a href="/docs/import">Add to magpie</a>
     <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>

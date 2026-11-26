@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MCP 路由 · magpie 文档</title>
+<title>MCP 路由：一个地址把 MCP 服务器给所有 Agent 用 · magpie 文档</title>
 <meta name="description" content="magpie 的 MCP 路由是做什么的：每个 Agent 只配一个 magpie MCP 服务器来代替资源库里的服务器，命令型服务器只运行一份，其他应用用一个地址接入。">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fafafa">
@@ -39,6 +39,54 @@
 <meta property="og:image" content="https://usemagpie.ai/img/og.png">
 <meta property="og:url" content="https://usemagpie.ai/docs/zh/mcp-router">
 <meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "TechArticle",
+   "headline": "MCP 路由",
+   "description": "magpie 的 MCP 路由是做什么的：每个 Agent 只配一个 magpie MCP 服务器来代替资源库里的服务器，命令型服务器只运行一份，其他应用用一个地址接入。",
+   "inLanguage": "zh-CN",
+   "url": "https://usemagpie.ai/docs/zh/mcp-router",
+   "about": {
+    "@type": "SoftwareApplication",
+    "name": "magpie",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS, Windows, Linux"
+   },
+   "publisher": {
+    "@type": "Organization",
+    "name": "magpie",
+    "url": "https://usemagpie.ai/"
+   }
+  },
+  {
+   "@type": "BreadcrumbList",
+   "itemListElement": [
+    {
+     "@type": "ListItem",
+     "position": 1,
+     "name": "magpie",
+     "item": "https://usemagpie.ai/zh/"
+    },
+    {
+     "@type": "ListItem",
+     "position": 2,
+     "name": "文档",
+     "item": "https://usemagpie.ai/docs/zh/start"
+    },
+    {
+     "@type": "ListItem",
+     "position": 3,
+     "name": "MCP 路由",
+     "item": "https://usemagpie.ai/docs/zh/mcp-router"
+    }
+   ]
+  }
+ ]
+}
+</script>
 </head>
 <body>
 
@@ -55,6 +103,13 @@
     <a class="toc-only" href="/docs/zh/masking">本地脱敏</a>
     <a class="toc-only" href="/docs/zh/mcp-router">MCP 路由</a>
     <a class="toc-only" href="/docs/zh/library">资源库</a>
+    <a class="toc-only" href="/docs/zh/claude-code-models">Claude Code 接入其他模型</a>
+    <a class="toc-only" href="/docs/zh/codex-models">Codex 接入其他模型</a>
+    <a class="toc-only" href="/docs/zh/gemini-cli-models">Gemini CLI 接入其他模型</a>
+    <a class="toc-only" href="/docs/zh/subscriptions">订阅用于任意 Agent</a>
+    <a class="toc-only" href="/docs/zh/local-models">本地模型</a>
+    <a class="toc-only" href="/docs/zh/opencode-models">OpenCode 接入其他模型</a>
+    <a class="toc-only" href="/docs/zh/alternatives">与 CC Switch、CCR 对比</a>
     <a href="/docs/zh/import">Add to magpie</a>
     <a href="/docs/zh/integrate">接入应用</a>
     <a href="https://github.com/yetone/magpie-releases/releases">版本发布</a>
@@ -79,6 +134,7 @@
     <a href="#overview">概述</a>
     <a href="#on">打开</a>
     <a href="#apps">其他应用</a>
+    <a href="#away">从另一台电脑连接</a>
     <a href="#kept">保留各自条目的 Agent</a>
     <a href="#when">什么时候用</a>
   </aside>
@@ -90,7 +146,7 @@
     <ul>
       <li><b>配一次。</b>资源库里写好一次的服务器，通过一个条目给所有 Agent 和应用使用。</li>
       <li><b>只运行一份。</b>命令型服务器（以程序启动的，比如 <code>npx …</code>）在 magpie 里只运行一份，而不是每个 Agent 各起一份。10 分钟没有调用的服务器会被停掉，下次调用时再启动。</li>
-      <li><b>其他应用一个地址。</b>Cursor、VS Code、Windsurf 或另一台电脑上的应用，连上 magpie 就能用资源库里的所有服务器。</li>
+      <li><b>其他应用一个地址。</b>Cursor、VS Code、Windsurf 或另一台电脑上的应用，连上 magpie 就能用资源库里的服务器（另一台电脑上的应用只拿到<a href="#away">其中一部分</a>）。</li>
     </ul>
     <p>工具在 Agent 里显示为 <code>服务器__工具</code>。只提供工具（不含 resources 和 prompts），在资源库里关掉的工具既不会列出也不会运行。</p>
 
@@ -109,9 +165,30 @@ magpie library mcp router off</pre>
     </div>
     <p><code>magpie library</code> 会列出哪些 Agent 用上了 MCP 路由、哪些保留各自的条目，以及原因。</p>
 
+    <h2 id="on-demand"><a class="anchor" href="#on-demand">按需加载工具</a></h2>
+    <p>给 Agent 的每个工具，连同完整的参数定义，会随每次请求一起发出。所以通过 MCP 路由拿到超过 10 个工具的 Agent，会改为拿到两个工具，<b>默认开启</b>：</p>
+    <ul>
+      <li><b><code>find_tools</code></b>：按任务需要的关键词查找匹配的工具，最匹配的 5 个附带描述和参数，其后最多再列 15 个工具名。它自己的描述里列出了每个服务器和它的工具，模型知道有哪些可找。</li>
+      <li><b><code>call_tool</code></b>：按名字运行一个工具，并传入参数。</li>
+    </ul>
+    <p>自己会搜索 MCP 工具的 Agent 仍会拿到全部工具，由它自己的工具搜索把工具挡在每次请求之外：Claude Code、Claude Desktop、Codex、Pi、Droid 和 omp。工具不超过 10 个的 Agent，以及连接 <a href="#apps">其他应用</a> 地址的应用（magpie 无法知道是哪个应用），也拿到全部工具。连接这个地址的应用如果不会自己搜索工具，可以要求按需加载：在地址后面加上 <code>?tools=on-demand</code>，例如 <code>http://127.0.0.1:3425/mcp/magpie/hub?tools=on-demand</code>。</p>
+    <p>想让所有 Agent 都拿到全部工具，在 <span class="ui">资源库</span> → <span class="ui">MCP</span> 的 <span class="ui">MCP 路由</span> 下关闭 <span class="ui">按需加载工具</span>，然后重启 Agent。</p>
+
     <h2 id="apps"><a class="anchor" href="#apps">其他应用</a></h2>
-    <p>MCP 路由打开后，<span class="ui">其他应用</span> 一行显示一个以 <code>/mcp/magpie/hub</code> 结尾的地址，它提供资源库里的所有服务器。<span class="ui">连接…</span> 会打开一个面板，里面有给 Cursor、VS Code、Windsurf 或任何接受 JSON MCP 配置的应用准备好的条目，可直接复制；在应用窗口里，Cursor 和 VS Code 还有 <span class="ui">添加</span>，会打开对应应用让你确认。另一台电脑上的应用需要网关密钥，和局域网里的其他请求一样（见 <a href="/docs/zh/remote">远程 magpie</a>）。</p>
-    <div class="callout"><b>命令型服务器运行在这台电脑上。</b>局域网里持有网关密钥的人都能通过 MCP 路由调用它们，权限就是你在这台电脑上的权限。密钥只给信任的人。</div>
+    <p>MCP 路由打开后，<span class="ui">其他应用</span> 一行显示一个以 <code>/mcp/magpie/hub</code> 结尾的地址，它提供资源库里的所有服务器。<span class="ui">连接…</span> → <span class="ui">其他应用</span> 里还有带 <code>?tools=on-demand</code> 的地址，给需要<a href="#on-demand">按需加载工具</a>的应用使用。<span class="ui">连接…</span> 会打开一个面板，里面有给 Cursor、VS Code、Windsurf 或任何接受 JSON MCP 配置的应用准备好的条目，可直接复制；在应用窗口里，Cursor 和 VS Code 还有 <span class="ui">添加</span>，会打开对应应用让你确认。另一台电脑上的应用需要网关密钥，和局域网里的其他请求一样（见 <a href="/docs/zh/remote">远程 magpie</a>）。</p>
+    <div class="callout"><b>命令型服务器运行在这台电脑上。</b>局域网里持有不限模型、账号和花费的网关密钥的人，都能通过 MCP 路由调用它们，权限就是你在这台电脑上的权限。密钥只给信任的人。</div>
+
+    <h2 id="away"><a class="anchor" href="#away">从另一台电脑连接</a></h2>
+    <p>另一台电脑上的应用，拿到的比 magpie 所在电脑上的应用少。经隧道或代理连进来的应用也算，Docker 里的 magpie 所在主机上的应用也算，因为它是从容器外面连进来的。</p>
+    <ul>
+      <li><b>在这里以程序运行的服务器</b>（<code>npx …</code>、<code>uvx …</code> 这类命令，或插件提供的工具）只给不限模型、账号和花费的网关密钥。限定了其中任何一项的密钥，只拿到资源库里的 URL 服务器。</li>
+      <li><b>以你的身份在这里操作的服务器</b>从不给：magpie 的图片和会话服务器，以及另一个 magpie 的路由。要生成图片，请带着密钥调用 <code>/mcp/magpie/image</code>，它遵守密钥的限制。</li>
+      <li><b>Magpie Browser</b> 给任何网关密钥，但只能用同一个密钥连上的浏览器。</li>
+      <li><b>Magpie Memory</b> 只给允许使用记忆的密钥（见 <a href="/docs/zh/remote#memory">其他电脑使用记忆</a>）。</li>
+      <li>只允许使用部分 MCP 服务器的密钥，只拿到那些服务器。</li>
+    </ul>
+    <p>应用会被告知少了哪些。magpie 给它的说明最后，每类没给的服务器各有一行 <code>Not given to this caller: …</code>，写明是哪些、为什么、怎样才能拿到；调用其中的工具时也会得到同样的原因。密钥不允许使用的服务器只给出数量，不写名字。</p>
+    <p><b>要拿到所有服务器</b>，给应用一个不限模型、账号和花费的网关密钥（<span class="ui">网关</span> → <span class="ui">网关密钥</span>），或者在 magpie 所在的电脑上运行它。以你的身份操作的服务器无论如何都只留在那台电脑上。</p>
 
     <h2 id="kept"><a class="anchor" href="#kept">保留各自条目的 Agent</a></h2>
     <p>以下 Agent 会保留每个服务器自己的条目，资源库页面会写明是哪些、为什么：</p>
@@ -142,6 +219,13 @@ magpie library mcp router off</pre>
     <a href="/docs/zh/masking">本地脱敏</a>
     <a href="/docs/zh/mcp-router">MCP 路由</a>
     <a href="/docs/zh/library">资源库</a>
+    <a href="/docs/zh/claude-code-models">Claude Code 接入其他模型</a>
+    <a href="/docs/zh/codex-models">Codex 接入其他模型</a>
+    <a href="/docs/zh/gemini-cli-models">Gemini CLI 接入其他模型</a>
+    <a href="/docs/zh/subscriptions">订阅用于任意 Agent</a>
+    <a href="/docs/zh/local-models">本地模型</a>
+    <a href="/docs/zh/opencode-models">OpenCode 接入其他模型</a>
+    <a href="/docs/zh/alternatives">与 CC Switch、CCR 对比</a>
     <a href="/docs/zh/import">Add to magpie</a>
     <a href="/docs/zh/integrate">接入应用</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>

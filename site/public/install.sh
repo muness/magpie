@@ -120,6 +120,19 @@ case "$(uname -m)" in
   *) arch= ;;
 esac
 
+# apiroute <url> <file>: GitHub's API address of a release file whose
+# github.com address is <url>, read from the release's description with
+# sed alone (no jq); nothing when <url> isn't a GitHub release file
+apiroute() {
+  repo=$(printf '%s' "$1" | sed -n 's|^https://github\.com/\([^/]*/[^/]*\)/releases/download/[^/]*/[^/]*$|\1|p')
+  tag=$(printf '%s' "$1" | sed -n 's|^https://github\.com/[^/]*/[^/]*/releases/download/\([^/]*\)/[^/]*$|\1|p')
+  [ -n "$repo" ] && [ -n "$tag" ] || return 0
+  # one asset's own fields (url, id, name) come before its first nested
+  # object, so cutting at each { leaves them on one line
+  get -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$repo/releases/tags/$tag" 2>/dev/null | tr -d '\n' | tr '{' '\n' |
+    sed -n "s|.*\"url\": *\"\(https://api\.github\.com/repos/$repo/releases/assets/[0-9]*\)\".*\"name\": *\"$2\".*|\1|p" | head -n 1
+}
+
 tmp=
 # fetch <file>: the newest release's <file> downloaded into $tmp and
 # checked against the SHA-256 the site gives, never a mirror's
@@ -134,24 +147,53 @@ fetch() {
   # The feed is one line of JSON; pull this file's url and hash out of it.
   entry=$(printf '%s' "$feed" | sed -n "s/.*\"$file\":{\([^}]*\)}.*/\1/p")
   url=$(printf '%s' "$entry" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
+  api=$(printf '%s' "$entry" | sed -n 's/.*"api":"\([^"]*\)".*/\1/p')
+  # github: the file's github.com address when url is the site's copy (R2)
+  github=$(printf '%s' "$entry" | sed -n 's/.*"github":"\([^"]*\)".*/\1/p')
   sum=$(printf '%s' "$entry" | sed -n 's/.*"sha256":"\([^"]*\)".*/\1/p')
   version=$(printf '%s' "$feed" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
   if [ "$os" = android ] && { [ -z "$url" ] || [ -z "$sum" ]; }; then
     die "the newest release has no $file; build in Termux with go build -tags nogui (see $site/docs/start)"
   fi
   [ -n "$url" ] && [ -n "$sum" ] || die "the newest release has no $file"
+  case "$url" in https://github.com/*) github=$url ;; esac
 
-  from=$url
+  # The tries, in order: url (the site's copy, or github.com's own);
+  # github.com's address, through the mirror when one is given (a mirror
+  # is only ever put before a github.com address); GitHub's API, never
+  # through a mirror. via is the mirror a try went through.
+  from=$url via=
   case "$url" in
-    https://github.com/*) [ -z "$mirror" ] || from="$mirror$url" ;;
+    https://github.com/*) [ -z "$mirror" ] || { from="$mirror$url" via=$mirror; } ;;
   esac
-  if [ "$from" != "$url" ]; then say "downloading magpie $version ($file) through $mirror"
+  if [ -n "$via" ]; then say "downloading magpie $version ($file) through $mirror"
   else say "downloading magpie $version ($file)"; fi
-  get -o "$tmp/$file" "$from" || die "could not download $from"
+  if ! get -o "$tmp/$file" "$from"; then
+    if [ -z "$via" ] && [ -n "$github" ] && [ "$github" != "$url" ]; then
+      from=$github
+      [ -z "$mirror" ] || { from="$mirror$github" via=$mirror; }
+      say "that failed; downloading it from github.com${via:+ through $via} instead"
+      get -o "$tmp/$file" "$from" || from=
+    else
+      from=
+    fi
+    if [ -z "$from" ]; then
+      # github.com's download address can fail (504 on every try, for
+      # hours on 2026-11-08) while GitHub's API serves the same file:
+      # asked for there, checked against the same SHA-256 below. A mirror
+      # given keeps precedence: through one, the API is never asked.
+      [ -z "$mirror" ] || die "could not download $mirror${github:-$url}"
+      [ -n "$api" ] || api=$(apiroute "${github:-$url}" "$file")
+      [ -n "$api" ] || die "could not download $url"
+      say "that failed; downloading it through GitHub's API instead"
+      get -H 'Accept: application/octet-stream' -o "$tmp/$file" "$api" || die "could not download $url, nor through $api"
+      via=
+    fi
+  fi
   if command -v sha256sum >/dev/null; then got=$(sha256sum "$tmp/$file" | cut -d' ' -f1)
   else got=$(shasum -a 256 "$tmp/$file" | cut -d' ' -f1); fi
   if [ "$got" != "$sum" ]; then
-    [ "$from" = "$url" ] || die "$file from $mirror does not match its checksum from $site; not installed"
+    [ -z "$via" ] || die "$file from $via does not match its checksum from $site; not installed"
     die "$file does not match its checksum"
   fi
 }
@@ -243,6 +285,16 @@ if [ -n "$uninstall" ]; then
       run=$(runs "$apps/magpie.desktop" Exec)
       if [ -f "$apps/magpie.desktop" ] && { [ "$run" = "$exe" ] || [ ! -e "$run" ]; }; then
         gone "$apps/magpie.desktop"
+      fi
+      # the entry for ccswitch:// links, on the same terms, and its default
+      cc=$(runs "$apps/magpie-ccswitch.desktop" Exec)
+      if [ -f "$apps/magpie-ccswitch.desktop" ] && { [ "$cc" = "$exe" ] || [ ! -e "$cc" ]; }; then
+        gone "$apps/magpie-ccswitch.desktop"
+        list="$config/mimeapps.list"
+        if [ -f "$list" ] && grep -qx 'x-scheme-handler/ccswitch=magpie-ccswitch\.desktop;\{0,1\}' "$list"; then
+          grep -vx 'x-scheme-handler/ccswitch=magpie-ccswitch\.desktop;\{0,1\}' "$list" > "$list.magpie-new" || true
+          mv "$list.magpie-new" "$list"
+        fi
       fi
       # with no menu entry (this one, or the one magpie uninstall took),
       # what came with it: the icon, the magpie:// default xdg-mime set

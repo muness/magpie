@@ -158,7 +158,7 @@ func almaFiles() []file {
 			path:     path + "#" + url.QueryEscape(id),
 			main:     true,
 			size:     bytes,
-			mod:      mod,
+			mod:      modOf(mod),
 			readOnly: true,
 			more: &fileMore{
 				sid:  id,
@@ -232,7 +232,7 @@ func almaModel(model, providerID string) string {
 // parseAlma reads one chat in a read transaction, a snapshot while Alma
 // writes on.
 func parseAlma(f file) *state {
-	s := &state{Size: f.size, Mod: f.mod.UnixNano(), DBRevision: f.m().rev}
+	s := &state{Size: f.size, Mod: f.mod.UnixNano(), StateMore: moreOf(StateMore{DBRevision: f.m().rev})}
 	st := f.m().alma
 	if st == nil {
 		return s
@@ -323,6 +323,14 @@ func parseAlma(f file) *state {
 					if json.Unmarshal(p.Input, &in) == nil {
 						skill = in.Skill
 					}
+				} else if strings.EqualFold(name, "Read") {
+					var in struct {
+						FilePath string `json:"file_path"`
+						Path     string `json:"path"`
+					}
+					if json.Unmarshal(p.Input, &in) == nil {
+						skill = routedSkill(in.FilePath + in.Path)
+					}
 				}
 				s.tool(t, name, skill)
 			}
@@ -335,7 +343,7 @@ func parseAlma(f file) *state {
 	if s.Title == "" {
 		s.Title = first
 	}
-	s.First = first
+	s.own().First = first
 
 	for _, table := range []struct {
 		name string

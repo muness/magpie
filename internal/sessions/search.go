@@ -264,9 +264,11 @@ func SearchSession(ctx context.Context, s Session, needle string) (Hit, bool, er
 // so that one without the needle's bytes can be passed over unread. An
 // OpenCode session's is its info (the messages are elsewhere) or a database,
 // and a Cursor chat's a database too, whose newest pages are in its -wal.
+// An Antigravity app conversation's is its database, the transcript beside
+// it.
 func linesFile(s Session) bool {
 	switch s.Agent {
-	case "opencode":
+	case "opencode", "antigravity":
 		return false
 	case "cursor":
 		return strings.HasSuffix(s.Path, ".jsonl")
@@ -407,6 +409,10 @@ func firstAsked(parts []Part) string {
 			continue
 		}
 		s := strings.TrimSpace(p.Text)
+		if typed, _, ok := wbTyped(s); ok && strings.HasPrefix(s, "<") {
+			// WorkBuddy's context and the user's words in one block
+			s = typed
+		}
 		if s == "" || strings.HasPrefix(s, "<") || strings.HasPrefix(s, "# AGENTS.md") || s == "[image]" {
 			continue
 		}

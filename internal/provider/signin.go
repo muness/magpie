@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/redact"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -120,6 +121,9 @@ type signInFlow struct {
 	// nonce and hostID are a ChatGPT API sign-in's: what its ID token must
 	// carry, and this machine's id it registers magpie for (chatgpt_api.go)
 	nonce, hostID string
+	// clientID and subject are the account a ChatGPT API sign-in signs in
+	// to again: the client id OpenAI issued it, and who it is
+	clientID, subject string
 	// claimed is a callback being traded for the account: the browser's own
 	// or a pasted address, whichever came first
 	claimed bool
@@ -378,8 +382,15 @@ func (s *signInFlow) begin() error {
 		}
 		s.redirect = fmt.Sprintf("http://127.0.0.1:%d/auth/callback", ln.Addr().(*net.TCPAddr).Port)
 		s.nonce = randomToken(24)
+		// an account signed in to again goes with the client OpenAI
+		// issued it, not a new registration
+		var again siwcCreds
+		if s.user != "" {
+			again, _ = siwcLookup(s.user)
+		}
 		s.mu.Lock()
-		s.st.URL = siwcAuthorize(s.redirect, s.state, s.nonce, challenge, s.hostID)
+		s.clientID, s.subject = again.ClientID, again.Subject
+		s.st.URL = siwcAuthorize(s.redirect, s.state, s.nonce, challenge, s.hostID, again)
 		s.mu.Unlock()
 	case "copilot":
 		// GitHub's device code, as Copilot's editors sign in
@@ -648,6 +659,10 @@ func (s *signInFlow) finish(out SignInState) bool {
 		s.mu.Lock()
 	}
 	out.ID, out.Agent, out.URL, out.Code, out.Proxy = s.st.ID, s.st.Agent, s.st.URL, s.st.Code, s.st.Proxy
+	// a sign-in's failure is shown, logged and pasted into reports: a
+	// token a vendor's (or a plugin's) error quoted goes out of it here,
+	// where every sign-in ends (QuotedReply)
+	out.Error = redact.Scrub(out.Error)
 	s.st = out
 	stop, srv := s.stop, s.srv
 	s.mu.Unlock()
@@ -716,7 +731,7 @@ func (s *signInFlow) callback(w http.ResponseWriter, r *http.Request) {
 	l, err := s.exchange(ctx, q.Get("code"))
 	if err == nil {
 		var using bool
-		if err = keepLogin(ctx, func() (err error) { using, err = addLogin(l); return err }); err == nil {
+		if err = keepLogin(ctx, func() (err error) { using, err = addLoginNamed(&l); return err }); err == nil {
 			s.finish(SignInState{State: "done", User: l.User, Plan: l.Plan, Using: using})
 			signInPage(w, true, "You're signed in", fmt.Sprintf("%s is added to magpie. You can close this tab.", l.User))
 			return
@@ -776,7 +791,7 @@ func postTokenWith(ctx context.Context, tokenURL, ctype, bearer string, h http.H
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return err
 	}
@@ -833,7 +848,7 @@ func claudeLogin(c claudeCredentials, acct map[string]any) (savedLogin, error) {
 		return savedLogin{}, err
 	}
 	profile, _ := json.Marshal(acct)
-	return savedLogin{Agent: "claude", User: claudeUser(email, c.OAuth.SubscriptionType, acct), Plan: c.OAuth.SubscriptionType, Auth: auth, Profile: profile}, nil
+	return savedLogin{Agent: "claude", User: claudeUser(email, c.OAuth.SubscriptionType, acct), Plan: claudeLivePlan(c, "", acct), Auth: auth, Profile: profile}, nil
 }
 
 func codexExchange(ctx context.Context, code, verifier, redirect string) (savedLogin, error) {
@@ -885,9 +900,17 @@ func codexLogin(idToken, accessToken, refreshToken, accountID string) (savedLogi
 // the old, so one refresh token stays in one place. Its kept usage
 // reading goes (StaleAllowance): it was read under the old sign-in, and
 // for a minute it would answer for the new one, a refusal and all.
-func addLogin(l savedLogin) (using bool, err error) {
+func addLogin(l savedLogin) (using bool, err error) { return addLoginNamed(&l) }
+
+// addLoginNamed is addLogin that gives in the name the account is kept
+// by: a second workspace of one email is "email · workspace" (codexName),
+// and what a sign-in does next by the account's name (the proxy picked
+// for it, @zzstar101 on X) is done to it, not to the first workspace.
+func addLoginNamed(in *savedLogin) (using bool, err error) {
+	l := *in
 	defer func() { // under the name it is kept by (codexName), once loginsMu is let go
 		if err == nil {
+			in.User = l.User
 			StaleAllowance(l.Agent, l.User)
 		}
 	}()
@@ -913,6 +936,14 @@ func addLogin(l savedLogin) (using bool, err error) {
 		// account is magpie's alone, its own sign-in left as it is
 		using = false
 	}
+	if l.AccessOnly {
+		// kept access token only: Codex would renew it, so it is magpie's
+		// alone, and never the one Codex holds here or in another folder
+		if signedIn && (sameLogin(live, l) || sameRefresh(live.Auth, l.Auth)) || codexHeldFolder(ls, l) != "" {
+			return false, errAccessOnlyHeld
+		}
+		using = false
+	}
 	if first := claudeStandIn(ls); !signedIn && l.Agent == "claude" && first != "" {
 		// logged out of Claude Code with accounts in magpie: it stays so,
 		// as the user left it (a claude.ai sign-in beside magpie's token
@@ -935,7 +966,7 @@ func addLogin(l savedLogin) (using bool, err error) {
 	// Codex and magpie both read it, or the next look would read the old
 	// ones back over them
 	held := ""
-	if l.Agent == "codex" && !using {
+	if l.Agent == "codex" && !using && !l.AccessOnly {
 		held = codexHeldFolder(ls, l)
 		l.Home = held
 	}
@@ -1010,8 +1041,9 @@ func signInPage(w http.ResponseWriter, ok bool, title, msg string) {
 		mark = `<path d="M7 7l10 10M17 7L7 17"/>`
 	}
 	fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>magpie · %[1]s</title><style>
-:root{--bg:#fafafa;--fg:#111;--muted:#6b6b6b;--line:#e4e4e4;--card:#fff}
+:root{--bg:#fafafa;--fg:#111;--muted:#6b6b6b;--line:#e4e4e4;--card:#fff;color-scheme:light dark}
 @media (prefers-color-scheme:dark){:root{--bg:#0e0e0e;--fg:#f2f2f2;--muted:#9a9a9a;--line:#262626;--card:#161616}}
 *{box-sizing:border-box}html,body{height:100%%;margin:0}
 body{background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;display:grid;place-items:center;padding:16px}

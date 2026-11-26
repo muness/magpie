@@ -64,13 +64,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     test(`${engine} ${lang}: a group names the reasoning levels agents are offered`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       t.after(() => browser.close());
-      const page = await (await browser.newContext({ viewport: { width: 1100, height: 1400 } })).newPage();
+      const page = await (await browser.newContext({ viewport: { width: 1100, height: 1400 }, reducedMotion: "reduce" })).newPage();
       page.setDefaultTimeout(5000);
       page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));
-      await page.goto("http://magpie.test/?view=routing");
+      await page.goto("http://magpie.test/?view=groups");
       await page.locator(".rt-group").first().waitFor();
       const ed = page.locator(".rt-gedit");
       // the editor's Levels row: the field after its label
@@ -101,11 +101,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // window's foot as the editor grew, wheeled to as the reader would:
       // WebKit's own scroll left a sliver of it over the footer and clicked
       // the footer)
-      await page.mouse.move(550, 600);
-      for (let i = 0; i < 10 && (await row().boundingBox()).y > 1400 - 260; i++) {
-        await page.mouse.wheel(0, 300);
-        await page.waitForTimeout(150);
-      }
+      const wheelToRow = async () => {
+        await page.mouse.move(550, 600);
+        for (let i = 0; i < 10 && (await row().boundingBox()).y > 1400 - 260; i++) {
+          await page.mouse.wheel(0, 300);
+          await page.waitForTimeout(150);
+        }
+      };
+      await wheelToRow();
       await row().locator(".segs .opt", { hasText: w.named }).click();
       assert.equal(await row().locator(".hint").textContent(), w.namedHint);
       assert.deepEqual(await chips().allTextContents(), ["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -131,6 +134,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await row().waitFor();
       assert.equal(await row().locator(".segs .opt.on").textContent(), w.named);
       assert.deepEqual(await lit(), ["medium", "xhigh"]);
+      await wheelToRow(); // as above: the row can open under the foot
       await chips().filter({ hasText: /^medium$/ }).click();
       await chips().filter({ hasText: /^xhigh$/ }).click();
       await save();

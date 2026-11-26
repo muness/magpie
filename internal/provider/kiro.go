@@ -42,7 +42,6 @@ import (
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/settings"
-	"github.com/yetone/magpie/internal/steady"
 )
 
 // KiroExecutable finds kiro-cli, which refreshes its own sign-in; a var so
@@ -466,7 +465,7 @@ func writeFileAtomic(path string, b []byte) error {
 	if err != nil {
 		return err
 	}
-	return steady.WriteFile(path, b, 0o600) // on the disk before it is renamed in (#1505)
+	return writeChanged(path, b, 0o600) // on the disk before it is renamed in (#1505)
 }
 
 // kiroPost posts to a sign-in endpoint.
@@ -480,7 +479,7 @@ func kiroPost(ctx context.Context, u, contentType string, body []byte, headers m
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return fmt.Errorf("refreshing Kiro's sign-in: %w", err)
 	}
@@ -521,7 +520,7 @@ func kiroManagement(ctx context.Context, region, token, tokenType, method string
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return err
 	}
@@ -569,7 +568,7 @@ func kiroProfile(ctx context.Context, c kiroCred) (string, error) {
 		KiroAuth{Token: c.access, TokenType: "API_KEY"}.Header(req.Header)
 		req.Header.Set("Content-Type", "application/x-amz-json-1.0")
 		req.Header.Set("X-Amz-Target", "AmazonCodeWhispererService.GetProfile")
-		res, err := http.DefaultClient.Do(req)
+		res, err := Keyed(http.DefaultClient).Do(req)
 		if err != nil {
 			return "", err
 		}

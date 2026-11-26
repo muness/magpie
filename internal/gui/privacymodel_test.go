@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yetone/magpie/internal/pii"
 	"github.com/yetone/magpie/internal/redact"
@@ -99,16 +101,18 @@ type fakeModel struct {
 	did       *[]string
 }
 
-func (f *fakeModel) ID() string        { return f.id }
-func (f *fakeModel) Supported() bool   { return true }
-func (f *fakeModel) Installed() bool   { return f.installed }
-func (f *fakeModel) MinScore() float64 { return 0.5 }
-func (f *fakeModel) Size() int64       { return 1 }
+func (f *fakeModel) ID() string           { return f.id }
+func (f *fakeModel) Supported() bool      { return true }
+func (f *fakeModel) Installed() bool      { return f.installed }
+func (f *fakeModel) ManagesWeights() bool { return true }
+func (f *fakeModel) Generation() string   { return "" }
+func (f *fakeModel) MinScore() float64    { return 0.5 }
+func (f *fakeModel) Size() int64          { return 1 }
 func (f *fakeModel) Find(context.Context, []string) ([][]redact.Found, error) {
 	return nil, nil
 }
 func (f *fakeModel) Now() pii.Status {
-	return pii.Status{Model: f.id, Supported: true, Installed: f.installed, Size: 1}
+	return pii.Status{Model: f.id, ManagedWeights: true, Supported: true, Installed: f.installed, Size: 1}
 }
 func (f *fakeModel) Download(done func()) error {
 	*f.did = append(*f.did, "download "+f.id)
@@ -208,5 +212,160 @@ func TestPrivacyModelPick(t *testing.T) {
 	did = nil
 	if st := do(`{"do":"remove"}`); st.On || strings.Join(did, ", ") != "remove privacy-filter, remove astrlink-guard" {
 		t.Fatalf("remove: %+v %v", st, did)
+	}
+}
+
+// Models folder (MetalHqa on X: both went onto the C: drive): Move… takes
+// the picker's folder and moves what is downloaded there, the state says
+// where the models are and that the user picked it, Move back returns them
+// to magpie's cache, and a cancelled picker moves nothing.
+func TestPrivacyModelFolder(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	t.Cleanup(func() { settings.SetRedactModelDir("") })
+	def := pii.Root()
+	held := filepath.Join(def, "astrlink-guard", "rev", "model.onnx")
+	if err := os.MkdirAll(filepath.Dir(held), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(held, []byte("weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	picked := filepath.Join(t.TempDir(), "models")
+	pick := &pickFolder{dir: picked}
+	srv := webPageHandler(t, folderPick{p: pick}, nil)
+	do := func(body string) privacyModelJSON {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		method := "POST"
+		if body == "" {
+			method = "GET"
+		}
+		srv.ServeHTTP(rec, httptest.NewRequest(method, "/api/privacy-model", strings.NewReader(body)))
+		var st privacyModelJSON
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &st) != nil {
+			t.Fatalf("%s: %d %s", body, rec.Code, rec.Body)
+		}
+		return st
+	}
+	settle := func() privacyModelJSON {
+		t.Helper()
+		for end := time.Now().Add(30 * time.Second); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+			if st := do(""); !st.Moving.Moving {
+				return st
+			}
+		}
+		t.Fatal("the move never ended")
+		return privacyModelJSON{}
+	}
+	if st := do(""); st.FolderSet || st.Folder != tilde(def) {
+		t.Fatalf("before: %+v", st)
+	}
+	pick.dir = ""
+	do(`{"do":"folder"}`)
+	if st := settle(); st.FolderSet {
+		t.Fatalf("a cancelled picker moved: %+v", st)
+	}
+	pick.dir = picked
+	do(`{"do":"folder"}`)
+	st := settle()
+	if !st.FolderSet || st.Folder != tilde(picked) || st.Moving.Error != "" || settings.Load().RedactModelDir != picked {
+		t.Fatalf("moved: %+v", st)
+	}
+	if b, err := os.ReadFile(filepath.Join(picked, "astrlink-guard", "rev", "model.onnx")); err != nil || string(b) != "weights" {
+		t.Fatalf("the model isn't in the picked folder: %v", err)
+	}
+	if _, err := os.Stat(held); !os.IsNotExist(err) {
+		t.Fatalf("the old copy is still there: %v", err)
+	}
+	do(`{"do":"folder","dir":"default"}`)
+	st = settle()
+	if st.FolderSet || st.Folder != tilde(def) || settings.Load().RedactModelDir != "" {
+		t.Fatalf("back: %+v", st)
+	}
+	if _, err := os.Stat(held); err != nil {
+		t.Fatalf("the model didn't come back: %v", err)
+	}
+	// a folder that can't be used is an error, not a move
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest("POST", "/api/privacy-model", strings.NewReader(`{"do":"folder","dir":"relative/path"}`)))
+	if rec.Code == http.StatusOK {
+		t.Fatalf("a relative folder was accepted")
+	}
+}
+
+// folderPick answers the picker with whatever its pointer holds now.
+type folderPick struct {
+	folderOnly
+	p *pickFolder
+}
+
+func (f folderPick) ChooseFolder(s string) (string, error) { return f.p.ChooseFolder(s) }
+
+// pluginFakeModel is a plugin's model (pii/external.go): nothing to
+// download, and unavailable while its plugin is off.
+type pluginFakeModel struct{ *fakeModel }
+
+func (pluginFakeModel) ManagesWeights() bool { return false }
+func (p pluginFakeModel) Now() pii.Status {
+	s := p.fakeModel.Now()
+	s.ManagedWeights, s.Name = false, "My detector"
+	if !p.installed {
+		s.Failed = "the local masking model My detector is unavailable"
+	}
+	return s
+}
+
+// A plugin's model is picked by its id (#6959). One whose plugin is off is
+// refused with why, nothing downloaded and the pick before kept; one whose
+// files are there masks at once, the one before let go. An id no model
+// has is refused.
+func TestPrivacyModelPickPluginModel(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(h, ".cache"))
+	const id = "external/plugin/0123456789abcdef/v1"
+	var did []string
+	guard := &fakeModel{id: pii.AstrLinkGuard, installed: true, did: &did}
+	mine := pluginFakeModel{&fakeModel{id: id, did: &did}}
+	wasOf, wasModels := modelOf, models
+	t.Cleanup(func() { modelOf, models = wasOf, wasModels })
+	modelOf = func(m string) pii.Model {
+		if m == id {
+			return mine
+		}
+		return guard
+	}
+	models = func() []pii.Model { return []pii.Model{guard, mine} }
+	srv := webPageHandler(t, webHost{func() {}}, nil)
+	post := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, httptest.NewRequest("POST", "/api/privacy-model", strings.NewReader(body)))
+		return rec
+	}
+	if rec := post(`{"do":"on","model":"astrlink-guard"}`); rec.Code != http.StatusOK {
+		t.Fatalf("on: %d %s", rec.Code, rec.Body)
+	}
+	did = nil
+	if rec := post(`{"do":"pick","model":"` + id + `"}`); rec.Code == http.StatusOK || !strings.Contains(rec.Body.String(), "My detector is unavailable") {
+		t.Fatalf("picked while its plugin is off: %d %s", rec.Code, rec.Body)
+	}
+	if len(did) != 0 || settings.Load().RedactModelName != pii.AstrLinkGuard {
+		t.Fatalf("refused, yet did %v, name %q", did, settings.Load().RedactModelName)
+	}
+	mine.installed = true
+	if rec := post(`{"do":"pick","model":"` + id + `"}`); rec.Code != http.StatusOK || settings.Load().RedactModelName != id {
+		t.Fatalf("picked: %d %s", rec.Code, rec.Body)
+	}
+	if strings.Join(did, ", ") != "stop astrlink-guard, warm "+id {
+		t.Fatalf("did %v", did)
+	}
+	if rec := post(`{"do":"pick","model":"external/plugin/0123456789abcdef/nope"}`); rec.Code == http.StatusOK {
+		t.Fatalf("an unknown id picked: %d", rec.Code)
 	}
 }

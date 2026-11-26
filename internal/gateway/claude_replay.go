@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/yetone/magpie/internal/bridgesid"
 )
 
 // replaySession is a saved session written for a conversation no run has
@@ -55,7 +57,7 @@ func replaySession(dirs []string, work, model string, req *Request) *savedSessio
 	for _, b := range blocks {
 		delete(b, "cache_control")
 	}
-	sid, user, assistant := newUUID(), newUUID(), newUUID()
+	sid, user, assistant := bridgesid.New(), newUUID(), newUUID()
 	at := time.Now().UTC()
 	line := func(parent any, uuid, kind string, message map[string]any, at time.Time) []byte {
 		b, _ := json.Marshal(map[string]any{
@@ -96,7 +98,9 @@ func replaySession(dirs []string, work, model string, req *Request) *savedSessio
 		return nil
 	}
 	log.Printf("claude: a new Claude Code goes on with the conversation from a transcript of it (%d messages, %d images), typed the last turn's %d", split, countImages(req.Messages[:split]), len(req.Messages)-split)
-	return &savedSession{session: sid, sessions: dirs, since: req.Messages[split:], tui: true, appended: req.appendPrompt}
+	// its first message has no marks: the run keeps its cache as the user
+	// picked (runTTLFor)
+	return &savedSession{session: sid, sessions: dirs, since: req.Messages[split:], tui: true, appended: req.appendPrompt, cachePrefix: cachePrefix{ttl: runTTLFor(req, os.Environ())}}
 }
 
 // replyWords is what a reply says, its thinking left out.

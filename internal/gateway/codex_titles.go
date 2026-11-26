@@ -17,14 +17,13 @@ import (
 
 // codexTitlesTo is where a request Codex makes for a thread's title goes
 // (#705): a hidden turn of its own (thread_title,
-// thread_title_reconsideration), which Codex sends on its own model —
-// gpt-5.6-luna when signed in to ChatGPT, the conversation's model when
-// magpie is its provider. "" for a request that isn't one, or one left to
-// go as Codex sent it; "off", or the model that writes the title:
-// settings.CodexTitles, else the model Codex asked for when it is one of
-// magpie's (ours: the request came to magpie's own API, where every model
-// is). Codex reads a title only as the {"title": …} its text.format asks
-// for, which a model behind the Chat or Anthropic API is never shown, so
+// thread_title_reconsideration), which Codex sends on a model it chooses
+// itself — gpt-5.6-luna when signed in to ChatGPT, its provider list's
+// default or first model when magpie is its provider. "" for a request
+// that isn't one, or one left to go as Codex sent it; "off", or the model
+// that writes the title: settings.CodexTitles, else the conversation's
+// model (codexSideTo). Codex reads a title only as the {"title": …} its
+// text.format asks for, which a model behind the Chat or Anthropic API is never shown, so
 // a title on one of magpie's models goes through codexTitle whoever picked
 // it (#743: Codex as magpie's provider had none at all, the model's plain
 // answer turned down).
@@ -32,7 +31,7 @@ func codexTitlesTo(h http.Header, body []byte, ours bool, session func() string)
 	if !isTitleKind(requestCallKind(h, requestSessionMetadata(h, body))) {
 		return ""
 	}
-	if to := settings.Load().CodexTitles; to != "" {
+	if to := settings.Shared().CodexTitles; to != "" {
 		return to
 	}
 	return codexSideTo(body, ours, session)
@@ -54,12 +53,28 @@ var CodexSideModel func() string
 // (atom_Ray on X: an hour on a third-party model took 2% of the 5-hour
 // window). Those go on the session's model (session: Server.codexSideSession),
 // as the conversation's turns do; on Codex's own, as Codex sent them.
+//
+// With magpie as Codex's provider the model asked for is not the user's
+// pick either: the app asks for a new conversation's title on
+// ephemeralGenerationModel, and when the provider's list lacks it, on the
+// list's default model or else its first (the app's oX), never on the
+// model picked for the conversation (tenacious_eagle_96548 on Discord:
+// the conversation on A/dsf4.1, its title on B/qwen3.7). Those go on the
+// session's model too when magpie knows it, else on the model asked for.
 func codexSideTo(body []byte, ours bool, session func() string) string {
 	m := modelOf(body)
-	if m != "" && (ours || strings.Contains(m, "/")) {
+	if ours {
+		if session != nil {
+			if to := session(); to != "" {
+				return to
+			}
+		}
 		return m
 	}
-	if !ours && session != nil {
+	if strings.Contains(m, "/") {
+		return m
+	}
+	if session != nil {
 		return session()
 	}
 	return ""
@@ -73,7 +88,7 @@ func codexDescriptionsTo(h http.Header, body []byte, ours bool, session func() s
 	if !isDescriptionKind(requestCallKind(h, requestSessionMetadata(h, body))) {
 		return ""
 	}
-	if to := settings.Load().CodexDescriptions; to != "" {
+	if to := settings.Shared().CodexDescriptions; to != "" {
 		return to
 	}
 	// Codex on a magpie model gets no schema upstream (#743), so an empty
@@ -93,6 +108,147 @@ func codexSummariesTo(h http.Header, body []byte, ours bool, session func() stri
 	return codexSideTo(body, ours, session)
 }
 
+// codexCommitsTo is where the Codex app's request to write a commit
+// message or a pull request's text goes (makenxis on X): an ephemeral turn
+// on a model it picks as it does for a title, with the text in a schema
+// of its own ({"message"}, {"title","body"}). A model behind the Chat or
+// Anthropic API never sees that schema and answers in plain text, which
+// the app turns down, so on one of magpie's models the answer is handed
+// back in the schema's shape (codexCommit). "" leaves the request as Codex
+// sent it.
+func codexCommitsTo(h http.Header, body []byte, ours bool, session func() string) string {
+	if !isCommitKind(requestCallKind(h, requestSessionMetadata(h, body))) {
+		return ""
+	}
+	return codexSideTo(body, ours, session)
+}
+
+// codexCommit answers a commit message request as codexCommitsTo says, by
+// that model, its text handed back as the JSON the request's schema asks
+// for.
+func (s *Server) codexCommit(w http.ResponseWriter, r *http.Request, body []byte, to string) {
+	shape := titleShapeOf(body)
+	s.codexShaped(w, r, body, to, "commit message", false, func(said string) string { return commitJSON(said, shape) }, noCommit)
+}
+
+func noCommit(said string) string {
+	said = strings.Join(strings.Fields(said), " ")
+	if said == "" {
+		return "commit message: the model answered with no text, so Codex got no message"
+	}
+	if r := []rune(said); len(r) > 80 {
+		said = string(r[:80]) + "…"
+	}
+	return "commit message: no usable text in the model's answer, so Codex got none: " + said
+}
+
+// commitJSON is a model's answer to a commit message or pull request
+// request as Codex reads one: the JSON object its schema asks for, the
+// model's own when it gave every required string, else made from its text.
+// message is the whole text, its subject (first line) cut to 72 characters,
+// as the app's schema requires; title is the first line (a leading "#" or
+// "Title:" dropped) and body the rest, or the whole text when that is
+// short. "" when the answer holds no text.
+func commitJSON(said string, shape titleShape) string {
+	t := strings.TrimSpace(said)
+	t = afterThought(t)
+	if strings.HasPrefix(t, "```") {
+		t = strings.TrimPrefix(t, "```")
+		if i := strings.IndexByte(t, '\n'); i >= 0 && !strings.Contains(t[:i], "{") {
+			t = t[i+1:]
+		}
+		t = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(t), "```"))
+	}
+	fields := map[string]any{}
+	if strings.HasPrefix(t, "{") {
+		if json.NewDecoder(bytes.NewReader([]byte(t))).Decode(&fields) != nil {
+			return ""
+		}
+	}
+	names := shape.Required
+	if len(names) == 0 {
+		names = []string{"message"}
+	}
+	given := func(name string) string {
+		v, _ := fields[name].(string)
+		return strings.TrimSpace(v)
+	}
+	if len(fields) == 0 {
+		t = strings.TrimSpace(strings.Trim(t, "`"))
+		if low := strings.ToLower(t); strings.HasPrefix(low, "message:") {
+			t = strings.TrimSpace(t[len("message:"):])
+		}
+	}
+	whole := t
+	if len(fields) > 0 {
+		whole = given("message")
+	}
+	var title, body string
+	if len(fields) > 0 {
+		title, body = given("title"), given("body")
+	} else {
+		first, rest, _ := strings.Cut(t, "\n")
+		title = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(first), "# "))
+		if low := strings.ToLower(title); strings.HasPrefix(low, "title:") {
+			title = strings.TrimSpace(title[len("title:"):])
+		}
+		title = strings.Trim(title, "\"'`*")
+		body = strings.TrimSpace(rest)
+		if low := strings.ToLower(body); strings.HasPrefix(low, "body:") {
+			body = strings.TrimSpace(body[len("body:"):])
+		}
+	}
+	clip := func(name, v string) string {
+		if n := shape.Properties[name].MaxLength; n > 0 {
+			if r := []rune(v); len(r) > n {
+				v = strings.TrimSpace(string(r[:n]))
+			}
+		}
+		return v
+	}
+	out := map[string]string{}
+	for _, name := range names {
+		if ty := shape.Properties[name].Type; ty != "" && ty != "string" {
+			continue
+		}
+		var v string
+		switch name {
+		case "message":
+			v = whole
+			if v == "" {
+				v = title
+			}
+			// the subject is the first line, 72 characters at most
+			first, rest, more := strings.Cut(v, "\n")
+			if r := []rune(strings.TrimSpace(first)); len(r) > 72 {
+				first = strings.TrimSpace(string(r[:72]))
+			}
+			v = strings.TrimSpace(first)
+			if more && strings.TrimSpace(rest) != "" {
+				v += "\n\n" + strings.TrimSpace(rest)
+			}
+		case "title":
+			v = title
+		case "body":
+			v = body
+			if v == "" {
+				v = title
+			}
+		default:
+			v = given(name)
+			if v == "" {
+				v = title
+			}
+		}
+		if v == "" {
+			return ""
+		}
+		out[name] = clip(name, v)
+	}
+	b, _ := json.Marshal(out)
+	return string(b)
+}
+
 // codexPredictionsTo is where the Codex app's request to predict the
 // user's next message goes (#1970, pluo): a hidden turn on a fork of the
 // whole conversation (composer_predictions), which the app sends on the
@@ -106,7 +262,7 @@ func codexPredictionsTo(h http.Header, body []byte, ours bool, session func() st
 	if !isPredictionKind(requestCallKind(h, requestSessionMetadata(h, body))) {
 		return ""
 	}
-	if to := settings.Load().CodexPredictions; to != "" {
+	if to := settings.Shared().CodexPredictions; to != "" {
 		return to
 	}
 	// the app asks on the thread's model, but one of Codex's own when the
@@ -155,7 +311,7 @@ func (s *Server) codexTitle(w http.ResponseWriter, r *http.Request, body []byte,
 	}
 	ctx := context.WithValue(r.Context(), titleCheckKey{}, check)
 	ctx = context.WithValue(ctx, titleShapeKey{}, &shape)
-	if to == settings.Load().CodexTitles {
+	if to == settings.Shared().CodexTitles {
 		// the model picked for titles in magpie's settings, not by the
 		// caller's key (#882)
 		ctx = magpieChose(ctx)
@@ -286,7 +442,7 @@ func (s *Server) codexPrediction(w http.ResponseWriter, r *http.Request, body []
 		return ""
 	}
 	ctx := context.WithValue(r.Context(), titleCheckKey{}, check)
-	if to == settings.Load().CodexPredictions {
+	if to == settings.Shared().CodexPredictions {
 		ctx = magpieChose(ctx)
 	}
 	s.serve(rec, r.WithContext(ctx), provider.Responses, codexSideEffort(withModel(body, to), to))

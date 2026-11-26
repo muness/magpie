@@ -6,7 +6,12 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -16,6 +21,8 @@ import (
 	// the zone /usage names its resets in: Windows has no zone database,
 	// and without one a reset was read in the machine's own zone
 	_ "time/tzdata"
+
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // claudeCLIUsage runs Claude Code's /usage in configDir, or its own
@@ -37,14 +44,42 @@ func UsageClaudeVia(f func(ctx context.Context, configDir string) (string, error
 }
 
 // runClaudeUsage is what Claude Code's /usage printed, through
-// claudeCLIUsage; errClaudeCannotRun when nothing set it.
+// claudeCLIUsage; errClaudeCannotRun when nothing set it. It runs for
+// claudeUsageTimeout (claudeUsageCtx), not to the deadline of the refresh
+// it is part of.
 func runClaudeUsage(ctx context.Context, configDir string) (string, error) {
 	claudeCLIUsage.RLock()
 	defer claudeCLIUsage.RUnlock()
 	if claudeCLIUsage.f == nil {
 		return "", errClaudeCannotRun
 	}
+	ctx, done := claudeUsageCtx(ctx)
+	defer done()
 	return claudeCLIUsage.f(ctx, configDir)
+}
+
+// claudeUsageTimeout bounds one Claude Code /usage run. Claude Code 2.1.327
+// asks api.anthropic.com in two rounds before /usage prints (three
+// requests at once, then one more), so a run takes about twice one
+// request's time: 0.3s on a near network, 6.3s with each request 3s, 18.3s
+// with each 9s (a proxy that held each request that long, on mote). It
+// bounds none of them itself: a request that is never answered held the
+// run past 120s. The 20s of a refresh (subscriptionTimeout) killed every
+// read on the owner's Mac, where a request takes longer, and a read killed
+// is no reading at all: the account's last one, days old, stood in for it.
+var claudeUsageTimeout = 45 * time.Second
+
+// claudeUsageCtx is ctx for a /usage run: its deadline claudeUsageTimeout
+// from now, whatever deadline ctx has, and ended when ctx is cancelled
+// otherwise (a caller gone, magpie quitting).
+func claudeUsageCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	run, cancel := context.WithTimeout(context.WithoutCancel(ctx), claudeUsageTimeout)
+	stop := context.AfterFunc(ctx, func() {
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			cancel()
+		}
+	})
+	return run, func() { stop(); cancel() }
 }
 
 // readClaudeUsage is the allowance of the account in configDir, from
@@ -54,13 +89,61 @@ func readClaudeUsage(ctx context.Context, configDir string) ([]QuotaWindow, erro
 	if err != nil {
 		return []QuotaWindow{}, err
 	}
-	return parseClaudeUsage(text, time.Now())
+	ws, err := parseClaudeUsage(text, time.Now())
+	if errors.Is(err, errClaudeUsageUnavailable) && claudeUsageBased(configDir) {
+		// a seat Claude Code itself holds no rate limits for: nothing to
+		// wait for
+		return []QuotaWindow{claudeNoLimitsWindow()}, nil
+	}
+	return ws, err
+}
+
+// ClaudeNoLimitsLine is the line the gateway adds under /usage's text when
+// Claude Code's usage_report has the server reporting no meters (limits:
+// []): the plan has no 5-hour or weekly limits. Read as /usage's text
+// alone (the subscription line, no window), it said "temporarily
+// unavailable" (@andy_chen1997 on X, a Claude Enterprise seat). Its words
+// say no "usage limit", which claudeUsageDenied reads as an account error.
+const ClaudeNoLimitsLine = "Usage report: no meters on this plan"
+
+// claudeNoLimitsWindow is a plan without 5-hour or weekly limits: told as
+// text, set aside, so routing holds nothing against it.
+func claudeNoLimitsWindow() QuotaWindow {
+	return QuotaWindow{Name: "5-hour and weekly limits", Display: "None on this plan", Text: true, Aside: true}
+}
+
+// claudeUsageBased says the account in configDir ("" the user's own) is a
+// seat Claude Code holds no rate limits for, by what it saved of the
+// account's organization (.claude.json's oauthAccount): a usage-based
+// Claude Enterprise seat (seatTier "enterprise_usage_based", Claude
+// Code's vmr) or an organization billed by usage (billingType
+// "usage_based", its fD). Its /usage then never draws a window. A read
+// that fails says no.
+func claudeUsageBased(configDir string) bool {
+	path := claudeProfilePath()
+	if configDir != "" {
+		path = filepath.Join(configDir, ".claude.json")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var p struct {
+		Account *struct {
+			SeatTier    string `json:"seatTier"`
+			BillingType string `json:"billingType"`
+		} `json:"oauthAccount"`
+	}
+	if json.Unmarshal(b, &p) != nil || p.Account == nil {
+		return false
+	}
+	return p.Account.SeatTier == "enterprise_usage_based" || p.Account.BillingType == "usage_based"
 }
 
 // "Current session: 13% used · resets Oct 1 at 3:30pm (Asia/Shanghai)",
 // "Current week (all models): 4% used · resets Oct 3 at 2pm (Asia/Shanghai)",
 // "Current week (Fable): 0% used"
-var claudeUsageLineRE = regexp.MustCompile(`^Current (session|week(?: \(([^)]+)\))?):\s*([0-9.]+)% used(?:\s*·\s*resets (.+))?$`)
+var claudeUsageLineRE = lazyre.New(`^Current (session|week(?: \(([^)]+)\))?):\s*([0-9.]+)% used(?:\s*·\s*resets (.+))?$`)
 
 // A successful /usage run can tell only how the subscription is billed,
 // without an allowance. This says nothing about the account's limits.
@@ -74,13 +157,33 @@ var errClaudeUsageUnavailable = errors.New("Claude Code's /usage is temporarily 
 // account's last reading. Windows' pseudo console showed 2.1.316's panel
 // while it still loaded, and the card said the account had no allowance
 // (Seagull fries).
-var claudeUsageUnknown = regexp.MustCompile(`^(?:Claude Code: )?(?:` + regexp.QuoteMeta(errClaudeUsageUnavailable.Error()) + `|/usage couldn't load the plan's usage)`)
+var claudeUsageUnknown = lazyre.New(`^(?:Claude Code: )?(?:` + regexp.QuoteMeta(errClaudeUsageUnavailable.Error()) + `|/usage couldn't load the plan's usage)`)
 
 var errClaudeCannotRun = errors.New("Claude Code can't be run from here")
 
 // An account error stays visible even when it also mentions a timeout or
 // rate limit. It is not a temporary failure to read the usage endpoint.
-var claudeUsageDenied = regexp.MustCompile(`(?i)\b(401|403)\b|not (logged|signed) in|signed out|sign-in (has )?expired|unauthorized|forbidden|authentication (failed|required)|invalid (access )?token|(session|usage) limit|hit your limit`)
+var claudeUsageDenied = lazyre.New(`(?i)\b(401|403)\b|not (logged|signed) in|signed out|sign-in (has )?expired|unauthorized|forbidden|authentication (failed|required)|invalid (access )?token|(session|usage) limit|hit your limit`)
+
+// claudeDenied says s tells an account error (claudeUsageDenied). Claude
+// Code's "(not your usage limit)", which it says of Anthropic turning the
+// usage page's requests away for a while ("Claude is temporarily limiting
+// requests to the usage page (not your usage limit)"), tells none: read as
+// one, a /usage that couldn't load had the account refused.
+func claudeDenied(s string) bool {
+	return claudeUsageDenied.MatchString(claudeNotYourLimit.ReplaceAllString(s, ""))
+}
+
+var claudeNotYourLimit = lazyre.New(`(?i)\(not your usage limit\)`)
+
+// claudeUsageCounts is /usage's closing line of the account's local
+// activity ("Last 7d · 403 requests · 388 sessions"), with the " · "
+// before it wherever it sits in a line: counts, not the HTTP statuses a
+// count of 401 or 403 reads as (SCIYYDy, #4995). Taken out, what is left
+// of the line is read: "Last 7d · 403 requests · 388 sessions · HTTP 403
+// Forbidden" is an account error. Any span and a count with thousands
+// separators ("1,403 requests") are counts too.
+var claudeUsageCounts = lazyre.New(`(?: · )?Last [0-9]+[a-z]+ · [0-9][0-9,]* requests? · [0-9][0-9,]* sessions?`)
 
 // claudeOverages is /usage's line for an account past its plan's limits
 // and billed for what it uses ("You are currently using your overages to
@@ -90,7 +193,44 @@ var claudeUsageDenied = regexp.MustCompile(`(?i)\b(401|403)\b|not (logged|signed
 // one, the reading had no windows and an error, and the switch, which
 // stays on an account it can't read, left Claude Code spending overages
 // with other accounts that had room (StringKe, #4532).
-var claudeOverages = regexp.MustCompile(`(?i)using your overages`)
+var claudeOverages = lazyre.New(`(?i)using your overages`)
+
+// claudeExtraLineRE is the line the gateway adds under /usage's text for an
+// account with extra usage on ("usage credits"): Claude Code's -p /usage
+// prints no figure for it, but the usage_report it carries (verbose json)
+// has the month's cap and spend, which Claude Code read from Anthropic, so
+// magpie asks Anthropic nothing. "Extra usage: 271.40 / 500.00 USD spent".
+// ClaudeExtraLine writes it.
+var claudeExtraLineRE = lazyre.New(`^Extra usage: ([0-9.]+) / ([0-9.]+) ([A-Za-z]{3}) spent$`)
+
+// ClaudeExtraLine is the line for spent and limit, in cents of currency.
+func ClaudeExtraLine(spent, limit float64, currency string) string {
+	if currency == "" {
+		currency = "USD"
+	}
+	return fmt.Sprintf("Extra usage: %.2f / %.2f %s spent", spent/100, limit/100, strings.ToUpper(currency))
+}
+
+// claudeExtraWindow reads that line, when text has it: the month's spend of
+// the cap set aside (Aside), so a cap spent never stops the account the way
+// a plan window used up does: only Anthropic decides whether a request
+// spends it.
+func claudeExtraWindow(lines []string) (QuotaWindow, bool) {
+	for _, line := range lines {
+		m := claudeExtraLineRE.FindStringSubmatch(strings.TrimSpace(line))
+		if m == nil {
+			continue
+		}
+		spent, err1 := strconv.ParseFloat(m[1], 64)
+		limit, err2 := strconv.ParseFloat(m[2], 64)
+		if err1 != nil || err2 != nil || limit <= 0 {
+			continue
+		}
+		return QuotaWindow{Name: "Usage credits", Used: math.Min(100, spent/limit*100), Aside: true, Extra: true,
+			Amount: spent, Limit: limit, Unit: strings.ToUpper(m[3])}, true
+	}
+	return QuotaWindow{}, false
+}
 
 // claudeOveragesWindow is the window an account on overages is read with,
 // beside ws: spent (usedPast, roomLeft), so the switch moves Claude Code
@@ -116,7 +256,10 @@ func parseClaudeUsage(text string, now time.Time) ([]QuotaWindow, error) {
 	lines := strings.Split(text, "\n")
 	// Account errors take precedence over notices (and partial readings).
 	for _, line := range lines {
-		if claudeUsageDenied.MatchString(line) {
+		// the counts are no HTTP status, wherever the line has them: the
+		// interactive panel's words come joined on one line
+		// (claudetui.usagePart)
+		if claudeDenied(claudeUsageCounts.ReplaceAllString(line, "")) {
 			return out, errors.New("Claude Code's /usage told no allowance: " + clipLine(strings.TrimSpace(line)))
 		}
 	}
@@ -158,22 +301,62 @@ func parseClaudeUsage(text string, now time.Time) ([]QuotaWindow, error) {
 		out = append(out, claudeOveragesWindow(out))
 	}
 	if len(out) == 0 {
+		if slices.ContainsFunc(lines, func(line string) bool { return strings.TrimSpace(line) == ClaudeNoLimitsLine }) {
+			out = append(out, claudeNoLimitsWindow())
+			if w, ok := claudeExtraWindow(lines); ok {
+				out = append(out, w)
+			}
+			return out, nil
+		}
+		if text == claudeNoWindow {
+			// the interactive panel loaded with none of the account's
+			// windows: none has started (claudeWithUnstarted)
+			return out, nil
+		}
 		if text == "" || slices.ContainsFunc(lines, func(line string) bool {
 			return strings.TrimSuffix(strings.TrimSpace(line), ".") == "You are currently using your subscription to power your Claude Code usage"
 		}) {
 			return out, errClaudeUsageUnavailable
 		}
 		// a panel with no figure says nothing of the account's allowance:
-		// unknown, its words told
-		first, _, _ := strings.Cut(text, "\n")
-		return out, errors.New("Claude Code's /usage showed no usage figures: " + clipLine(first))
+		// unknown, its words told whole, not the first line clipped, which
+		// left out why (koohoko5924); its counts, told in the error, would
+		// read as a 401 or 403 where the error is matched again
+		// (claudeUsageDenied)
+		var said []string
+		for _, line := range lines {
+			line = strings.TrimSpace(claudeUsageCounts.ReplaceAllString(line, ""))
+			if line != "" {
+				said = append(said, line)
+			}
+		}
+		if len(said) == 0 {
+			return out, errors.New("Claude Code's /usage showed no usage figures")
+		}
+		return out, errors.New("Claude Code's /usage showed no usage figures: " + clipReason(strings.Join(said, " · ")))
+	}
+	if w, ok := claudeExtraWindow(lines); ok {
+		out = append(out, w)
 	}
 	return out, nil
 }
 
+// claudeNoWindow is the helper's word for an interactive /usage panel that
+// loaded with no window drawn (claudetui.NoUsageWindow). The gateway reads
+// /usage through -p since #5582, which says no such thing.
+const claudeNoWindow = "No usage window has started"
+
 func clipLine(s string) string {
 	if r := []rune(s); len(r) > 120 {
 		return string(r[:120]) + "…"
+	}
+	return s
+}
+
+// clipReason is a failure's words, kept long enough to say why.
+func clipReason(s string) string {
+	if r := []rune(s); len(r) > 600 {
+		return string(r[:600]) + "…"
 	}
 	return s
 }
@@ -192,6 +375,10 @@ func claudeResetTime(s string, now time.Time, span time.Duration) (time.Time, bo
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return time.Time{}, false
+	}
+	// a usage_report row's resets_at, which the gateway adds as written
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, true
 	}
 	loc := time.Local
 	if i := strings.LastIndex(s, "("); i >= 0 && strings.HasSuffix(s, ")") {

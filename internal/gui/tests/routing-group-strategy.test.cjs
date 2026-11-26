@@ -25,10 +25,10 @@ const info = [{ id: "a/sol", ready: true }, { id: "b/flash", ready: true }, { id
 const base = { members: ["a/sol", "b/flash", "c/luna"], ready: true, memberInfo: info, offers: [], shared: [] };
 
 const words = {
-  en: { order: "In order", manual: "Manual", weight: "By weight", smart: "Smart", head: "Routing", edit: "Edit",
-    names: ["Smart", "In order", "Until used up", "In turn", "Least used", "Use before expiry", "Free first", "Speed first", "Cheapest first", "Free quota by expiry", "By weight", "Manual"],
+  en: { order: "In order", manual: "Manual", weight: "By weight", smart: "Quota first", head: "Routing", edit: "Edit",
+    names: ["Quota first", "In order", "Until used up", "In turn", "Least used first", "Use before expiry", "Free first", "Speed first", "Cheapest first", "Free quota by expiry", "Small context first", "By weight", "Manual"],
     tip: "How Auto routes: click to change it", saved: "Auto: Manual" },
-  zh: { order: "按顺序", manual: "手动", weight: "按权重", smart: "智能", head: "路由", edit: "编辑",
+  zh: { order: "按顺序", manual: "手动", weight: "按权重", smart: "额度优先", head: "路由", edit: "编辑",
     tip: "Auto 的路由方式：点击更改", saved: "Auto：手动" },
   "zh-TW": { tip: "Auto 的路由方式：點擊更改" },
   ja: { tip: "Auto のルーティング方法：クリックで変更" },
@@ -86,7 +86,7 @@ async function open(t, engine, { lang, theme = "light", web = true, width = 1100
   const errors = [], posts = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/*", serve(lang, theme, web, posts));
-  await page.goto("http://magpie.test/?view=routing");
+  await page.goto("http://magpie.test/?view=groups");
   await page.locator(".rt-group", { hasText: "Auto" }).waitFor();
   return { page, errors, posts };
 }
@@ -94,7 +94,7 @@ async function open(t, engine, { lang, theme = "light", web = true, width = 1100
 // the reader wheels the row into the middle of the view (code that scrolls
 // is put back: only the reader moves the view)
 async function wheelTo(page, row, width) {
-  const dy = await row.evaluate((g) => { const v = document.querySelector("#view-routing");
+  const dy = await row.evaluate((g) => { const v = document.querySelector("#view-groups");
     return Math.round(g.getBoundingClientRect().top - v.getBoundingClientRect().top - v.clientHeight / 2); });
   await page.mouse.move(width / 2, 400);
   await page.mouse.wheel(0, dy);
@@ -124,8 +124,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await page.locator(".rt-group select, select").count(), 0, "no native select");
 
         // the reader scrolls the card to the middle, then opens its routing
-        const view = page.locator("#view-routing");
-        const dy = await card().evaluate((g) => { const v = document.querySelector("#view-routing");
+        const view = page.locator("#view-groups");
+        const dy = await card().evaluate((g) => { const v = document.querySelector("#view-groups");
           return Math.round(g.getBoundingClientRect().top - v.getBoundingClientRect().top - v.clientHeight / 2); });
         await page.mouse.move(550, 400);
         await page.mouse.wheel(0, dy);
@@ -140,7 +140,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await menu.locator(".pm-head").textContent(), w.head);
         const items = menu.locator(".pm-item");
         if (w.names) assert.deepEqual(await items.locator(".pm-name").allTextContents(), w.names);
-        assert.equal(await items.count(), 12);
+        assert.equal(await items.count(), 13);
         assert.deepEqual(await menu.locator('.pm-item[aria-checked="true"] .pm-name').allTextContents(), [w.order]);
         assert.equal(await page.locator(".rt-gedit").count(), 0, "opening the menu opens no editor");
         // the menu sits inside the window
@@ -213,8 +213,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await menu.waitFor();
       const box = await menu.boundingBox();
       assert.ok(box.x >= 0 && box.x + box.width <= width, JSON.stringify(box));
-      await menu.locator(".pm-item", { hasText: "Smart" }).click();
-      await page.waitForFunction(() => document.querySelector('.rt-group[data-id="auto"] .rt-groute')?.textContent === "Smart");
+      await menu.locator(".pm-item", { hasText: "Quota first" }).click();
+      await page.waitForFunction(() => document.querySelector('.rt-group[data-id="auto"] .rt-groute')?.textContent === "Quota first");
       assert.equal(posts.at(-1).body.routing, "");
       assert.deepEqual(errors, []);
     });
@@ -229,7 +229,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal(await btn.getAttribute("title"), words[lang].tip);
       await btn.click();
       await page.locator(".proto-menu").waitFor();
-      assert.equal(await page.locator(".proto-menu .pm-item").count(), 12);
+      assert.equal(await page.locator(".proto-menu .pm-item").count(), 13);
       assert.deepEqual(errors, []);
     });
   }

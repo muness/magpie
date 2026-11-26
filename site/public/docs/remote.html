@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Remote magpie · magpie docs</title>
+<title>Remote magpie: one AI gateway for every computer on your network · magpie</title>
 <meta name="description" content="Use one magpie from several computers: share it on the network, add it on each other computer as a Remote magpie (app, TUI or CLI), and what comes over: models, routing groups, images, System One, prices and quotas.">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fafafa">
@@ -39,6 +39,54 @@
 <meta property="og:image" content="https://usemagpie.ai/img/og.png">
 <meta property="og:url" content="https://usemagpie.ai/docs/remote">
 <meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "TechArticle",
+   "headline": "Remote magpie",
+   "description": "Use one magpie from several computers: share it on the network, add it on each other computer as a Remote magpie (app, TUI or CLI), and what comes over: models, routing groups, images, System One, prices and quotas.",
+   "inLanguage": "en",
+   "url": "https://usemagpie.ai/docs/remote",
+   "about": {
+    "@type": "SoftwareApplication",
+    "name": "magpie",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS, Windows, Linux"
+   },
+   "publisher": {
+    "@type": "Organization",
+    "name": "magpie",
+    "url": "https://usemagpie.ai/"
+   }
+  },
+  {
+   "@type": "BreadcrumbList",
+   "itemListElement": [
+    {
+     "@type": "ListItem",
+     "position": 1,
+     "name": "magpie",
+     "item": "https://usemagpie.ai/"
+    },
+    {
+     "@type": "ListItem",
+     "position": 2,
+     "name": "Docs",
+     "item": "https://usemagpie.ai/docs/start"
+    },
+    {
+     "@type": "ListItem",
+     "position": 3,
+     "name": "Remote magpie",
+     "item": "https://usemagpie.ai/docs/remote"
+    }
+   ]
+  }
+ ]
+}
+</script>
 </head>
 <body>
 
@@ -55,6 +103,13 @@
     <a class="toc-only" href="/docs/masking">Privacy masking</a>
     <a class="toc-only" href="/docs/mcp-router">MCP router</a>
     <a class="toc-only" href="/docs/library">Library</a>
+    <a class="toc-only" href="/docs/claude-code-models">Models in Claude Code</a>
+    <a class="toc-only" href="/docs/codex-models">Models in Codex</a>
+    <a class="toc-only" href="/docs/gemini-cli-models">Models in Gemini CLI</a>
+    <a class="toc-only" href="/docs/subscriptions">Subscriptions in any agent</a>
+    <a class="toc-only" href="/docs/local-models">Local models</a>
+    <a class="toc-only" href="/docs/opencode-models">Models in OpenCode</a>
+    <a class="toc-only" href="/docs/alternatives">magpie vs CC Switch vs CCR</a>
     <a href="/docs/import">Add to magpie</a>
     <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie-releases/releases">Releases</a>
@@ -82,6 +137,7 @@
     <a href="#models">What you get</a>
     <a href="#quotas">Quotas and usage</a>
     <a href="#keys">Short-lived keys</a>
+    <a href="#admin">Management API</a>
     <a href="#oidc">Keys for GitHub Actions</a>
     <a href="#api">Stats API</a>
     <a href="#trouble">When it doesn’t work</a>
@@ -190,11 +246,38 @@ steps:
     </div>
     <p>The key is issued under the rule’s gateway key and held to it like any other issued key, lives no longer than the rule says, and is named after the repository, branch and run. A token from another repository or branch, an expired one, or one already traded gets <code>401</code> and why. The route answers another computer only while magpie is shared, and refused tokens count against the failed sign-ins it allows. Without a rule nothing is traded.</p>
 
+    <h2 id="admin"><a class="anchor" href="#admin">Management API</a></h2>
+    <p>Providers, accounts, gateway keys, account groups and routing groups can be managed with no hand-edited file, by a key you allow to. Allow it from the key’s menu in the app, under Advanced, or from the command line (not through the API: a key can't give another more than it has):</p>
+    <div class="code">
+      <span class="lang">Shell</span>
+      <button class="copy" data-copy="ex-admin">Copy</button>
+      <pre id="ex-admin">magpie gateway-key add automation
+magpie gateway-key admin &lt;id&gt; local   <span class="c"># this computer only</span>
+magpie gateway-key admin &lt;id&gt; any     <span class="c"># also from other computers</span>
+curl -s http://127.0.0.1:3425/v1/magpie/admin/providers -H "Authorization: Bearer $KEY"
+curl -s -X POST http://127.0.0.1:3425/v1/magpie/admin/gateway-keys/add-key \
+  -H "Authorization: Bearer $KEY" -d '{"name":"ci"}'</pre>
+    </div>
+    <p>It answers the same as the app’s own pages do, under <code>/v1/magpie/admin/</code>: <code>GET providers</code>, <code>POST provider/{save,delete,on,off,name,…}</code>, <code>POST keys/…</code> (a provider’s keys), <code>GET</code>/<code>POST gateway-keys[/{add-key,rename-key,limit-key,models-key,remove-key,…}]</code>, <code>GET</code>/<code>POST account-groups[/…]</code>, <code>GET routing-groups[/{id}]</code> and <code>POST routing-groups/{create,update,delete,switch,…}</code> (the Routing page’s groups and combos, checked as the app checks them; <code>update</code> changes only the fields you send), and <code>POST signin</code> with <code>{"agent":…}</code>, which answers the vendor’s page and the code to type there, never a password; open it on a computer with a browser. A saved key and a gateway key’s secret are never told again, and what changes this computer’s apps is not served. Sign-ins are not exported: that would hand out every account’s secrets.</p>
+    <p>A key that is read-only, the extension’s, issued or short-lived, or the sharing key, can’t have it. A web page can’t call it, with a key or without (any request with <code>Origin</code> or <code>Sec-Fetch-*</code> is refused), and nor can a request under another name for this computer. Shared over the network, only a key set to <code>any</code> gets in.</p>
+
+    <h2 id="memory"><a class="anchor" href="#memory">Memory from other computers</a></h2>
+    <p>Magpie Memory answers the agents on this computer. To let an agent on another computer read and save it too, give that agent a gateway key of its own and allow it, from the key’s menu in the app under Advanced › Magpie Memory, or from the command line:</p>
+    <div class="code">
+      <span class="lang">Shell</span>
+      <button class="copy" data-copy="ex-memory">Copy</button>
+      <pre id="ex-memory">magpie gateway-key add remote-box
+magpie gateway-key memory &lt;id&gt; on</pre>
+    </div>
+    <p>While magpie is shared, that agent uses <code>http://&lt;this computer&gt;:3425/mcp/magpie/memory</code> with <code>Authorization: Bearer &lt;key&gt;</code>, or finds <code>magpie-memory</code> in the MCP router. What it saves goes into every agent’s instructions here, so no other key gets it: not the sharing key, a read-only, issued or short-lived key, nor a web page, with the key or without.</p>
+    <p>The Library’s other MCP servers through the MCP router: a key with a model, account or spend limit isn’t given the ones that run as programs on the shared computer. See <a href="/docs/mcp-router#away">From another computer</a>.</p>
+
     <h2 id="api"><a class="anchor" href="#api">Stats API</a></h2>
     <p>What the Usage page shows is also served as JSON, to this computer and, while magpie is shared, to a request with a gateway key. A key held to a budget, models or accounts is told only its own calls and limit, and the quotas of what it may use once its owner turns on <span class="ui">Quotas</span> for it (<code>magpie gateway-key quotas &lt;id&gt; on</code>).</p>
     <ul>
       <li><code>/v1/magpie/usage?period=today|7d|30d|all</code>: totals, by model, agent, provider, account and gateway key.</li>
       <li><code>/v1/magpie/usage/requests</code>: the request log, with <code>period</code>, <code>day</code>, <code>offset</code>, <code>limit</code>, and filters <code>model</code>, <code>agent</code>, <code>provider</code>, <code>account</code>, <code>callerKey</code>, <code>failed=1</code>, <code>retried=1</code> and <code>q</code>.</li>
+      <li><code>/v1/magpie/usage/requests?cursor=start</code>: the same requests as changes for a ledger of your own: <code>rows</code> to upsert by a stable <code>id</code> (with <code>original_ids</code>), <code>deleted</code> ids, <code>next_cursor</code> and <code>has_more</code>; <code>cursor=now</code> reads only what comes after, and a cursor magpie cannot resume from is refused with a <code>code</code>, never skipped.</li>
       <li><code>/v1/magpie/quotas</code>: each subscription’s windows (<code>?kept=1</code> without asking the vendors); <code>/v1/magpie/quotas/history?days=</code>: what was left over time, 45 days at most.</li>
       <li><code>/v1/magpie/limit</code>: the key’s own limits, its expiry, and its issuer’s limits; for a held key, what holds it (<code>heldTo</code>), its <code>models</code>, and whether it is told quotas (<code>quotas</code>, <code>quotaProviders</code>).</li>
       <li><code>/v1/magpie/concurrency</code>: requests in flight, per account.</li>
@@ -238,6 +321,13 @@ curl -s http://127.0.0.1:3425/v1/magpie/concurrency</pre>
     <a href="/docs/masking">Privacy masking</a>
     <a href="/docs/mcp-router">MCP router</a>
     <a href="/docs/library">Library</a>
+    <a href="/docs/claude-code-models">Models in Claude Code</a>
+    <a href="/docs/codex-models">Models in Codex</a>
+    <a href="/docs/gemini-cli-models">Models in Gemini CLI</a>
+    <a href="/docs/subscriptions">Subscriptions in any agent</a>
+    <a href="/docs/local-models">Local models</a>
+    <a href="/docs/opencode-models">Models in OpenCode</a>
+    <a href="/docs/alternatives">magpie vs CC Switch vs CCR</a>
     <a href="/docs/import">Add to magpie</a>
     <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>

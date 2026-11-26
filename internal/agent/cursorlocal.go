@@ -26,7 +26,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -35,6 +34,7 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
 )
@@ -193,7 +193,7 @@ func cursorLocalProduct(res string) (cursorProduct, bool) {
 	return p, strings.EqualFold(strings.TrimSpace(p.NameShort), cursorLocalName)
 }
 
-var plistExeRe = regexp.MustCompile(`<key>CFBundleExecutable</key>\s*<string>([^<]+)</string>`)
+var plistExeRe = lazyre.New(`<key>CFBundleExecutable</key>\s*<string>([^<]+)</string>`)
 
 // plistExecutable is CFBundleExecutable of an XML Info.plist, "" when it
 // can't be read.
@@ -326,7 +326,7 @@ func cursorLocal() *Agent {
 }
 
 // pickedEfforts are the levels an agent's effort picked in magpie
-// (provider.AgentEffort: Cursor Private Inference, Antigravity) is picked
+// (provider.AgentEffort: Cursor Private Inference, Antigravity, agy) is picked
 // among: the default, its requests going as it asks, then every level a
 // model its list shows has (low, medium and high for models that reason
 // with levels unknown). None when no model it lists reasons.

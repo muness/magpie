@@ -78,7 +78,7 @@ func searchRestFor(vendor string, status int, retryAfter string, now time.Time) 
 // restSearchKey sets a key resting for d; a rest it has that ends later
 // is kept.
 func restSearchKey(vendor, key string, d time.Duration, why string, now time.Time) {
-	r := keyRest{Until: now.Add(d), Why: why}
+	r := keyRest{Until: onWall(now.Add(d)), Why: why}
 	if was, ok := searchKeyRest(vendor, key, now); ok && was.Until.After(r.Until) {
 		return
 	}
@@ -100,6 +100,15 @@ func searchKeyRest(vendor, key string, now time.Time) (keyRest, bool) {
 		return keyRest{}, false
 	}
 	return r, true
+}
+
+// SearchKeyRest is why a search API's key rests now (searchKeyOrder asks
+// it last), and until when; "" when it doesn't.
+func SearchKeyRest(vendor, key string) (string, time.Time) {
+	if r, ok := searchKeyRest(vendor, key, time.Now()); ok {
+		return r.Why, r.Until
+	}
+	return "", time.Time{}
 }
 
 // searchKeyOrder is the order a search asks a's keys in, by their index:

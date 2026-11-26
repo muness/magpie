@@ -1,18 +1,24 @@
 // usemagpie.ai. Releases live on GitHub (yetone/magpie-releases); this
 // worker turns the newest one into the update feed the app reads and into
-// download links that never go stale.
+// download links that never go stale, and serves their files from R2,
+// copied there from GitHub (files.js).
 //
-//   /api/latest            {version, notes, url, published, assets: {name: {url, size, sha256}}}
+//   /api/latest            {version, notes, url, published, assets: {name: {url, api, size, sha256}}}
 //   /api/latest?channel=stable
 //                          the same for Settings' Stable channel: a release a
 //                          week, an urgent one at once ("The Stable channel"
 //                          below), with channel and urgent; 503 while unknown
+//   /api/latest?channel=daily
+//                          the same for the Daily channel: the newest release
+//                          with a green CI run and all its files, picked once
+//                          a day at 20:00 UTC ("The Daily channel" below)
 //   /api/notes?after=&upto=&limit= {releases: [{version, notes, url, published}]}, newest
 //                          first: what changed since the version an app last ran
 //                          Both take ?lang=zh for the notes in Chinese, where a
 //                          release has them (below its <!-- lang:zh --> marker);
 //                          any other lang, or none, is the English alone.
-//   /api/partners          {partners: [...]}: the add sheet's Partners (partners.js),
+//   /api/partners          {partners: [...]}: the add sheet's and the Plugins
+//                          page's Partners (partners.js),
 //                          their website and key links through /go
 //   /go/<id>/keys[/<region>], /go/<id>/site[/<region>]
 //                          a partner's key page or website, counted
@@ -32,22 +38,41 @@
 //   /download/windows      the Windows app (x64);  /download/windows-arm64
 //   /download/linux        the Linux app (x86-64); /download/linux-arm64
 //   /download/<file>       any file of the newest release, by name
+//   /download/stable, /download/stable/<platform or file>
+//                          the same from the Stable channel's release
+//   /download/daily, /download/daily/<platform or file>
+//                          the same from the Daily channel's release
+//   /files/<tag>/<file>    a release's file from R2 (files.js), the feed's
+//                          url and /download's for the files R2 holds;
+//                          GitHub's own address for any it doesn't
+//   /dl/<tag>/<file>       a release's file through GitHub's API, the feed's
+//                          url while github.com's download address fails
 //   /r/...                 the pages' PostHog snippet, passed on to PostHog
 //                          (relay, below) so a blocker that knows its host
 //                          doesn't drop the count
 //   /docs, /docs/zh, /docs/ja  the getting-started guide: /docs/start, /docs/<lang>/start
-//   /zh/, /ja/, /de/       the home page in Chinese, Japanese, German (i18n.js);
+//   /zh/, /zh-tw/, /ja/, /de/  the home page in Chinese (Simplified and
+//                          Traditional), Japanese, German (i18n.js);
 //                          / sends a browser that prefers one of them there,
 //                          until a language is picked on the page (the lang
-//                          cookie). /de/ has no docs: its links go to English.
+//                          cookie). /zh-tw/'s docs links go to the Chinese
+//                          docs, /de/'s to English.
+//   /a/<id>, /api/shares, /api/shares/<id>
+//                          shared artifacts: a page a magpie user shared,
+//                          and sharing, updating and taking one down
+//                          (shares.js); a.usemagpie.ai serves their files
 //
 // Everything else is the static site in public/.
 
 import { LANGS } from "./i18n.js";
 import { PARTNERS } from "./partners.js";
 import { SPONSORS } from "./sponsors.js";
+import { serve as serveFile, held, onR2, mirror, githubFile } from "./files.js";
+import { handle as pluginStats, prune as prunePlugins } from "./pluginstats.js";
+import { api as shareAPI, page as sharePage, content as shareContent, prune as pruneShares, CONTENT as SHARE_HOST } from "./shares.js";
 
 const REPO = "yetone/magpie-releases";
+const SITE = "https://usemagpie.ai";
 const TTL = 300; // seconds the newest release is remembered
 
 const SHORT = {
@@ -73,22 +98,36 @@ const DOC_LANGS = ["zh", "ja"];
 export default {
   async fetch(req, env, ctx) {
     const url = new URL(req.url);
+    // shared artifacts' own host serves their files and nothing else
+    if (url.hostname === SHARE_HOST) return shareContent(req, env);
     if (url.hostname.startsWith("www.")) {
       url.hostname = url.hostname.slice(4);
       return Response.redirect(url.toString(), 301);
     }
+    if (url.pathname === "/api/shares" || url.pathname.startsWith("/api/shares/")) return shareAPI(req, env, ctx);
+    if (url.pathname.startsWith("/a/")) {
+      const got = await sharePage(req, env);
+      if (got) return got;
+    }
+    if (url.pathname === "/api/plugins/tagged") return taggedPlugins(ctx);
+    if (url.pathname === "/api/plugins/readme") return pluginReadme(ctx, url.searchParams.get("name"));
+    if (url.pathname.startsWith("/api/plugins/")) {
+      const got = await pluginStats(req, env, ctx);
+      if (got) return got;
+    }
     if (url.pathname === "/api/latest") {
       const lang = url.searchParams.get("lang");
-      // Settings' Stable channel; any other channel, or none, is every
-      // version as it comes out
-      if (url.searchParams.get("channel") === "stable") {
-        const got = await stable(ctx, env, Date.now());
-        if (!got) return json({ error: "the stable version isn't known yet" }, 503, NO_STORE);
-        return json({ ...got.rel, notes: inLang(got.rel.notes, lang) }, 200, cacheFor(got));
+      // Settings' Stable and Daily channels; any other channel, or none,
+      // is every version as it comes out
+      const ch = url.searchParams.get("channel");
+      if (CHANNELS[ch]) {
+        const got = await CHANNELS[ch](ctx, env, Date.now());
+        if (!got) return json({ error: `the ${ch} version isn't known yet` }, 503, NO_STORE);
+        return json({ ...(await fromR2(ctx, env, got.rel)), notes: inLang(got.rel.notes, lang) }, 200, cacheFor(got));
       }
       const got = await latest(ctx, env);
       if (!got) return json({ error: "no release yet" }, 503, NO_STORE);
-      return json({ ...got.rel, notes: inLang(got.rel.notes, lang) }, 200, cacheFor(got));
+      return json({ ...(await fromR2(ctx, env, got.rel)), notes: inLang(got.rel.notes, lang) }, 200, cacheFor(got));
     }
     if (url.pathname === "/api/partners") {
       const now = Date.now();
@@ -100,7 +139,7 @@ export default {
       let id, what, region, to, counted;
       try {
         [, , id, what, region] = url.pathname.split("/").map(decodeURIComponent);
-        if ((to = goTarget(PARTNERS, id, what, region))) counted = ["magpie partner go", { id, what, region: region || "" }];
+        if ((to = goTarget(PARTNERS, id, what, region))) counted = ["magpie partner go", { id, what, region: region || "", slot: PARTNERS.find((p) => p.id === id).plugin ? "plugins" : "providers" }];
         else if (region === undefined && (to = sponsorTarget(SPONSORS, id, what))) counted = ["magpie sponsor go", { id, where: what }];
       } catch {}
       if (!to) return new Response("not found\n", { status: 404 });
@@ -127,15 +166,26 @@ export default {
       return json({ releases: pick }, 200, cacheFor(got));
     }
     if (url.pathname === "/api/icon") return icon(url.searchParams.get("url"));
+    const file = url.pathname.match(/^\/files\/(v[0-9][0-9A-Za-z.+-]*)\/([0-9A-Za-z._+-]+)$/);
+    if (file) return serveFile(req, env, REPO, file[1], file[2]);
+    const dl = url.pathname.match(/^\/dl\/(v[0-9][0-9A-Za-z.+-]*)\/([0-9A-Za-z._+-]+)$/);
+    if (dl) return detour(ctx, env, dl[1], dl[2]);
     if (url.pathname.startsWith(RELAY)) return relay(req, url);
     if (url.pathname === "/download" || url.pathname.startsWith("/download/")) {
-      const want = url.pathname.split("/")[2] || "mac-arm64";
-      const got = await latest(ctx, env);
-      const asset = got && got.rel.assets && got.rel.assets[SHORT[want] || want];
-      if (!asset) return new Response("not found\n", { status: 404 });
-      if (req.method === "GET") ctx.waitUntil(capture("magpie site download", { link: want, file: SHORT[want] || want, client: client(req), country: country(req) }));
+      // /download/stable/... and /download/daily/...: the same from that
+      // channel's release (the home page's Stable choice, fishmagic80 on X)
+      const parts = url.pathname.split("/");
+      const ch = CHANNELS[parts[2]] ? parts[2] : "";
+      const want = parts[ch ? 3 : 2] || "mac-arm64";
+      const got = ch ? await CHANNELS[ch](ctx, env, Date.now()).catch(() => null) : await latest(ctx, env);
+      const rel = got && (await fromR2(ctx, env, got.rel));
+      const asset = rel && rel.assets && rel.assets[SHORT[want] || want];
+      if (!asset) return new Response(ch && !got ? `the ${ch} version isn't known yet\n` : "not found\n", { status: ch && !got ? 503 : 404, headers: NO_STORE });
+      if (req.method === "GET") ctx.waitUntil(capture("magpie site download", { link: ch ? ch + "/" + want : want, file: SHORT[want] || want, client: client(req), country: country(req) }));
       return Response.redirect(asset.url, 302);
     }
+    // crawlers and old browsers ask for /favicon.ico whatever the page links
+    if (url.pathname === "/favicon.ico") return Response.redirect(new URL("/favicon.png", url).toString(), 301);
     const guide = DOCS[url.pathname.replace(/\/+$/, "")];
     if (guide) return Response.redirect(new URL(guide, url).toString(), 302);
     const moved = MOVED[url.pathname.replace(/(\.html)?\/*$/, "")];
@@ -144,7 +194,7 @@ export default {
     // does, until a language is picked
     const doc = url.pathname.match(/^\/docs\/([a-z-]+)(\.html)?$/);
     if (doc && !DOC_LANGS.includes(doc[1]) && (req.method === "GET" || req.method === "HEAD")) {
-      const lang = preferred(req);
+      const lang = LANGS[preferred(req)]?.docs;
       const vary = { Vary: "Accept-Language, Cookie", "Cache-Control": "no-cache" };
       const there = `/docs/${lang}/${doc[1]}`;
       // a page not written in that language yet stays English
@@ -156,13 +206,14 @@ export default {
       out.headers.set("Cache-Control", "no-cache");
       return out;
     }
-    const home = url.pathname.match(/^\/([a-z]{2})(\/(index\.html)?)?$/);
-    if (home && LANGS[home[1]]) {
-      if (!home[2]) return Response.redirect(new URL(`/${home[1]}/`, url).toString(), 301);
+    const home = url.pathname.match(/^\/([a-z]{2}(?:-[a-z]{2})?)(\/(index\.html)?)?$/i);
+    if (home && LANGS[home[1].toLowerCase()]) {
+      const lang = home[1].toLowerCase();
+      if (!home[2] || lang !== home[1]) return Response.redirect(new URL(`/${lang}/`, url).toString(), 301);
       // the English page, fetched afresh: its ETag would also stand for an
       // older dictionary
       const res = await env.ASSETS.fetch(new Request(new URL("/", url), { method: req.method }));
-      return beacon(translate(res, home[1]));
+      return beacon(translate(res, lang));
     }
     if (url.pathname === "/" && (req.method === "GET" || req.method === "HEAD")) {
       const lang = preferred(req);
@@ -177,10 +228,17 @@ export default {
       ctx.waitUntil(capture("magpie site install script", { client: client(req), country: country(req) }));
     return beacon(await withWall(await env.ASSETS.fetch(req), env, url));
   },
-  // the cron (wrangler.jsonc's triggers) keeps the ledger the Stable
-  // channel is chosen from
+  // the crons (wrangler.jsonc's triggers): every quarter hour the ledger
+  // the Stable channel is chosen from, then the day's Daily pick, and
+  // Discover's old counts pruned; every five minutes the newest, the
+  // Stable and the Daily release's files into R2
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(keepLedger(env, Date.now()));
+    if (event.cron === MIRROR_CRON) ctx.waitUntil(keepFiles(ctx, env));
+    else {
+      ctx.waitUntil(keepLedger(env, Date.now()).catch((e) => console.log("ledger", String(e))).then(() => keepDaily(env, Date.now())));
+      ctx.waitUntil(prunePlugins(env));
+      ctx.waitUntil(pruneShares(env).catch((e) => console.log("shares", String(e))));
+    }
   },
 };
 
@@ -275,16 +333,17 @@ async function capture(event, props) {
 
 // preferred is the home page's language for this browser: the one picked on
 // the page (the lang cookie), else the first of its Accept-Language that the
-// site has, else English.
+// site has, else English. Chinese written in Traditional characters (zh-TW,
+// zh-HK, zh-MO, zh-Hant) is zh-tw.
 export function preferred(req) {
-  const picked = (req.headers.get("Cookie") || "").match(/(?:^|;\s*)lang=([a-z]{2})/);
-  if (picked) return LANGS[picked[1]] ? picked[1] : "en";
+  const picked = (req.headers.get("Cookie") || "").match(/(?:^|;\s*)lang=([a-z]{2}(?:-[a-z]{2})?)/i);
+  if (picked) return LANGS[picked[1].toLowerCase()] ? picked[1].toLowerCase() : "en";
   const wants = (req.headers.get("Accept-Language") || "")
     .split(",")
     .map((p, i) => {
       const [tag, ...rest] = p.trim().toLowerCase().split(";");
       const q = rest.map((x) => x.trim()).find((x) => x.startsWith("q="));
-      return { lang: tag.split("-")[0], q: q ? parseFloat(q.slice(2)) || 0 : 1, i };
+      return { lang: /^zh-(tw|hk|mo|hant)\b/.test(tag) ? "zh-tw" : tag.split("-")[0], q: q ? parseFloat(q.slice(2)) || 0 : 1, i };
     })
     .filter((w) => w.lang && w.q > 0)
     .sort((a, b) => b.q - a.q || a.i - b.i);
@@ -324,7 +383,7 @@ function translate(res, lang) {
     rw.on('a[href^="/docs/"]', {
       element: (el) => {
         const href = el.getAttribute("href");
-        if (!href.startsWith(`/docs/${lang}/`)) el.setAttribute("href", `/docs/${lang}/` + href.slice(6));
+        if (!href.startsWith(`/docs/${docs}/`)) el.setAttribute("href", `/docs/${docs}/` + href.slice(6));
       },
     });
   return rw.transform(out);
@@ -350,9 +409,12 @@ export async function relay(req, url) {
   }
 }
 
-// beacon adds Cloudflare Web Analytics and PostHog's Web Analytics to a page.
-// The dashboard's automatic injection skips whatever a worker returns, and
-// every page passes through this one. PostHog's requests go through RELAY
+// beacon adds PostHog's Web Analytics to a page; every page passes through
+// this one. Cloudflare Web Analytics is not added here: Cloudflare injects
+// its own beacon into worker responses now, and that one reports to this
+// site's /cdn-cgi/rum. A second, manual beacon loaded first and won, and
+// reported to cloudflareinsights.com, which answers 404 for this site's
+// token, so Web Analytics counted no visits at all. PostHog's requests go through RELAY
 // on this site. PostHog keeps its visitor id in
 // localStorage, never a cookie: these pages vary on Cookie (the lang
 // cookie), and a per-visitor cookie would ride on every request. It isn't
@@ -364,7 +426,7 @@ export async function relay(req, url) {
 // flags aren't turned off. Nothing is loaded under Do Not Track or Global
 // Privacy Control. Its project is the daily count's.
 const WEB_ANALYTICS = `<script>if(!(navigator.doNotTrack=="1"||window.doNotTrack=="1"||navigator.globalPrivacyControl)){!function(t,e){var o,n,p,r;e.__SV||(window.posthog&&window.posthog.__loaded)||(window.posthog=e,e._i=[],e.init=function(i,s,a){function g(t,e){var o=e.split(".");2==o.length&&(t=t[o[0]],e=o[1]),t[e]=function(){t.push([e].concat(Array.prototype.slice.call(arguments,0)))}}(p=t.createElement("script")).type="text/javascript",p.crossOrigin="anonymous",p.async=!0,p.src=s.api_host.replace(".i.posthog.com","-assets.i.posthog.com")+"/static/array.js",(r=t.getElementsByTagName("script")[0]).parentNode.insertBefore(p,r);var u=e;for(void 0!==a?u=e[a]=[]:a="posthog",u.people=u.people||[],u.toString=function(t){var e="posthog";return"posthog"!==a&&(e+="."+a),t||(e+=" (stub)"),e},u.people.toString=function(){return u.toString(1)+" (stub)"},o="capture register unregister opt_out_capturing opt_in_capturing has_opted_out_capturing set_config".split(" "),n=0;n<o.length;n++)g(u,o[n]);e._i.push([i,s,a])},e.__SV=1)}(document,window.posthog||[]);posthog.init("${POSTHOG_KEY}",{api_host:location.origin+"/r",ui_host:"https://us.posthog.com",persistence:"localStorage",person_profiles:"identified_only",capture_pageview:true,capture_pageleave:true,autocapture:true,enable_heatmaps:true,capture_dead_clicks:true,capture_exceptions:true,capture_performance:{web_vitals:true,network_timing:true},session_recording:{maskAllInputs:true},disable_surveys:true,respect_dnt:true})}</script>`;
-const BEACON = `<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "c09e76abf16b40b2aa5571c196efb847"}'></script>` + WEB_ANALYTICS;
+const BEACON = WEB_ANALYTICS;
 
 // The contributors page: its #wall gets the table credits-cli.mjs rendered
 // for that language at deploy. Without it (a deploy that couldn't build
@@ -432,8 +494,10 @@ async function latest(ctx, env) {
   if (hit && hit.rel && hit.rel.version) return hit;
   const full = await fromAPI(env);
   if (full) {
-    const got = { rel: full, degraded: false };
-    remember(ctx, "latest", got, TTL);
+    // a feed sending the files by /dl is kept briefly: github.com's own
+    // address is given again as soon as it answers
+    const got = { rel: full, degraded: detoured(full) };
+    remember(ctx, "latest", got, got.degraded ? BRIEF : TTL);
     remember(ctx, "latest-good", full, KEEP);
     return got;
   }
@@ -450,6 +514,55 @@ async function latest(ctx, env) {
 }
 
 const UA = { "User-Agent": "usemagpie.ai" };
+
+const MIRROR_CRON = "*/5 * * * *";
+
+// fromR2 is rel with the files R2 holds at /files (onR2); what R2 holds
+// of a tag is asked once a minute.
+async function fromR2(ctx, env, rel) {
+  if (!rel || !env.RELEASES) return rel;
+  const tag = "v" + rel.version;
+  let have = await cached("r2/" + tag);
+  if (!have || typeof have !== "object") {
+    have = await held(env, tag);
+    if (have) remember(ctx, "r2/" + tag, have, BRIEF);
+  }
+  return onR2(rel, have, REPO, SITE);
+}
+
+// keepFiles is the five-minute cron's run: the newest release's files and
+// the Stable one's into R2, each from github.com's address or, when that
+// fails, by way of GitHub's API (located).
+async function keepFiles(ctx, env) {
+  if (!env.RELEASES) return;
+  const rels = [];
+  const got = await latest(ctx, env);
+  if (got) rels.push(got.rel);
+  const st = await stable(ctx, env, Date.now()).catch((e) => console.log("r2: stable", String(e)));
+  if (st) rels.push(st.rel);
+  const dy = await daily(ctx, env, Date.now()).catch((e) => console.log("r2: daily", String(e)));
+  if (dy && !rels.some((r) => r.version === dy.rel.version)) rels.push(dy.rel);
+  const open = async (name, a, tag) => {
+    let res = null;
+    try {
+      res = await fetch(githubFile(REPO, tag, name), { headers: UA });
+    } catch (e) {
+      console.log("r2: github.com", name, String(e));
+    }
+    if (res && res.ok) return res;
+    const to = a.api && (await located(a.api, env));
+    return to ? fetch(to, { headers: UA }) : res;
+  };
+  // the attestation bundles GitHub holds for a digest, in R2 beside the files
+  const attest = async (sha256) => {
+    const res = await api(`attestations/sha256:${sha256}`, env);
+    if (!res.ok) return null;
+    const j = await res.json();
+    return (j.attestations || []).map((x) => x.bundle).filter(Boolean);
+  };
+  const done = await mirror(env, rels, open, Date.now, attest);
+  if (done.copied.length || done.failed.length) console.log("r2", JSON.stringify(done));
+}
 
 // api asks GitHub's API, with the GITHUB_TOKEN secret where one is set.
 function api(path, env) {
@@ -474,14 +587,84 @@ async function fromAPI(env, path = "releases/latest") {
   }
   const gh = await res.json();
   const tag = gh.tag_name;
-  const sums = await checksums(tag);
-  if (!sums) return null;
+  const listed = gh.assets.find((a) => a.name === "SHA256SUMS");
+  const listedSig = gh.assets.find((a) => a.name === SIG);
+  const got = await checksums(tag, env, listed && listed.url, listedSig && listedSig.url);
+  if (!got) return null;
   const rel = { version: tag.replace(/^v/, ""), notes: gh.body || "", url: gh.html_url, published: gh.published_at, assets: {} };
+  if (got.signed) rel.signed = got.signed;
   for (const a of gh.assets) {
-    if (a.name === "SHA256SUMS") continue;
-    rel.assets[a.name] = { url: a.browser_download_url, size: a.size, sha256: sums[a.name] || "" };
+    if (a.name === "SHA256SUMS" || a.name === SIG) continue;
+    // api: the file's address in GitHub's API, which an app asks when
+    // url is busy. With github.com's download address failing (504 for
+    // hours on 2026-11-08), url is the site's /dl, which redirects
+    // through the API: an app too old to know api follows it, and still
+    // checks the file against sha256.
+    const url = got.direct ? a.browser_download_url : `${SITE}/dl/${tag}/${encodeURIComponent(a.name)}`;
+    rel.assets[a.name] = { url, api: a.url, size: a.size, sha256: got.sums[a.name] || "" };
   }
   return rel;
+}
+
+// detoured: whether rel's files go by the site's /dl
+function detoured(rel) {
+  return Object.values(rel.assets || {}).some((a) => a.url && a.url.startsWith(SITE + "/dl/"));
+}
+
+// located is where GitHub's API sends an ask for a release file's bytes
+// (Accept: application/octet-stream): a signed address on GitHub's asset
+// host, good for some minutes, or null. The redirect is read, not
+// followed, so no Authorization goes to the asset host.
+async function located(apiURL, env) {
+  const headers = { ...UA, Accept: "application/octet-stream" };
+  if (env && env.GITHUB_TOKEN) headers.Authorization = `Bearer ${env.GITHUB_TOKEN}`;
+  let res;
+  try {
+    res = await fetch(apiURL, { headers, redirect: "manual" });
+  } catch (e) {
+    console.log("github asset", e);
+    return null;
+  }
+  const to = res.headers.get("Location") || "";
+  let host = "";
+  try {
+    host = new URL(to).hostname;
+  } catch {}
+  if (res.status < 300 || res.status > 399 || !to.startsWith("https://") || !(host.endsWith(".githubusercontent.com") || host === "github.com")) {
+    console.log("github asset", res.status, to.slice(0, 80));
+    return null;
+  }
+  return to;
+}
+
+// detour is /dl/<tag>/<file>: a redirect to the release's file by way of
+// GitHub's API (located), for when github.com's download address fails.
+// Where GitHub's API sends is kept five minutes, and each release's list
+// of files an hour, so a worker IP's 60 anonymous asks an hour go far.
+// The file is checked by whoever downloads it, against the feed's hash.
+async function detour(ctx, env, tag, name) {
+  const key = `dl/${tag}/${name}`;
+  let to = await cached(key);
+  if (typeof to !== "string" || !to) {
+    let files = await cached(`dl-files/${tag}`);
+    if (!files || typeof files !== "object") {
+      let res = null;
+      try {
+        res = await api(`releases/tags/${tag}`, env);
+      } catch (e) {
+        console.log("github api", tag, e);
+      }
+      if (!res || !res.ok) return new Response("GitHub didn't say where the file is; try again in a minute\n", { status: 502, headers: NO_STORE });
+      files = {};
+      for (const a of (await res.json()).assets || []) files[a.name] = a.url;
+      remember(ctx, `dl-files/${tag}`, files, 3600);
+    }
+    if (!files[name]) return new Response("not found\n", { status: 404 });
+    to = await located(files[name], env);
+    if (!to) return new Response("GitHub didn't hand out the file; try again in a minute\n", { status: 502, headers: NO_STORE });
+    remember(ctx, key, to, 300);
+  }
+  return new Response(null, { status: 302, headers: { Location: to, ...NO_STORE } });
 }
 
 async function fromPages() {
@@ -505,10 +688,12 @@ async function fromPages() {
 // date from entry ({notes, published}) where there is one: every file, its
 // size unknown (0). null when SHA256SUMS can't be read.
 async function fromSums(tag, entry) {
-  const sums = await checksums(tag);
-  if (!sums) return null;
+  const got = await checksums(tag);
+  if (!got) return null;
+  const sums = got.sums;
   const url = `https://github.com/${REPO}/releases/tag/${tag}`;
   const rel = { version: tag.replace(/^v/, ""), notes: entry ? entry.notes : "", url, published: entry ? entry.published : null, assets: {} };
+  if (got.signed) rel.signed = got.signed;
   for (const [name, sha256] of Object.entries(sums)) {
     rel.assets[name] = { url: `https://github.com/${REPO}/releases/download/${tag}/${name}`, size: 0, sha256 };
   }
@@ -574,9 +759,10 @@ async function releases(ctx, env) {
 // A hundred releases are a day or so of magpie, so the list GitHub's API
 // gives in one ask doesn't reach a week back. The ledger does: a KV
 // namespace (LEDGER) the cron fills every quarter hour, its "index" every
-// release of the last LEDGER_DAYS ({v, p: published, u: urgent}, newest
-// first) and "notes:<UTC day>" each day's notes by version, which
-// /api/notes reads for a range older than the hundred newest. Without the
+// release of the last LEDGER_DAYS ({v, p: published, u: urgent, a: how
+// many files}, newest first) and "notes:<UTC day>" each day's notes by
+// version, which /api/notes reads for a range older than the hundred
+// newest. Without the
 // ledger, or one that doesn't reach back to the week's cut, Stable isn't
 // known and the feed says so (503) rather than guess. The Docker image's
 // stable tag follows this feed (.github/workflows/docker-stable.yml).
@@ -644,8 +830,17 @@ async function stable(ctx, env, now) {
   if (!ix) return null;
   const pick = stableOf(ix.list.map((r) => ({ version: r.v, published: r.p, urgent: !!r.u })), now);
   if (!pick) return null;
+  return channelRelease(ctx, env, "stable", pick);
+}
+
+// channelRelease is a channel's pick ({version, published, urgent}) as a
+// release, condensed as latest's is and kept under the channel's name:
+// from GitHub's API, or, when it says no, the files from SHA256SUMS and
+// the notes from the ledger.
+async function channelRelease(ctx, env, channel, pick) {
   const tag = "v" + pick.version;
-  let rel = await fromAPI(env, "releases/tags/" + tag), degraded = false;
+  let rel = await fromAPI(env, "releases/tags/" + tag);
+  let degraded = !!rel && detoured(rel);
   if (!rel) {
     // the API said no: the files from SHA256SUMS, the notes from the ledger
     const [entry] = await fromLedger(env, null, null, pick.version, 1);
@@ -653,10 +848,169 @@ async function stable(ctx, env, now) {
     degraded = true;
   }
   if (!rel) return null;
-  const got = { rel: { ...rel, channel: "stable", urgent: !!pick.urgent }, degraded };
-  remember(ctx, "stable", got, degraded ? BRIEF : TTL);
+  const got = { rel: { ...rel, channel, urgent: !!pick.urgent }, degraded };
+  remember(ctx, channel, got, degraded ? BRIEF : TTL);
   return got;
 }
+
+// The Daily channel (fishmagic80 on X, a Docker user): Stable is a week
+// behind, so a plugin that needs a newer magpie doesn't work there, and
+// the newest is many releases a day. /api/latest?channel=daily is the
+// update feed between them, chosen here and never by hand:
+//
+//   - once a day, at DAILY_HOUR UTC (04:00 in China), Daily becomes the
+//     newest release out by then that has all RELEASE_FILES files and
+//     whose own CI run (yetone/magpie's Test workflow, on the push of its
+//     tagged commit) has passed by the time the pick is made;
+//   - an urgent release is Daily as soon as it is out, as on Stable,
+//     until a daily pick passes it.
+//
+// The quarter-hour cron makes the pick (keepDaily) once the day's cut has
+// passed and keeps it in the ledger as "daily": {cut, v}. A release with
+// no run of its own (a push of several commits runs the newest alone; a
+// newer push replaces a run that hasn't started) or a red one is passed
+// over. When nothing in reach qualifies the last pick stays, so Daily
+// never goes back. Until the first pick it isn't known (503). The Docker
+// image's daily tag follows this feed (.github/workflows/docker-daily.yml).
+const DAILY_HOUR = 20;
+export const RELEASE_FILES = 17; // the dmgs, zips, apps, CLIs, SHA256SUMS and its signature
+const SOURCE = "yetone/magpie"; // where the tags and their CI runs are
+const DAILY_ASKS = 6; // tag lookups (ten versions each) one pick makes at most
+
+// dayCut is the DAILY_HOUR:00 UTC on or before now, in ms.
+export function dayCut(now) {
+  const d = new Date(now);
+  const c = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), DAILY_HOUR);
+  return c > now ? c - DAY : c;
+}
+
+// dailyOf is the Daily pick at cut among list ([{version, published,
+// files, green}], any order): the newest out by cut with every file and a
+// green run. null when none is.
+export function dailyOf(list, cut) {
+  let pick = null;
+  for (const r of list) {
+    if (!(Date.parse(r.published) <= cut) || !(r.files >= RELEASE_FILES) || !r.green) continue;
+    if (!pick || newer(r.version, pick.version)) pick = r;
+  }
+  return pick;
+}
+
+// srcApi asks GitHub's API about yetone/magpie, with the GITHUB_TOKEN
+// secret where one is set, and without it when the token isn't let in
+// there (a token made for magpie-releases alone).
+async function srcApi(path, env) {
+  const url = `https://api.github.com/repos/${SOURCE}/${path}`;
+  const headers = { ...UA, Accept: "application/vnd.github+json" };
+  if (env && env.GITHUB_TOKEN) {
+    const res = await fetch(url, { headers: { ...headers, Authorization: `Bearer ${env.GITHUB_TOKEN}` } });
+    if (res.ok || ![401, 403, 404].includes(res.status)) return res;
+  }
+  return fetch(url, { headers });
+}
+
+// greenRuns is the commits the Test workflow passed on main, as a Set,
+// or null when GitHub can't say.
+async function greenRuns(env) {
+  try {
+    const res = await srcApi("actions/workflows/test.yml/runs?branch=main&event=push&status=success&per_page=100", env);
+    if (!res.ok) {
+      console.log("daily: runs", res.status);
+      return null;
+    }
+    const j = await res.json();
+    return new Set((j.workflow_runs || []).filter((r) => r.conclusion === "success").map((r) => r.head_sha));
+  } catch (e) {
+    console.log("daily: runs", String(e));
+    return null;
+  }
+}
+
+// keepDaily is the quarter-hour cron's Daily pick, made once a cut: the
+// ledger's releases out by the cut, newest first, each looked up as its
+// tag's commit (ten tags an ask, at most DAILY_ASKS asks) until one has
+// all its files and a green run. Nothing written while GitHub or the
+// ledger can't say: the next run tries again.
+export async function keepDaily(env, now) {
+  const kv = env && env.LEDGER;
+  if (!kv) return;
+  const cut = dayCut(now);
+  let had;
+  try {
+    had = await kv.get("daily", { type: "json" });
+  } catch (e) {
+    console.log("daily: read", String(e));
+    return;
+  }
+  if (had && Date.parse(had.cut) >= cut) return;
+  const ix = await readIndex(env);
+  if (!ix) return;
+  const out = ix.list
+    .filter((r) => Date.parse(r.p) <= cut && r.a >= RELEASE_FILES && (!had || !had.v || newer(r.v, had.v)))
+    .sort((a, b) => (newer(a.v, b.v) ? -1 : newer(b.v, a.v) ? 1 : 0));
+  let pick = null;
+  if (out.length) {
+    const green = await greenRuns(env);
+    if (!green) return;
+    const shas = new Map(); // version: commit
+    const groups = new Set();
+    for (const r of out) {
+      const group = r.v.slice(0, -1); // 0.1.422 holds 0.1.4220 to 0.1.4229
+      if (!groups.has(group)) {
+        if (groups.size >= DAILY_ASKS) break;
+        groups.add(group);
+        let refs;
+        try {
+          const res = await srcApi(`git/matching-refs/tags/v${group}`, env);
+          if (!res.ok) {
+            console.log("daily: tags", group, res.status);
+            return;
+          }
+          refs = await res.json();
+        } catch (e) {
+          console.log("daily: tags", group, String(e));
+          return;
+        }
+        // a lightweight tag names its commit; an annotated one isn't read
+        for (const t of refs) if (t.object && t.object.type === "commit") shas.set(t.ref.replace(/^refs\/tags\/v/, ""), t.object.sha);
+      }
+      const sha = shas.get(r.v);
+      pick = dailyOf([{ version: r.v, published: r.p, files: r.a, green: !!sha && green.has(sha) }], cut);
+      if (pick) break;
+    }
+  }
+  const v = pick ? pick.version : had && had.v;
+  if (!v) {
+    console.log("daily: nothing in reach passed", new Date(cut).toISOString());
+    return;
+  }
+  await kv.put("daily", JSON.stringify({ cut: new Date(cut).toISOString(), v, at: new Date(now).toISOString() }));
+}
+
+// daily is the Daily release, condensed as latest's is: {rel, degraded},
+// or null when it isn't known. An urgent release newer than the day's
+// pick is Daily at once.
+async function daily(ctx, env, now) {
+  const hit = await cached("daily");
+  if (hit && hit.rel && hit.rel.version) return hit;
+  if (!env || !env.LEDGER) return null;
+  let had;
+  try {
+    had = await env.LEDGER.get("daily", { type: "json", cacheTtl: 60 });
+  } catch (e) {
+    console.log("daily", String(e));
+    return null;
+  }
+  if (!had || !had.v) return null;
+  const ix = await readIndex(env, 60);
+  if (!ix) return null;
+  let pick = { version: had.v, published: (ix.list.find((r) => r.v === had.v) || {}).p, urgent: false };
+  for (const r of ix.list) if (r.u && Date.parse(r.p) <= now && newer(r.v, pick.version)) pick = { version: r.v, published: r.p, urgent: true };
+  return channelRelease(ctx, env, "daily", pick);
+}
+
+// CHANNELS are the update feed's channels other than every version.
+const CHANNELS = { stable, daily };
 
 // fromLedger is the notes of the releases the ledger has older than below
 // (every one when null), after after (exclusive, "" for any) up to upto,
@@ -705,7 +1059,7 @@ export async function keepLedger(env, now) {
     }
     const rels = (await res.json())
       .filter((r) => !r.draft && !r.prerelease)
-      .map((r) => ({ version: r.tag_name.replace(/^v/, ""), notes: r.body || "", published: r.published_at }));
+      .map((r) => ({ version: r.tag_name.replace(/^v/, ""), notes: r.body || "", published: r.published_at, files: (r.assets || []).length }));
     if (rels.length < 100) bottom = true;
     for (const r of rels) got.set(r.version, r);
     return rels;
@@ -735,7 +1089,9 @@ export async function keepLedger(env, now) {
     // the feed's date is when the release was last edited: the API's, or
     // the one the ledger has, is when it came out
     const was = merged.get(r.version);
-    merged.set(r.version, { v: r.version, p: !first && was ? was.p : r.published, u: urgentIn(r.notes) });
+    // a: how many files it has, from the API (the feed doesn't say)
+    const a = r.files !== undefined ? r.files : was && was.a;
+    merged.set(r.version, { v: r.version, p: !first && was ? was.p : r.published, u: urgentIn(r.notes), ...(a !== undefined ? { a } : {}) });
   }
   const list = [...merged.values()]
     .filter((r) => r.v && Date.parse(r.p) >= keep)
@@ -903,22 +1259,73 @@ function newer(a, b) {
   return x.pre > y.pre;
 }
 
-// checksums reads a release's SHA256SUMS: {file name: hash}.
-async function checksums(tag) {
-  let r;
+// SIG is the signature of SHA256SUMS, a release asset (see signed below).
+const SIG = "SHA256SUMS.sig";
+
+// checksums reads a release's SHA256SUMS: {sums: {file name: hash},
+// direct, signed}, or null. direct says github.com's download address gave
+// it; when that fails, viaAPI (the file's address in GitHub's API) is asked.
+// signed is {sums, sig}: SHA256SUMS as published and its ed25519 signature
+// (base64, the release's SHA256SUMS.sig, viaAPISig in the API), or absent
+// for a release with none. The site only carries them; the app checks the
+// signature against the key it holds, so nothing here is trusted, this
+// worker included.
+async function checksums(tag, env, viaAPI, viaAPISig) {
+  let r = null;
   try {
     r = await fetch(`https://github.com/${REPO}/releases/download/${tag}/SHA256SUMS`, { headers: UA });
   } catch (e) {
     console.log("SHA256SUMS", e);
-    return null;
   }
-  if (!r.ok) return null;
+  let direct = !!r && r.ok;
+  if (!direct) {
+    if (r) console.log("SHA256SUMS", r.status);
+    const to = viaAPI && (await located(viaAPI, env));
+    if (!to) return null;
+    try {
+      r = await fetch(to, { headers: UA });
+    } catch (e) {
+      console.log("SHA256SUMS through the API", e);
+      return null;
+    }
+    if (!r.ok) return null;
+  }
+  const text = await r.text();
   const sums = {};
-  for (const line of (await r.text()).split("\n")) {
+  for (const line of text.split("\n")) {
     const [hash, name] = line.trim().split(/\s+\*?/);
     if (hash && name) sums[name] = hash;
   }
-  return sums;
+  const out = { sums, direct };
+  const sig = await signature(tag, env, direct, viaAPISig);
+  if (sig) out.signed = { sums: text, sig };
+  return out;
+}
+
+// signature is the release's SHA256SUMS.sig as the base64 line it holds, or
+// "" when the release has none (every release before it was signed).
+async function signature(tag, env, direct, viaAPI) {
+  let r = null;
+  if (direct) {
+    try {
+      r = await fetch(`https://github.com/${REPO}/releases/download/${tag}/${SIG}`, { headers: UA });
+    } catch (e) {
+      console.log(SIG, e);
+    }
+  }
+  if (!r || !r.ok) {
+    const to = viaAPI && (await located(viaAPI, env));
+    if (!to) return "";
+    try {
+      r = await fetch(to, { headers: UA });
+    } catch (e) {
+      console.log(SIG, "through the API", e);
+      return "";
+    }
+  }
+  if (!r.ok) return "";
+  const t = (await r.text()).trim();
+  return /^[A-Za-z0-9+/=]{80,100}$/.test(t) ? t : "";
 }
 
 // ---- icons ------------------------------------------------------------------
@@ -1010,4 +1417,74 @@ function json(v, status = 200, headers = {}) {
     status,
     headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", ...headers },
   });
+}
+
+// taggedPlugins is the Plugins page's Discover list, built every half hour
+// by the plugins repo's `tagged` workflow onto its dist branch, passed on
+// for the desktops that can't reach GitHub (River_WLan on X). The edge
+// keeps it ten minutes, and the last whole copy stands in for a failed ask.
+const TAGGED = [
+  "https://raw.githubusercontent.com/magpie-community/plugins/dist/tagged.json",
+  "https://cdn.jsdelivr.net/gh/magpie-community/plugins@dist/tagged.json",
+];
+export async function taggedPlugins(ctx) {
+  const hit = await cached("tagged");
+  if (hit && Array.isArray(hit.plugins)) return json(hit, 200, { "Cache-Control": "public, max-age=600" });
+  for (const u of TAGGED) {
+    try {
+      const res = await fetch(u, { headers: UA });
+      if (!res.ok) continue;
+      const got = await res.json();
+      if (got.version !== 1 || !Array.isArray(got.plugins) || !got.plugins.length) continue;
+      remember(ctx, "tagged", got, 600);
+      remember(ctx, "tagged-good", got, KEEP);
+      return json(got, 200, { "Cache-Control": "public, max-age=600" });
+    } catch (e) {
+      console.log("tagged", u, e);
+    }
+  }
+  const good = await cached("tagged-good");
+  if (good && Array.isArray(good.plugins)) return json(good, 200, { "Cache-Control": "public, max-age=60" });
+  return json({ error: "no list yet" }, 503, NO_STORE);
+}
+
+// pluginReadme is a Discover plugin's README, as the `tagged` workflow keeps
+// it on the dist branch (readmes/<key>.md), passed on for the desktops npm's
+// human check or GitHub's block holds back (River_WLan on X). name is the
+// package's npm name or github:owner/repo, as magpie installs it. The edge
+// keeps a README ten minutes; one the branch doesn't have is a 404, which
+// magpie answers by asking npm or GitHub itself.
+const PKG_NAME = /^(@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/;
+export function readmeKey(name) {
+  name = String(name ?? "");
+  if (name.startsWith("github:")) {
+    const repo = name.slice(7).split("#")[0];
+    return /^[\w.-]+\/[\w.-]+$/.test(repo) && !repo.includes("..") ? "github/" + repo : "";
+  }
+  return PKG_NAME.test(name) ? name : "";
+}
+export async function pluginReadme(ctx, name) {
+  const key = readmeKey(name);
+  if (!key) return json({ error: "not a plugin name" }, 400, NO_STORE);
+  const hit = await cached("readme/" + key);
+  if (hit && typeof hit.readme === "string") return readmeText(hit.readme, 600);
+  for (const base of [
+    "https://raw.githubusercontent.com/magpie-community/plugins/dist/readmes/",
+    "https://cdn.jsdelivr.net/gh/magpie-community/plugins@dist/readmes/",
+  ]) {
+    try {
+      const res = await fetch(base + key.split("/").map(encodeURIComponent).join("/") + ".md", { headers: UA });
+      if (!res.ok) continue;
+      const readme = await res.text();
+      if (!readme.trim()) continue;
+      remember(ctx, "readme/" + key, { readme }, 600);
+      return readmeText(readme, 600);
+    } catch (e) {
+      console.log("readme", key, e);
+    }
+  }
+  return json({ error: "no README kept" }, 404, NO_STORE);
+}
+function readmeText(readme, age) {
+  return new Response(readme, { status: 200, headers: { "Content-Type": "text/markdown; charset=utf-8", "Cache-Control": `public, max-age=${age}` } });
 }

@@ -10,13 +10,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -167,16 +167,16 @@ func missingSeerNote() string {
 // none of its members is marked as taking images.
 func textOnlyNote(p provider.Provider, model string, group string) string {
 	if group != "" {
-		return fmt.Sprintf("; no model in the group %s is marked as taking images: turn on Accepts images for one that does, in its provider's Names, prices & levels in magpie", group)
+		return fmt.Sprintf("; no model in the group %s is marked as taking images: turn on Accepts images for one that does, in its provider's Model settings in magpie", group)
 	}
 	name := p.Name
 	if name == "" {
 		name = p.ID
 	}
 	if v, ok := provider.ImageOverride(p.ID, model); ok && !v {
-		return fmt.Sprintf("; Accepts images is turned off for it in magpie, in Providers → %s → Names, prices & levels", name)
+		return fmt.Sprintf("; Accepts images is turned off for it in magpie, in Providers → %s → Model settings", name)
 	}
-	return fmt.Sprintf("; %s's model list marks it as not taking images: if it does, turn on Accepts images for it in magpie, in Providers → %s → Names, prices & levels", name, name)
+	return fmt.Sprintf("; %s's model list marks it as not taking images: if it does, turn on Accepts images for it in magpie, in Providers → %s → Model settings", name, name)
 }
 
 // noSeerNote is what a request turned away for an image says of why no
@@ -206,8 +206,8 @@ func autoSeerNote(see string) string {
 
 // AutoVision is the model magpie picks to describe images when the
 // Settings name none: a small model that sees, of the models the user
-// enabled on the providers switched on (smallModel) — a
-// Claude account's, a Codex account's, the cheapest of an API key's,
+// enabled on the providers switched on (smallModel) — the provider it is
+// held to's (heldPick, auto_picks.go), a Claude account's, a Codex account's, the cheapest of an API key's,
 // another account's. One with allowance left goes before one whose every
 // account or key is out of it (smallReady), whatever their order: the
 // one out is picked only when every model that sees is, so that agents
@@ -221,10 +221,13 @@ func AutoVision() string {
 
 // autoVision is AutoVision's pick, and whether it has allowance left.
 func autoVision() (string, bool) {
-	if r := seersRanked(nil); len(r) > 0 {
-		return r[0].model, r[0].ready
+	held := heldPick(slotVision)
+	r := seersRankedHeld(nil, held)
+	if len(r) == 0 {
+		return "", false
 	}
-	return "", false
+	settlePick(slotVision, held, slices.ContainsFunc(r, func(s rankedSeer) bool { return providerOfRef(s.model) == held }), providerOfRef(r[0].model))
+	return r[0].model, r[0].ready
 }
 
 // rankedSeer is a model seersRanked names, and whether it has allowance.
@@ -240,8 +243,17 @@ type rankedSeer struct {
 // passed over for the provider's next one (the describers a failed
 // description already asked, describeWith).
 func seersRanked(skip func(string) bool) []rankedSeer {
+	return seersRankedHeld(skip, heldPick(slotVision))
+}
+
+// seersRankedHeld is seersRanked with held, the provider Image
+// recognition's Automatic pick is held to (heldPick), before every other
+// of its readiness: a Claude account added later doesn't take it over.
+func seersRankedHeld(skip func(string) bool, held string) []rankedSeer {
 	tier := func(p provider.Provider) int {
 		switch {
+		case held != "" && p.ID == held:
+			return -1
 		case p.Account != nil && p.Account.Agent == "claude":
 			return 0
 		case p.Account != nil && p.Account.Agent == "codex":
@@ -834,7 +846,7 @@ func smallModelWhere(p provider.Provider, kind string, keep func(catalog.Model) 
 // endpoints found that support image input", vLLM's "is not a multimodal
 // model", and the plain "does not support image input" / "image input is
 // not supported" / "不支持图片" of the rest.
-var imageRefusedWords = regexp.MustCompile("(?i)unknown variant [`'\"\\\\]*(?:image_url|input_image|image)\\b|image_url is only supported by certain models|no endpoints found that support image|not a multi-?modal model|(?:does not|doesn't|do not|don't|cannot|can't|unable to) (?:support|accept|process|handle|take|read) (?:the )?(?:image|images|vision|multi-?modal)|\\b(?:image|images|vision|multi-?modal|image_url|input_image)(?: (?:input|inputs|content|parts?))? (?:is |are )?(?:not supported|unsupported|not enabled|not allowed)|不支持(?:图片|图像|多模态|视觉|识图)")
+var imageRefusedWords = lazyre.New("(?i)unknown variant [`'\"\\\\]*(?:image_url|input_image|image)\\b|image_url is only supported by certain models|no endpoints found that support image|not a multi-?modal model|(?:does not|doesn't|do not|don't|cannot|can't|unable to) (?:support|accept|process|handle|take|read) (?:the )?(?:image|images|vision|multi-?modal)|\\b(?:image|images|vision|multi-?modal|image_url|input_image)(?: (?:input|inputs|content|parts?))? (?:is |are )?(?:not supported|unsupported|not enabled|not allowed)|不支持(?:图片|图像|多模态|视觉|识图)")
 
 // imageRefused says a failure was the model turning the request's image
 // away: what a describer fixes by describing it, not what another

@@ -223,4 +223,120 @@ async function pickItem(page, locator) {
   throw new Error("the picker's item never settled: " + last);
 }
 
-module.exports = { settled, inView, reach, wheelTo, click, openPart, watchSettingsReads, settingsDrawn, agentRow, openAgentSettings, pickItem };
+
+// provPrefsProviders: /api/providers with a signed-in subscription for each
+// id, so its editor holds its warm-ups, check-in and resets (PROV_PREFS);
+// an id with no built-in row comes from a plugin of that name
+const BUILTIN_SUBS = new Set(["codex", "claude", "workbuddy", "qoder", "qoder-cn"]);
+function provPrefsProviders(ids, names = {}) {
+  const base = { icon: "generic", chat: "https://example.invalid/v1", models: [], agents: [], fallback: [], headers: {}, keyList: [], routing: "" };
+  return {
+    providers: ids.map((id) => ({ ...base, id, name: names[id] || id, account: { agent: id, agentName: names[id] || id, user: "ann@example.test", logins: [{ agent: id, user: "ann@example.test", plan: "Pro", active: true, on: true }] } })),
+    plugins: ids.filter((id) => !BUILTIN_SUBS.has(id)).map((id) => ({ id, pid: id, name: names[id] || id, spec: "fixture-" + id, methods: [] })),
+    presets: [], excluded: [], gateway: { running: true, window: true },
+  };
+}
+// openProvPrefs: the provider's editor, its Advanced opened on its own
+// settings (fields there since the owner's 11-09)
+async function openProvPrefs(page, id) {
+  await page.goto(`http://magpie.test/?view=providers&edit=${encodeURIComponent(id)}`);
+  const adv = page.locator(".editor details.advanced");
+  await adv.waitFor({ timeout: 60000 });
+  if (!(await adv.evaluate((d) => d.open))) await adv.locator(":scope > summary").click();
+  await page.locator(".editor .prov-prefs .row").filter({ visible: true }).first().waitFor({ timeout: 60000 });
+  // and the editor at rest: with a warm-up or check-in on, Advanced opens
+  // on its own, so no click waits out the modal's opening and a row read
+  // now is read mid-scale (warm-at-times, WebKit 900px, 0.66px over)
+  await page.waitForFunction(() => !document.querySelector("#modal").getAnimations({ subtree: true })
+    .some((a) => a.playState === "running" && a.effect?.getComputedTiming().endTime !== Infinity), null, { timeout: 60000 });
+}
+// inEditor brings a control in a provider's editor into sight. The editor
+// is in the modal, whose body isn't a view, so the app lets the scroll
+// stand; then it waits till no box has scrolled for ten frames, so a check
+// that a click left the page where it was reads it at rest.
+async function inEditor(page, locator) {
+  // a code scroll is put back (gui-shell.md, "A click never moves"): the
+  // wheel over the editor's body, as a reader, till the element is inside
+  // it, clear of the bar under it; a save draws the lists again, so the
+  // element is found again each time
+  for (let round = 0; round < 5; round++) {
+  await locator.waitFor({ state: "visible" });
+  let inside = false;
+  for (let i = 0; i < 200; i++) {
+    const at = await locator.evaluateAll((es) => {
+      const e = es.length === 1 ? es[0] : null, body = e?.closest(".ebody");
+      if (!e || !e.isConnected) return null;
+      if (!body) return { none: true };
+      const r = e.getBoundingClientRect(), v = body.getBoundingClientRect();
+      // a point whose nearest box that can scroll is the body: one inside
+      // it (a list of its own) takes the wheel first, even with nothing
+      // to scroll in Chromium, and the body never moves
+      const scrolls = (n) => /auto|scroll/.test(getComputedStyle(n).overflowY);
+      let px = v.left + v.width / 2, py = (v.top + v.bottom) / 2;
+      find: for (let fy = 0.5; fy < 1; fy += 0.1) for (const fx of [0.5, 0.15, 0.85, 0.02]) for (const s of [1, -1]) {
+        const x = v.left + v.width * fx, y = v.top + v.height * (s > 0 ? fy : 1 - fy);
+        let n = document.elementFromPoint(x, y);
+        if (!n || !body.contains(n)) continue;
+        while (n !== body && !scrolls(n)) n = n.parentElement;
+        if (n === body) { px = x; py = y; break find; }
+      }
+      // and nothing lies over it (a bar held at the editor's foot): a
+      // click there would be scrolled to by Playwright first
+      const h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      const over = !!h && h !== e && !e.contains(h);
+      return { top: r.top, bottom: r.bottom, vt: v.top, vb: v.bottom, px, py, over, low: r.top > (v.top + v.bottom) / 2 };
+    });
+    if (!at) { await page.waitForTimeout(40); continue; }
+    if (at.none) { await locator.scrollIntoViewIfNeeded(); inside = true; break; }
+    if (at.top >= at.vt + 8 && at.bottom <= at.vb - 8 && !at.over) { inside = true; break; }
+    await page.mouse.move(at.px, at.py);
+    await page.mouse.wheel(0, at.top < at.vt + 8 || at.over && !at.low ? -40 : 40);
+    await page.waitForTimeout(30);
+  }
+  await page.evaluate(() => new Promise((done) => {
+    let last = "", same = 0;
+    const at = () => [scrollY, ...[...document.querySelectorAll("*")].map((e) => e.scrollTop)].join(",");
+    const f = () => { const now = at(); same = now === last ? same + 1 : 0; last = now; if (same >= 10) done(); else requestAnimationFrame(f); };
+    requestAnimationFrame(f);
+  }));
+  // the editor drawn again meanwhile (a load come in) starts at its top:
+  // reached again
+  if (inside && await locator.evaluateAll((es) => {
+    const e = es.length === 1 ? es[0] : null, body = e?.closest(".ebody");
+    if (!e || !body) return !!e;
+    const r = e.getBoundingClientRect(), v = body.getBoundingClientRect();
+    return r.top >= v.top && r.bottom <= v.bottom;
+  })) return;
+  }
+  throw new Error("not brought into the editor's sight: " + locator);
+}
+
+// The Usage page's Requests: a row's click opens that one request on a page
+// of its own (#ledReqPane, geesehowardt7 on X), and Requests ‹ goes back to
+// the list where it was left. openRequest gives the page's .led-detail.
+async function openRequest(page, row) {
+  await row.click();
+  const d = page.locator("#ledReqPane .led-detail");
+  await d.waitFor();
+  return d;
+}
+async function closeRequest(page) {
+  await page.locator("#ledReqPane .led-req-back").click();
+  await page.locator("#ledReqPane").waitFor({ state: "hidden" });
+}
+
+// openPage opens a page from the navigation as the reader does: its tab, or,
+// on a phone's tab bar where it is past the fifth, More and then its row in
+// More's menu (phonetabs.js).
+async function openPage(page, view) {
+  const tab = page.locator(`#nav [data-view="${view}"]`);
+  if (await tab.isVisible()) await tab.click();
+  else {
+    await page.locator("#nav .nav-more").click();
+    const name = (await tab.textContent()).trim();
+    await page.locator(".nav-more-menu .pm-item", { hasText: name }).first().click();
+  }
+  await page.locator(`#view-${view}`).waitFor();
+}
+
+module.exports = { openPage, openRequest, closeRequest, provPrefsProviders, openProvPrefs, inEditor, settled, inView, reach, wheelTo, click, openPart, watchSettingsReads, settingsDrawn, agentRow, openAgentSettings, pickItem };

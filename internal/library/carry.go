@@ -33,10 +33,42 @@ type Bundle struct {
 	// carried, which knew nothing of this computer's: Put keeps them. Collect
 	// always sets it, empty too, so taking the last one out is carried.
 	Subagents *[]*Subagent `json:"subagents,omitempty"`
+	// Commands are nil in a bundle from a magpie before slash commands,
+	// as Subagents are: Put keeps this computer's.
+	Commands *[]*Command `json:"commands,omitempty"`
+	// Rules are nil in a bundle from a magpie before rules, as Subagents
+	// are: Put keeps this computer's.
+	Rules *[]*Rule `json:"rules,omitempty"`
 	// Hooks are nil in a bundle from a magpie before they were carried,
 	// as Subagents are: Put keeps this computer's. Applied.Hooks, the
 	// entries magpie wrote into each agent here, stays out.
 	Hooks *[]*Hook `json:"hooks,omitempty"`
+	// Env is nil in a bundle from a magpie before variables were carried:
+	// Put keeps this computer's. Applied.Env stays out. A backup made
+	// without keys carries the names with empty values (WithoutSecrets).
+	Env *[]*EnvVar `json:"env,omitempty"`
+	// Bili is billion-context's own billion-context.json, with magpie's
+	// recipe at the default gateway address (carriedBili). It is nil when
+	// this computer has none or it can't be read, and in a bundle from a
+	// magpie before it was carried: Put keeps this computer's then.
+	Bili *string `json:"bili,omitempty"`
+	// ClaudePlugins are the marketplaces and plugins installed in Claude
+	// Code itself (claude_plugins.go). nil when there are none, or they
+	// can't be read, and in a bundle from a magpie before them: Put adds
+	// nothing then. Put only adds, so one computer's never takes away
+	// another's.
+	ClaudePlugins *ClaudePlugins `json:"claudePlugins,omitempty"`
+	// Plugins are the library's own Claude plugins (plugin.go), each as a
+	// whole: its parts aren't among the skills, servers, hooks and
+	// subagents above, and each computer makes them again from it
+	// (plugin_carry.go). nil in a bundle from a magpie before they were
+	// carried: Put keeps this computer's then.
+	Plugins *[]*CarriedPlugin `json:"plugins,omitempty"`
+	// NoAgents says the Library was told by a magpie whose page shows no
+	// agent (a container, a NAS, gateway mode; Shared): its skills and
+	// prompts are ticked for none there, and a magpie that takes them
+	// gives one ticked for none to the agents a new one goes to (Borrow).
+	NoAgents bool `json:"noAgents,omitempty"`
 }
 
 // CarriedSkill is a skill with its folder's files.
@@ -51,6 +83,23 @@ type CarriedSkill struct {
 	Called string `json:"called,omitempty"`
 	// Note is the user's note on it (Skill.Note)
 	Note string `json:"note,omitempty"`
+	// Router is Skill.Router: direct, kept out of the skill router
+	Router string `json:"router,omitempty"`
+	// From is the repository the skill was traced to on the computer that
+	// made the bundle (Skill.From, skill_from.go), when it isn't a source
+	// the skill carries itself: the lock, a checkout, CC Switch's record or
+	// an install-again there. What traced it is that computer's own files,
+	// so without this the other computer groups the skill under "this
+	// computer". Bundles from before this have none.
+	From string `json:"from,omitempty"`
+	// Fetch is a skill carried as its source (skill_carry.go): the other
+	// computer fetches it from there, at the version Hash names (Commit
+	// too, for a git repository's), and Files are only what fit, standing
+	// in until then. A magpie from before this leaves it out and writes
+	// the files, as it did.
+	Fetch  bool   `json:"fetch,omitempty"`
+	Hash   string `json:"hash,omitempty"`
+	Commit string `json:"commit,omitempty"`
 }
 
 // A skill's file bigger than maxCarried is left out, and so are the
@@ -99,35 +148,112 @@ func Collect() (*Bundle, error) {
 	// a server kept to this computer stays out; another computer's by its
 	// name, which a sync brought, goes on as it came (mcp_local.go)
 	for _, s := range sorted(l.carriedServers(), func(s *Server) string { return s.Name }) {
-		c := *carried(s) // magpie's own by name, each computer's own binary
+		if l.ownedPart(s.Bundle) { // with its plugin (plugin_carry.go)
+			continue
+		}
+		// magpie's own by name, each computer's own binary; a server
+		// started its own way here goes with the synced start (mcp_here.go)
+		c := *carried(carriedStart(s))
 		c.Agents = orNone(slices.Sorted(slices.Values(s.Agents)))
 		b.MCP = append(b.MCP, &c)
 	}
-	skills := sorted(l.Skills, func(s *Skill) string { return s.Name })
-	dirs := []string{}
+	skills := sorted(slices.DeleteFunc(slices.Clone(l.Skills), func(s *Skill) bool { return l.ownedPart(s.Bundle) }),
+		func(s *Skill) string { return s.Name })
+	// a skill carried as its source (skill_carry.go) takes only the room
+	// the ones carried as their files leave
+	var asFiles, asSource []*Skill
+	dirs, sdirs := []string{}, []string{}
 	for _, s := range skills {
-		dirs = append(dirs, realDir(skillDir(s.Name)))
+		if l.bySource(s) {
+			asSource, sdirs = append(asSource, s), append(sdirs, realDir(skillDir(s.Name)))
+		} else {
+			asFiles, dirs = append(asFiles, s), append(dirs, realDir(skillDir(s.Name)))
+		}
 	}
-	for i, c := range readSkills(dirs) {
-		s := skills[i]
-		c.Name, c.Source, c.Agents, c.Called, c.Note = s.Name, s.Source, orNone(slices.Sorted(slices.Values(s.Agents))), s.Called, s.Note
+	// a plugin's files from a folder are read with the skills', in one
+	// budget
+	plugins, pdirs, at := l.carriedPlugins()
+	read := readSkills(append(dirs, pdirs...))
+	for i, f := range read[len(asFiles):] {
+		c := plugins[at[i]]
+		c.Files, c.Exec, c.Left = f.Files, f.Exec, f.Left
+	}
+	b.Plugins = &plugins
+	used := int64(0)
+	for _, c := range read {
+		for _, f := range c.Files {
+			used += int64(len(f))
+		}
+	}
+	carried := map[string]*CarriedSkill{}
+	for i, c := range readSkillsMax(sdirs, maxCarried, max(maxCarriedAll-used, 0)) {
+		s := asSource[i]
+		c.Fetch, c.Hash, c.Commit = true, s.Hash, s.Commit
+		carried[s.Name] = c
+	}
+	for i, c := range read[:len(asFiles)] {
+		carried[asFiles[i].Name] = c
+	}
+	for _, s := range skills {
+		missing(carried[s.Name], s)
+	}
+	tr := &tracer{}
+	for _, s := range skills {
+		c := carried[s.Name]
+		if s.Source == nil || s.Source.Kind == "folder" {
+			c.From = tr.repoOf(s)
+		}
+		c.Name, c.Source, c.Agents, c.Called, c.Note, c.Router = s.Name, s.Source, orNone(slices.Sorted(slices.Values(s.Agents))), s.Called, s.Note, s.Router
 		b.Skills = append(b.Skills, c)
 	}
 	subs := []*Subagent{}
 	for _, s := range sorted(l.Subagents, func(s *Subagent) string { return s.Name }) {
+		if l.ownedPart(s.Bundle) {
+			continue
+		}
 		c := *s
 		c.Skills, c.MCP = slices.Sorted(slices.Values(s.Skills)), slices.Sorted(slices.Values(s.MCP))
 		c.Agents = orNone(slices.Sorted(slices.Values(s.Agents)))
+		c.From = s.From.clone()
+		c.File, c.FileHash = "", "" // this computer's
 		subs = append(subs, &c)
 	}
 	b.Subagents = &subs
+	cmds := []*Command{}
+	for _, c := range sorted(l.Commands, func(c *Command) string { return c.Name }) {
+		x := *c
+		x.Agents = orNone(slices.Sorted(slices.Values(c.Agents)))
+		x.Taken = nil // files here, this computer's own
+		cmds = append(cmds, &x)
+	}
+	b.Commands = &cmds
+	rules := []*Rule{}
+	for _, r := range sorted(l.Rules, func(r *Rule) string { return r.Name }) {
+		x := *r
+		x.Paths = slices.Clone(r.Paths)
+		x.Agents = orNone(slices.Sorted(slices.Values(r.Agents)))
+		rules = append(rules, &x)
+	}
+	b.Rules = &rules
 	hooks := []*Hook{}
 	for _, h := range sorted(l.Hooks, func(h *Hook) string { return h.Name }) {
+		if l.ownedPart(h.Bundle) {
+			continue
+		}
 		c := *h
 		c.Agents = orNone(slices.Sorted(slices.Values(h.Agents)))
 		hooks = append(hooks, &c)
 	}
 	b.Hooks = &hooks
+	envs := []*EnvVar{}
+	for _, e := range sorted(l.Env, func(e *EnvVar) string { return e.Name }) {
+		c := *e
+		c.Agents = orNone(slices.Sorted(slices.Values(e.Agents)))
+		envs = append(envs, &c)
+	}
+	b.Env = &envs
+	b.Bili = carriedBili()
+	b.ClaudePlugins = carriedClaudePlugins()
 	return b, nil
 }
 
@@ -145,7 +271,10 @@ func orNone(xs []string) []string {
 // readSkills is each skill folder's files. Links in it, .git and what
 // isn't a plain file stay out. What goes is chosen smallest first across
 // every skill, so the text of them all comes before any big file.
-func readSkills(dirs []string) []*CarriedSkill {
+func readSkills(dirs []string) []*CarriedSkill { return readSkillsMax(dirs, maxCarried, maxCarriedAll) }
+
+// readSkillsMax is readSkills with a file's and the whole's budget given.
+func readSkillsMax(dirs []string, perFile, all int64) []*CarriedSkill {
 	type file struct {
 		skill  int
 		rel, p string
@@ -185,10 +314,10 @@ func readSkills(dirs []string) []*CarriedSkill {
 	slices.SortFunc(files, func(a, b file) int {
 		return cmp.Or(cmp.Compare(a.size, b.size), cmp.Compare(a.skill, b.skill), strings.Compare(a.rel, b.rel))
 	})
-	budget := int64(maxCarriedAll)
+	budget := all
 	for _, f := range files {
 		c := out[f.skill]
-		if f.size > maxCarried || f.size > budget {
+		if f.size > perFile || f.size > budget {
 			c.Left = append(c.Left, f.rel)
 			continue
 		}
@@ -196,7 +325,7 @@ func readSkills(dirs []string) []*CarriedSkill {
 		if err != nil {
 			continue
 		}
-		if n := int64(len(data)); n > maxCarried || n > budget { // grew since
+		if n := int64(len(data)); n > perFile || n > budget { // grew since
 			c.Left = append(c.Left, f.rel)
 			continue
 		}
@@ -275,6 +404,74 @@ func (b *Bundle) check() error {
 			seen[s.Name] = true
 		}
 	}
+	if b.Commands != nil {
+		seen := map[string]bool{}
+		for _, c := range *b.Commands {
+			if c == nil {
+				return fmt.Errorf("an empty slash command")
+			}
+			// the agents are left as they come, as a subagent's are
+			if !commandNameRe.MatchString(c.Name) {
+				return fmt.Errorf("the slash command name %q", c.Name)
+			}
+			if seen[c.Name] {
+				return fmt.Errorf("the slash command %s twice", c.Name)
+			}
+			seen[c.Name] = true
+		}
+	}
+	if b.Rules != nil {
+		seen := map[string]bool{}
+		for _, r := range *b.Rules {
+			if r == nil {
+				return fmt.Errorf("an empty rule")
+			}
+			// the agents are left as they come, as a subagent's are
+			if !commandNameRe.MatchString(r.Name) {
+				return fmt.Errorf("the rule name %q", r.Name)
+			}
+			if seen[r.Name] {
+				return fmt.Errorf("the rule %s twice", r.Name)
+			}
+			seen[r.Name] = true
+		}
+	}
+	if b.Env != nil {
+		seen := map[string]bool{}
+		for _, e := range *b.Env {
+			if e == nil {
+				return fmt.Errorf("an empty variable")
+			}
+			if err := e.check(); err != nil {
+				return err
+			}
+			if seen[e.Name] {
+				return fmt.Errorf("the variable %s twice", e.Name)
+			}
+			seen[e.Name] = true
+		}
+	}
+	if b.Plugins != nil {
+		seen := map[string]bool{}
+		for _, p := range *b.Plugins {
+			if p == nil {
+				return fmt.Errorf("an empty plugin")
+			}
+			// its folder's name in the library
+			if p.Name == "" || pluginSlug(p.Name) != p.Name {
+				return fmt.Errorf("the plugin name %q", p.Name)
+			}
+			if seen[p.Name] {
+				return fmt.Errorf("the plugin %s twice", p.Name)
+			}
+			seen[p.Name] = true
+			for _, rel := range slices.Concat(slices.Collect(maps.Keys(p.Files)), p.Left) {
+				if !localFile(rel) {
+					return fmt.Errorf("plugin %s: %q is not a file in its folder", p.Name, rel)
+				}
+			}
+		}
+	}
 	if b.Hooks != nil {
 		seen := map[string]bool{}
 		for _, h := range *b.Hooks {
@@ -309,9 +506,31 @@ func localFile(rel string) bool {
 // WithoutSecrets empties the values of the servers' environment variables
 // and headers that secret says hold one; their names stay, to be filled in.
 func (b *Bundle) WithoutSecrets(secret func(string) bool) {
+	// billion-context.json holds no keys (bili takes a key's variable or
+	// its own store's name), except a storage DSN's password: a file
+	// naming one stays out, kept on each computer as it is
+	if b.Bili != nil && strings.Contains(strings.ToLower(*b.Bili), "dsn") {
+		b.Bili = nil
+	}
+	// a variable's name says nothing of what its value is: every value
+	// goes, the names stay
+	if b.Env != nil {
+		envs := []*EnvVar{}
+		for _, e := range *b.Env {
+			c := *e
+			c.Value = ""
+			envs = append(envs, &c)
+		}
+		b.Env = &envs
+	}
 	for i, s := range b.MCP {
 		c := *s
 		c.Env, c.Headers = blank(s.Env, secret), blank(s.Headers, secret)
+		c.Accounts = nil
+		for _, a := range s.Accounts {
+			a.Headers = blank(a.Headers, secret)
+			c.Accounts = append(c.Accounts, a)
+		}
 		// an OAuth app's secret is a key too; its client ID isn't
 		if s.OAuth != nil && s.OAuth.ClientSecret != "" {
 			a := *s.OAuth
@@ -345,11 +564,29 @@ func (b *Bundle) WithSecrets(have *Bundle, secret func(string) bool) *Bundle {
 	}
 	out := *b
 	out.MCP = nil
+	if b.Env != nil && have.Env != nil {
+		envs := []*EnvVar{}
+		for _, e := range *b.Env {
+			c := *e
+			if i := slices.IndexFunc(*have.Env, func(h *EnvVar) bool { return h.Name == e.Name }); i >= 0 && c.Value == "" {
+				c.Value = (*have.Env)[i].Value
+			}
+			envs = append(envs, &c)
+		}
+		out.Env = &envs
+	}
 	for _, s := range b.MCP {
 		c := *s
 		i := slices.IndexFunc(have.MCP, func(h *Server) bool { return h.Name == s.Name })
 		if i >= 0 {
 			c.Env, c.Headers = filled(s.Env, have.MCP[i].Env, secret), filled(s.Headers, have.MCP[i].Headers, secret)
+			c.Accounts = nil
+			for _, a := range s.Accounts {
+				if j := slices.IndexFunc(have.MCP[i].Accounts, func(h Account) bool { return h.ID == a.ID }); j >= 0 {
+					a.Headers = filled(a.Headers, have.MCP[i].Accounts[j].Headers, secret)
+				}
+				c.Accounts = append(c.Accounts, a)
+			}
 			// the same app's secret, kept here
 			if h := have.MCP[i].OAuth; s.OAuth != nil && s.OAuth.ClientSecret == "" && h != nil && h.ClientID == s.OAuth.ClientID {
 				a := *s.OAuth
@@ -389,7 +626,12 @@ func Put(b *Bundle) (*Result, error) {
 	if err := b.check(); err != nil {
 		return nil, err
 	}
-	return change(func(l *Library) error {
+	biliWrote := false
+	var fetch []*CarriedPlugin
+	var gone, fetchS []string
+	var plProblems, skProblems []Problem
+	res, err := change(func(l *Library) error {
+		fetch, gone, fetchS, plProblems, skProblems = nil, nil, nil, nil, nil
 		if err := os.MkdirAll(skillsDir(), 0o755); err != nil {
 			return err
 		}
@@ -398,9 +640,29 @@ func Put(b *Bundle) (*Result, error) {
 			return err
 		}
 		defer os.RemoveAll(stage)
+		// this computer's plugins' parts stand aside while the items are
+		// replaced, the bundle carrying none of them, and the plugins
+		// are put after (plugin_carry.go). A bundle from a magpie before
+		// plugins were carried has their parts as its own items, naming
+		// the other computer's folder: this computer's stay instead
+		held := l.holdPluginParts()
+		b := b
+		if b.Plugins == nil {
+			b = held.without(b)
+		}
 
 		keep, link := map[string]bool{}, map[string]string{}
+		// a skill carried as its source (skill_carry.go)
+		bySrc := map[string]*fromSource{}
 		for _, s := range b.Skills {
+			p := l.fromSourceHere(s)
+			if p != nil {
+				bySrc[s.Name] = p
+				if p.keep {
+					keep[s.Name] = true
+					continue
+				}
+			}
 			if cur := l.skill(s.Name); cur != nil && sameSource(cur.Source, s.Source) {
 				if have := readSkills([]string{realDir(skillDir(s.Name))})[0]; sameFiles(have, s) {
 					keep[s.Name] = true
@@ -420,6 +682,9 @@ func Put(b *Bundle) (*Result, error) {
 			}
 			if err := keepLeft(filepath.Join(stage, s.Name), realDir(skillDir(s.Name)), s); err != nil {
 				return fmt.Errorf("skill %s: %w", s.Name, err)
+			}
+			if p != nil {
+				p.whole(filepath.Join(stage, s.Name), s)
 			}
 		}
 
@@ -450,7 +715,39 @@ func Put(b *Bundle) (*Result, error) {
 		for _, s := range b.Skills {
 			// turned off here stays off here: that is this computer's own
 			off := l.skill(s.Name) != nil && l.skill(s.Name).OffHere
-			skills = append(skills, &Skill{Name: s.Name, Source: s.Source, Agents: slices.Clone(orNone(s.Agents)), OffHere: off, Called: s.Called, Note: s.Note})
+			n := &Skill{Name: s.Name, Source: s.Source, Agents: slices.Clone(orNone(s.Agents)), OffHere: off, Called: s.Called, Note: s.Note, Router: s.Router}
+			// where it came from: the other computer's trace, else what
+			// this one has found itself (Group again) for the same skill,
+			// which a bundle from before From was carried says nothing of
+			n.From = s.From
+			if cur := l.skill(s.Name); cur != nil && sameSource(cur.Source, s.Source) {
+				if n.From == "" {
+					n.From = cur.From
+				}
+				n.Gone = cur.Gone // kept on this computer only
+				n.Home = cur.Home // where it was in this computer's agents
+				if keep[s.Name] {
+					// the same files: what was fetched is still known
+					n.Hash, n.Own, n.Commit = cur.Hash, cur.Own, cur.Commit
+				}
+			}
+			if len(s.Left) > 0 {
+				dir := filepath.Join(stage, s.Name)
+				if keep[s.Name] {
+					dir = realDir(skillDir(s.Name))
+				}
+				n.Missing = notIn(dir, s.Left)
+			}
+			if p := bySrc[s.Name]; p != nil {
+				n.Hash, n.Own, n.Commit, n.Pending = p.hash, p.own, p.commit, p.pending
+				if p.fetch {
+					fetchS = append(fetchS, s.Name)
+				}
+				if p.changed {
+					skProblems = append(skProblems, changedHere(s.Name))
+				}
+			}
+			skills = append(skills, n)
 			if keep[s.Name] {
 				continue
 			}
@@ -529,9 +826,46 @@ func Put(b *Bundle) (*Result, error) {
 			for _, s := range *b.Subagents {
 				c := *s
 				c.Skills, c.MCP, c.Agents = slices.Clone(s.Skills), slices.Clone(s.MCP), slices.Clone(orNone(s.Agents))
+				c.From = s.From.clone()
+				// the file it is kept in here stays this computer's
+				c.File, c.FileHash = "", ""
+				if here := l.subagent(s.Name); here != nil {
+					c.File, c.FileHash = here.File, here.FileHash
+				}
 				subs = append(subs, &c)
 			}
+			for _, s := range l.Subagents {
+				if !slices.ContainsFunc(subs, func(c *Subagent) bool { return c.Name == s.Name }) {
+					dropSubagentFile(s)
+				}
+			}
 			l.Subagents = subs
+		}
+		// slash commands the same way: Applied.Commands decides
+		if b.Commands != nil {
+			cmds := []*Command{}
+			for _, c := range *b.Commands {
+				x := *c
+				x.Agents = slices.Clone(orNone(c.Agents))
+				// the files this computer's was imported from stay its
+				// own: written as they were while it says the same
+				x.Taken = nil
+				if have := l.command(c.Name); have != nil {
+					x.Taken = have.Taken
+				}
+				cmds = append(cmds, &x)
+			}
+			l.Commands = cmds
+		}
+		// rules the same way: Applied.Rules decides
+		if b.Rules != nil {
+			rules := []*Rule{}
+			for _, r := range *b.Rules {
+				x := *r
+				x.Paths, x.Agents = slices.Clone(r.Paths), slices.Clone(orNone(r.Agents))
+				rules = append(rules, &x)
+			}
+			l.Rules = rules
 		}
 		// the same for hooks: Applied.Hooks decides, entry by entry,
 		// what magpie takes out of each agent's file here
@@ -544,8 +878,47 @@ func Put(b *Bundle) (*Result, error) {
 			}
 			l.Hooks = hooks
 		}
+		// variables the same way: Applied.Env decides what is taken out
+		if b.Env != nil {
+			envs := []*EnvVar{}
+			for _, e := range *b.Env {
+				c := *e
+				c.Agents = slices.Clone(orNone(e.Agents))
+				envs = append(envs, &c)
+			}
+			l.Env = envs
+		}
+		l.putBack(held)
+		if b.Plugins != nil {
+			fetch, gone, plProblems = l.putPlugins(*b.Plugins, stage)
+		}
+		if b.Bili != nil {
+			wrote, err := putBili(*b.Bili, kept)
+			if err != nil {
+				return err
+			}
+			biliWrote = wrote
+		}
+		if b.ClaudePlugins != nil {
+			if err := putClaudePlugins(b.ClaudePlugins, kept); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
+	if err == nil && biliWrote {
+		// the running bilis read their settings again (best effort: one
+		// started later reads the file anyway)
+		biliReload()
+	}
+	if err == nil {
+		removePluginDirs(gone)
+		res.Problems = append(res.Problems, plProblems...)
+		res.Problems = append(res.Problems, skProblems...)
+		fetchPlugins(fetch, res)
+		fetchSkills(fetchS, res)
+	}
+	return res, err
 }
 
 func sameSource(a, b *Source) bool {
@@ -618,11 +991,18 @@ func isDir(p string) bool {
 }
 
 // Changed is when the library was last changed: library.json, or a file
-// of its own (links not followed).
+// of its own (links not followed), or billion-context.json or Claude
+// Code's plugin records, which a sync carries with it.
 func Changed() time.Time {
 	var t time.Time
 	if fi, err := os.Stat(path()); err == nil {
 		t = fi.ModTime()
+	}
+	if b := biliChanged(); b.After(t) {
+		t = b
+	}
+	if c := claudePluginsChanged(); c.After(t) {
+		t = c
 	}
 	filepath.WalkDir(Dir(), func(p string, d fs.DirEntry, err error) error {
 		if err != nil {

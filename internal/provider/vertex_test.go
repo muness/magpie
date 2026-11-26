@@ -32,6 +32,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/testenv"
 )
 
@@ -343,7 +344,8 @@ func TestVertexAddress(t *testing.T) {
 	if got := VertexPath("gemini-3.1-pro-preview-customtools"); got != "/publishers/google/models/gemini-3.1-pro-preview-customtools:streamGenerateContent?alt=sse" {
 		t.Errorf("a model's path: %s", got)
 	}
-	if got := VertexPath("tuned/gemini 1?x#y"); got != "/publishers/google/models/tuned%2Fgemini%201%3Fx%23y:streamGenerateContent?alt=sse" {
+	// each segment escaped, the slash kept, as at a Gemini URL (#6695)
+	if got := VertexPath("tuned/gemini 1?x#y"); got != "/publishers/google/models/tuned/gemini%201%3Fx%23y:streamGenerateContent?alt=sse" {
 		t.Errorf("a model with a slash, a space, ? and # in it: %s", got)
 	}
 }
@@ -360,10 +362,12 @@ func TestVertexSaveRefuses(t *testing.T) {
 		keys []KeyAccount
 		want string
 	}{
-		{v: &Vertex{Project: "acme-vertex"}, key: "AIzaSyD-not-a-real-key", want: "Google Vertex AI is asked with your Google credentials, not an API key"},
-		{v: &Vertex{Project: "acme-vertex"}, keys: []KeyAccount{{Name: "express", Key: "AIzaSyD-not-a-real-key"}}, want: "Google Vertex AI is asked with your Google credentials, not an API key"},
-		{want: "Google Vertex AI needs the id of your Google Cloud project"},
-		{v: &Vertex{Location: "us-central1"}, want: "Google Vertex AI needs the id of your Google Cloud project"},
+		{v: &Vertex{Project: "acme-vertex"}, keys: []KeyAccount{{Name: "express", Key: "AQ.Ab8RN6-not-a-real-key"}}, want: "Google Vertex AI takes one API key"},
+		{want: "Google Vertex AI needs the id of your Google Cloud project, or an API key"},
+		{v: &Vertex{Location: "us-central1"}, want: "Google Vertex AI needs the id of your Google Cloud project, or an API key"},
+		// Google's token goes only to Google's own address
+		{v: &Vertex{Project: "acme-vertex", BaseURL: "https://proxy.example.com"}, want: "a base URL is for an API key: Google credentials are sent only to Google's own address"},
+		{v: &Vertex{Project: "acme-vertex", BaseURL: "ftp://proxy.example.com"}, key: "AQ.Ab8RN6-k", want: `"ftp://proxy.example.com" is no base URL`},
 		{v: &Vertex{Project: "acme_vertex"}, want: `"acme_vertex" is no Google Cloud project id`},
 		{v: &Vertex{Project: "-acme-vertex"}, want: `"-acme-vertex" is no Google Cloud project id`},
 		{v: &Vertex{Project: "acme-vertex/locations"}, want: `"acme-vertex/locations" is no Google Cloud project id`},
@@ -392,54 +396,41 @@ func TestVertexSaveRefuses(t *testing.T) {
 	}
 }
 
-// A key put in a Vertex AI provider's entry by hand stands in for
-// nothing: the provider as found has none, isn't ready without a project,
-// signs with its Google token, and saves without it (switched off, here).
-// A Provider made with one, as the app's typed Refresh makes it, still
-// signs with the token.
+// A Vertex AI provider's entry put in providers.json by hand with a key
+// and a list of keys keeps the one key and drops the list; its base URL
+// without a key is dropped, so that its Google token goes only to Google.
 func TestVertexKeyKeptDropped(t *testing.T) {
 	home := vertexHome(t)
 	newVertexGoogle(t)
 	writeFile(t, gcloudCredentials(home), vertexUser("1//0g-test-refresh"))
 	stray := []KeyAccount{{Name: "express", Key: "AQ.Ab8RN6-other"}}
 	writeFile(t, Path(), map[string]any{"providers": []Provider{
-		{ID: "vertex-prod", Name: "Vertex prod", Preset: VertexPreset, Key: "AQ.Ab8RN6-stray", KeyName: "express", Keys: stray, Vertex: &Vertex{Project: "acme-vertex"}},
-		{ID: "vertex-bare", Name: "Vertex bare", Preset: VertexPreset, Key: "AQ.Ab8RN6-stray"},
+		{ID: "vertex-prod", Name: "Vertex prod", Preset: VertexPreset, Key: "AQ.Ab8RN6-kept", KeyName: "express", Keys: stray, Vertex: &Vertex{Project: "acme-vertex"}},
+		{ID: "vertex-bare", Name: "Vertex bare", Preset: VertexPreset},
+		{ID: "vertex-leak", Name: "Vertex leak", Preset: VertexPreset, Vertex: &Vertex{Project: "acme-vertex", BaseURL: "https://evil.example.com"}},
 	}})
 	p, err := Find("vertex-prod")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Key != "" || p.KeyName != "" || p.Keys != nil || !p.On() {
+	if p.Key != "AQ.Ab8RN6-kept" || p.KeyName != "" || p.Keys != nil || !p.On() {
 		t.Fatalf("found with key %q (%q), keys %v, on %v", p.Key, p.KeyName, p.Keys, p.On())
 	}
 	if bare, err := Find("vertex-bare"); err != nil || bare.Ready() {
-		t.Fatalf("with a key and no project: ready %v (%v)", bare.Ready(), err)
+		t.Fatalf("with no key and no project: ready %v (%v)", bare.Ready(), err)
 	}
-	if auth, err := signVertex(context.Background(), *p, "gemini-3.5-flash"); err != nil || auth != "Bearer ya29.minted-1" {
+	leak, err := Find("vertex-leak")
+	if err != nil || leak.Vertex == nil || leak.Vertex.BaseURL != "" || strings.Contains(leak.Base(Gemini), "evil") {
+		t.Fatalf("a base URL with no key: %+v, %v", leak.Vertex, err)
+	}
+	if auth, err := signVertex(context.Background(), *leak, "gemini-3.5-flash"); err != nil || auth != "Bearer ya29.minted-1" {
 		t.Fatalf("signed with %q: %v", auth, err)
 	}
-	if err := SetOff("vertex-prod", true); err != nil {
-		t.Fatalf("switched off: %v", err)
-	}
-	var f struct {
-		Providers []map[string]any `json:"providers"`
-	}
-	if b, err := os.ReadFile(Path()); err != nil || json.Unmarshal(b, &f) != nil || f.Providers[0]["id"] != "vertex-prod" || f.Providers[0]["off"] != true {
-		t.Fatalf("providers.json: %v (%v)", f.Providers, err)
-	}
-	for _, k := range []string{"key", "keyName", "keys"} {
-		if v, ok := f.Providers[0][k]; ok && v != "" {
-			t.Errorf("saved with its %s %v", k, v)
-		}
-	}
-	typed := vertexAt("global", "")
-	typed.Key = "AQ.Ab8RN6-typed"
-	if auth, err := signVertex(context.Background(), typed, "gemini-3.5-flash"); err != nil || auth != "Bearer ya29.minted-1" {
-		t.Fatalf("made with a key, signed with %q: %v", auth, err)
-	}
-	if typed.Vertex = nil; typed.Ready() {
-		t.Fatal("a key made it ready with no project")
+	// even a Provider made with the URL and no key asks Google's address
+	q := vertexAt("global", "")
+	q.Vertex.BaseURL = "https://evil.example.com"
+	if b := q.Base(Gemini); strings.Contains(b, "evil") {
+		t.Fatalf("base %s", b)
 	}
 }
 
@@ -537,16 +528,97 @@ func TestVertexProviderListed(t *testing.T) {
 		case "global":
 			wrong = func(m string) bool { return !slices.Contains(global, m) }
 		case "us", "eu":
-			// Gemini 3's Flash models, of those global serves
+			// Gemini 3's Flash models and Gemini 4, of those global serves
 			wrong = func(m string) bool {
-				return !strings.HasPrefix(m, "gemini-3") || !strings.Contains(m, "-flash") || strings.Contains(m, "preview") || !slices.Contains(global, m)
+				gen4 := strings.HasPrefix(m, "gemini-4-")
+				return !gen4 && (!strings.HasPrefix(m, "gemini-3") || !strings.Contains(m, "-flash") || strings.Contains(m, "preview")) || !slices.Contains(global, m)
 			}
 		default:
 			wrong = func(m string) bool { return !strings.HasPrefix(m, "gemini-2.5-") }
 		}
+		if loc == "global" || loc == "us" || loc == "eu" {
+			// Gemini 4 is served at each of the three (#6452), Neon too
+			// (Google's Gemini 4 Neon page, read 2026-11-25: global, us, eu)
+			for _, m := range []string{"gemini-4-neon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-4-argon"} {
+				if !slices.Contains(got, m) {
+					t.Errorf("at %s: no %s in %v", loc, m, got)
+				}
+			}
+		}
 		if len(got) == 0 || slices.ContainsFunc(got, wrong) || loc == "global" && len(got) != len(global) {
 			t.Errorf("at %s: %v", loc, got)
 		}
+	}
+}
+
+// A Gemini 4 or later model Google releases on Vertex AI is offered once
+// models.dev's google-vertex entry has it, not once magpie is given its id
+// (T_t__biu on X: no Gemini 4 Neon a week after its release): at global,
+// us and eu and in express mode, ahead of the Gemini 4 models listed, and
+// not at a region. A preview, a cyber model Google gives on its allowlist,
+// an older Gemini, another vendor's model and AI Studio's own entry add
+// nothing, and a model already listed isn't listed twice.
+func TestVertexNewGeminiFromCatalog(t *testing.T) {
+	vertexHome(t)
+	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
+	// gemini-4-xenon stands for a release models.dev has and magpie's
+	// lists don't; the rest are rows magpie must not take
+	if err := os.WriteFile(catalog.CachePath(), []byte(`{
+	  "google-vertex":{"id":"google-vertex","models":{
+	    "gemini-4-xenon":{"id":"gemini-4-xenon","release_date":"2026-12-02","modalities":{"input":["text"],"output":["text"]},"limit":{"context":1048576,"output":65536}},
+	    "gemini-4-neon":{"id":"gemini-4-neon","release_date":"2026-11-18","modalities":{"input":["text"],"output":["text"]},"limit":{"context":1048576,"output":65536}},
+	    "gemini-4-xenon-preview":{"id":"gemini-4-xenon-preview","release_date":"2026-12-01","modalities":{"input":["text"],"output":["text"]}},
+	    "gemini-4-neon-cyber-permissive":{"id":"gemini-4-neon-cyber-permissive","release_date":"2026-11-18","modalities":{"input":["text"],"output":["text"]}},
+	    "gemini-3.9-flash":{"id":"gemini-3.9-flash","release_date":"2026-11-20","modalities":{"input":["text"],"output":["text"]}},
+	    "claude-opus-6@default":{"id":"claude-opus-6@default","release_date":"2026-11-21","modalities":{"input":["text"],"output":["text"]}}}},
+	  "google":{"id":"google","models":{
+	    "gemini-4-krypton":{"id":"gemini-4-krypton","release_date":"2026-12-03","modalities":{"input":["text"],"output":["text"]}}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+	never := []string{"gemini-4-xenon-preview", "gemini-4-neon-cyber-permissive", "gemini-3.9-flash", "claude-opus-6@default", "gemini-4-krypton"}
+	for _, loc := range []string{"global", "us", "eu", "us-central1"} {
+		if err := Save(Provider{ID: "vertex-prod", Name: "Vertex prod", Preset: VertexPreset, Vertex: &Vertex{Project: "acme-vertex", Location: loc}}); err != nil {
+			t.Fatal(err)
+		}
+		p, err := Find("vertex-prod")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.Fetch(context.Background()); err != nil {
+			t.Fatalf("at %s: %v", loc, err)
+		}
+		got := modelIDs(p.Available())
+		for _, m := range never {
+			if slices.Contains(got, m) {
+				t.Errorf("at %s: %s offered: %v", loc, m, got)
+			}
+		}
+		if loc == "us-central1" {
+			if slices.Contains(got, "gemini-4-xenon") {
+				t.Errorf("at %s, a region: %v", loc, got)
+			}
+			continue
+		}
+		x, n := slices.Index(got, "gemini-4-xenon"), slices.Index(got, "gemini-4-neon")
+		if x < 0 || n < 0 || x > n || x != slices.IndexFunc(got, func(m string) bool { return strings.HasPrefix(m, "gemini-4-") }) {
+			t.Errorf("at %s: want gemini-4-xenon first of Gemini 4, before gemini-4-neon: %v", loc, got)
+		}
+		seen := map[string]bool{}
+		for _, m := range got {
+			if seen[m] {
+				t.Errorf("at %s: %s listed twice: %v", loc, m, got)
+			}
+			seen[m] = true
+		}
+		if loc == "global" && len(got) != len(Preset(VertexPreset).Models)+1 {
+			t.Errorf("at %s: %d models, want the preset's %d and xenon: %v", loc, len(got), len(Preset(VertexPreset).Models), got)
+		}
+	}
+	express := vertexExpressModels()
+	if !slices.Contains(express, "gemini-4-xenon") || slices.ContainsFunc(express, func(m string) bool { return slices.Contains(never, m) || VertexPartner(m) || VertexClaude(m) }) {
+		t.Errorf("express: %v", express)
 	}
 }
 
@@ -1419,6 +1491,9 @@ func TestVertexTestRequest(t *testing.T) {
 		"gemini-3.5-flash":       low,
 		"gemini-3.1-pro-preview": low,
 		"gemini-4-argon":         low,
+		"gemini-4-carbon":        low,
+		"gemini-4-hydrogen":      low,
+		"gemini-4-neon":          low,
 		"gemini-3-flash-preview": low,
 		"gemini-2.5-pro":         budget(128),
 		"Gemini-2.5-Pro":         budget(128),
@@ -1681,7 +1756,7 @@ func TestVertexClaudeModels(t *testing.T) {
 		t.Fatalf("Claude at %q, want %q", p.Base(Anthropic), base)
 	}
 	listed := modelIDs(p.Available())
-	for _, m := range []string{"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"} {
+	for _, m := range []string{"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2", "claude-fable-5-1"} {
 		if !slices.Contains(listed, m) {
 			t.Errorf("%s not listed at global: %v", m, listed)
 		}

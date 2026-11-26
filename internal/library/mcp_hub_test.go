@@ -626,11 +626,11 @@ func TestHubSaysWhatServersAreFor(t *testing.T) {
 	ok(t)(SetMCPHub(true))
 	m, _ := marketServer("deepwiki")
 	c, _ := marketServer("context7")
-	want := []gateway.HubServer{{Name: "context7", About: c.Description}, {Name: "notes"}, {Name: "wiki", About: m.Description}}
+	want := []gateway.HubServer{{Name: "context7", About: c.Description, Program: true}, {Name: "notes", Program: true}, {Name: "wiki", About: m.Description}}
 	if got := (theHub{}).Servers("pi"); !reflect.DeepEqual(got, want) || m.Description == "" || c.Description == "" {
 		t.Fatalf("pi's servers %+v, want %+v", got, want)
 	}
-	if got := (theHub{}).Servers("claude"); !reflect.DeepEqual(got, []gateway.HubServer{{Name: "notes"}}) {
+	if got := (theHub{}).Servers("claude"); !reflect.DeepEqual(got, []gateway.HubServer{{Name: "notes", Program: true}}) {
 		t.Fatalf("claude's servers %+v", got)
 	}
 }
@@ -668,6 +668,67 @@ func TestHubPiDescription(t *testing.T) {
 	}
 	if d, _ := piServers(t, file)["theirs"]["description"].(string); d != "My own." {
 		t.Fatalf("the user's description: %q", d)
+	}
+}
+
+// Pi declares a codemode server's tools to its model only as a line for
+// the server, so the hub entry tells it to declare Magpie Artifacts'
+// publish tool whole (toolExposure "direct"): an ask for a page then
+// reaches it without naming it. An exposure or toolExposure the user wrote
+// on the entry is theirs, and no other server is given one.
+func TestHubPiDeclaresArtifactsPublish(t *testing.T) {
+	h := hubSandbox(t)
+	setPiVersion(t, "1.6.0")
+	file := filepath.Join(h, ".pi/agent/mcp.json")
+	write(t, file, `{"mcpServers": {}}`)
+	ok(t)(SaveServer("", Server{Name: "wiki", Transport: "http", URL: "https://mcp.deepwiki.com/mcp", Agents: []string{"pi"}}))
+	ok(t)(SetMCPHub(true))
+	exposure := func() any {
+		t.Helper()
+		return piServers(t, file)[HubEntry]["toolExposure"]
+	}
+	if x := exposure(); x != nil {
+		t.Fatalf("no Artifacts, yet toolExposure %v:\n%s", x, read(t, file))
+	}
+	art := fakeStdio(t, "ok", nil)
+	art.Name, art.Args, art.Agents = ArtifactsServerName, []string{"mcp", "artifacts"}, []string{"pi"}
+	ok(t)(SaveServer("", *art))
+	want := map[string]any{"magpie-artifacts__publish_artifact": "direct"}
+	if x := exposure(); !reflect.DeepEqual(x, want) {
+		t.Fatalf("toolExposure %v, want %v:\n%s", x, want, read(t, file))
+	}
+	// an entry written before has it on the next sync
+	write(t, file, strings.Replace(read(t, file), `"toolExposure"`, `"toolExposureGone"`, 1))
+	ok(t)(Sync())
+	if x := exposure(); !reflect.DeepEqual(x, want) {
+		t.Fatalf("after a sync of an entry without it: %v:\n%s", x, read(t, file))
+	}
+	// the user's own toolExposure stays as they wrote it
+	theirs := map[string]any{"magpie-artifacts__*": "hidden"}
+	setEntry := func(k string, v any) {
+		t.Helper()
+		var doc map[string]map[string]map[string]any
+		if err := json.Unmarshal([]byte(read(t, file)), &doc); err != nil {
+			t.Fatal(err)
+		}
+		e := doc["mcpServers"][HubEntry]
+		delete(e, "toolExposureGone")
+		delete(e, "toolExposure")
+		e[k] = v
+		b, _ := json.Marshal(doc)
+		write(t, file, string(b))
+	}
+	setEntry("toolExposure", theirs)
+	ok(t)(Sync())
+	if x := exposure(); !reflect.DeepEqual(x, theirs) {
+		t.Fatalf("the user's toolExposure became %v", x)
+	}
+	// and so does a server-wide exposure, with none of magpie's beside it
+	// when the entry is written again (another server ticked)
+	setEntry("exposure", "hidden")
+	ok(t)(SaveServer("", Server{Name: "context7", Transport: "http", URL: "https://mcp.context7.com/mcp", Agents: []string{"pi"}}))
+	if e := piServers(t, file)[HubEntry]; e["exposure"] != "hidden" || e["toolExposure"] != nil || !strings.Contains(e["description"].(string), "context7") {
+		t.Fatalf("the user's exposure: %v", e)
 	}
 }
 
@@ -712,6 +773,44 @@ func TestHubGivesMagpieImage(t *testing.T) {
 	}
 	if got := hubText(t, res); !strings.Contains(got, `meta={"magpie/roots":[]}`) {
 		t.Errorf("no roots: called as %q", got)
+	}
+}
+
+// magpie's memory server is told the calling agent's roots and name, as
+// the image server is, so a memory is kept for the agent's project and
+// the agent; another server is told neither.
+func TestHubTellsMagpieMemoryItsCaller(t *testing.T) {
+	h := hubSandbox(t)
+	write(t, filepath.Join(h, ".claude.json"), `{"mcpServers": {}}`)
+	mem := fakeStdio(t, "ok", nil)
+	mem.Name, mem.Args, mem.Agents = memoryServerName, []string{"mcp", "memory"}, []string{"claude"}
+	ok(t)(SaveServer("", *mem))
+	other := fakeStdio(t, "ok", nil)
+	other.Agents = []string{"claude"}
+	ok(t)(SaveServer("", *other))
+	ok(t)(SetMCPHub(true))
+	hub := theHub{}
+	ctx := context.Background()
+
+	for _, x := range hub.Tools(ctx, "claude") {
+		if x.Roots != (x.Server == memoryServerName) {
+			t.Errorf("%s/%s: roots asked %v", x.Server, x.Tool, x.Roots)
+		}
+	}
+	caller := gateway.WithHubCaller(ctx, gateway.HubCaller{Roots: []string{"file:///work/proj"}, Client: "codex-mcp-client"})
+	res, err := hub.Call(caller, "claude", memoryServerName, "a", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hubText(t, res); !strings.Contains(got, `meta={"magpie/client":"codex-mcp-client","magpie/roots":["file:///work/proj"]}`) {
+		t.Errorf("memory called as %q", got)
+	}
+	res, err = hub.Call(caller, "claude", "fake", "a", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hubText(t, res); strings.Contains(got, "meta=") {
+		t.Errorf("another server was told the caller: %q", got)
 	}
 }
 
@@ -774,5 +873,88 @@ func TestKeepsSession(t *testing.T) {
 		if got := keepsSession(&c.s); got != c.want {
 			t.Errorf("%+v: %v, want %v", c.s, got, c.want)
 		}
+	}
+}
+
+// The hub runs Magpie Browser and magpie's image server for this
+// computer's callers only, and a program of this computer for no caller
+// from elsewhere by a held key; a call from elsewhere starts neither, and
+// neither is listed for it. The gateway leaves them out too
+// (TestHubKeepsThisComputersOwnServersHere); this holds when it doesn't.
+func TestHubKeepsThisComputersOwnServersHere(t *testing.T) {
+	h := hubSandbox(t)
+	write(t, filepath.Join(h, ".claude.json"), `{"mcpServers": {}}`)
+	br := fakeStdio(t, "ok", nil)
+	br.Name, br.Args, br.Agents = browserServerName, []string{"mcp", "browser"}, []string{"claude"}
+	ok(t)(SaveServer("", *br))
+	other := fakeStdio(t, "ok", nil)
+	other.Agents = []string{"claude"}
+	ok(t)(SaveServer("", *other))
+	ok(t)(SetMCPHub(true))
+	hub := theHub{}
+	here := context.Background()
+	away := gateway.WithHubVisitor(here, gateway.HubVisitor{Away: true})
+	held := gateway.WithHubVisitor(here, gateway.HubVisitor{Away: true, Held: true})
+
+	servers := func(ctx context.Context) []string {
+		var out []string
+		for _, t := range hub.Tools(ctx, "claude") {
+			if !slices.Contains(out, t.Server) {
+				out = append(out, t.Server)
+			}
+		}
+		slices.Sort(out)
+		return out
+	}
+	if got := servers(here); !slices.Equal(got, []string{"fake", browserServerName}) && !slices.Equal(got, []string{browserServerName, "fake"}) {
+		t.Errorf("listed here: %v", got)
+	}
+	if got := servers(away); !slices.Equal(got, []string{"fake"}) {
+		t.Errorf("listed from elsewhere: %v", got)
+	}
+	if got := servers(held); len(got) != 0 {
+		t.Errorf("listed for a held key from elsewhere: %v", got)
+	}
+	for _, c := range []struct {
+		ctx    context.Context
+		server string
+	}{{away, browserServerName}, {held, browserServerName}, {held, "fake"}} {
+		if _, err := hub.Call(c.ctx, "claude", c.server, "a", json.RawMessage(`{}`)); err == nil {
+			t.Errorf("%s ran for %+v", c.server, gateway.HubVisitorOf(c.ctx))
+		}
+	}
+	if _, err := hub.Call(away, "claude", "fake", "a", json.RawMessage(`{}`)); err != nil {
+		t.Errorf("a command server for a full key from elsewhere: %v", err)
+	}
+	if _, err := hub.Call(here, "claude", browserServerName, "a", json.RawMessage(`{}`)); err != nil {
+		t.Errorf("Magpie Browser here: %v", err)
+	}
+	for _, c := range []struct {
+		s             Server
+		here, program bool
+	}{
+		{Server{Transport: "stdio", Command: "magpie", Args: []string{"mcp", "browser"}}, true, true},
+		{Server{Transport: "stdio", Command: "magpie", Args: []string{"mcp", "image"}}, true, true},
+		{Server{Transport: "stdio", Command: "magpie", Args: []string{"mcp", "memory"}}, true, true},
+		{Server{Transport: "http", URL: "http://10.0.0.2:3425/mcp/magpie/hub"}, true, false},
+		{Server{Transport: "stdio", Command: "npx", Args: []string{"server-filesystem"}}, false, true},
+		{Server{Transport: "http", URL: "https://mcp.example.com/mcp"}, false, false},
+		{Server{Plugin: "notes", Transport: "http", URL: "http://127.0.0.1:1/x"}, false, true},
+	} {
+		if got := hubServerOf(&c.s); got.HereOnly != c.here || got.Program != c.program {
+			t.Errorf("%+v: here-only %v program %v, want %v %v", c.s, got.HereOnly, got.Program, c.here, c.program)
+		}
+		// only Magpie Browser's browsers are a gateway key's (gateway.HubServer's Keyed)
+		if got, want := hubServerOf(&c.s).Keyed, len(c.s.Args) > 1 && c.s.Args[1] == "browser"; got != want {
+			t.Errorf("%+v: keyed %v, want %v", c.s, got, want)
+		}
+		// only Magpie Memory goes to a key let use it (gateway.HubServer's Memory)
+		if got, want := hubServerOf(&c.s).Memory, len(c.s.Args) > 1 && c.s.Args[1] == "memory"; got != want {
+			t.Errorf("%+v: memory %v, want %v", c.s, got, want)
+		}
+	}
+	keyed := gateway.WithHubVisitor(here, gateway.HubVisitor{Away: true, Key: "k1"})
+	if got := servers(keyed); !slices.Equal(got, []string{"fake", browserServerName}) && !slices.Equal(got, []string{browserServerName, "fake"}) {
+		t.Errorf("listed for a key from elsewhere: %v", got)
 	}
 }

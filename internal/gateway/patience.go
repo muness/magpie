@@ -1,12 +1,12 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"net/http"
 	"slices"
 	"time"
 
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -62,19 +62,41 @@ type busyTry struct {
 // overloaded, unavailable, timed out, or a rate limit that isn't the
 // plan's or the money's, nor an account's token wall (walled). A proxy
 // that refused the connection, a quota used up, response protection's
-// 502, a void cut at its length (cutVoidWords, #2972), or an upstream
-// that answered a stream request with a whole reply (didNotStream) isn't:
-// each fails the same however often it is asked.
+// 502, a void cut at its length (cutVoidWords, #2972), an upstream
+// that answered a stream request with a whole reply (didNotStream), or
+// the Qoder plugin's queue answer (queued) isn't: each fails the same
+// however often it is asked.
 func busy(status int, body []byte) bool {
 	switch {
 	case busyStatus(status):
 		return failure(status, body) == failOther && !protectionRefused(status, body) &&
-			!bytes.Contains(body, []byte(didNotStream)) &&
-			!bytes.Contains(body, []byte(cutVoidWords))
+			!bodyHas(body, didNotStream) &&
+			!bodyHas(body, cutVoidWords) &&
+			!queued(body)
 	case status == 429:
 		return failure(status, body) == failRate && !creditWords.Match(wordsOf(body)) && !walled(body)
 	}
 	return false
+}
+
+// queuedWords matches the 503 the Qoder plugin answers when Qoder put a
+// request in the model's queue (its code 10605) and magpie has another
+// candidate to ask (#4049: "Qoder queued the request for efficient (this
+// plan's queue: p3, 3 ahead); try again in 30s", or "Qoder is busy for
+// efficient (this plan's queue: p3); …" when the model's service is out).
+// Asked again as a group's patience asks, the members only meet the same
+// queue again, every body sent again on every account, a whole round at
+// a time (#5346: 217 accounts, one request tried 656 times, 20 GB of
+// re-uploaded bodies a day). The last one left is asked untold, and the
+// plugin waits the queue out as Qoder's own client does, asking its
+// queue status rather than sending the request again. Only the plugin's
+// own words are matched: a relay's 503 that names its own queue ("queue
+// full", 排队中) is a moment's overload, waited out as before.
+var queuedWords = lazyre.New(`(?i)\bqueued the request\b|\bthis plan's queue:`)
+
+// queued says whether a failure's body is the Qoder plugin's queue answer.
+func queued(body []byte) bool {
+	return queuedWords.Match(wordsOf(body))
 }
 
 // busyStatus says whether an error status is one a vendor or the relay in
@@ -194,10 +216,16 @@ func minTime(a, b time.Time) time.Time {
 
 // pauseAlive waits d, keeping a streaming agent alive as a held stream
 // does once the request has gone keepHeldAfter without a word. false: the
-// agent went away first.
-func pauseAlive(ctx context.Context, w http.ResponseWriter, kept *keptAlive, streams bool, start time.Time, d time.Duration) bool {
+// agent went away first. A pause ends early once moved (when given) says
+// a provider about to be asked again was saved at another address
+// (readdressedOf).
+func pauseAlive(ctx context.Context, w http.ResponseWriter, kept *keptAlive, streams bool, start time.Time, d time.Duration, moved func() bool) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
+	edits := editsOf(moved)
+	if moved != nil && moved() {
+		return true // saved elsewhere while it was asked
+	}
 	var hw *holdWriter
 	if streams && kept != nil && kept.proto != provider.Gemini {
 		hw = newHoldWriter(w, true)
@@ -215,6 +243,61 @@ func pauseAlive(ctx context.Context, w http.ResponseWriter, kept *keptAlive, str
 		case <-ctx.Done():
 			return false
 		case <-tick.C:
+		case <-edits:
+			if moved() {
+				return true
+			}
+			edits = provider.Edited()
 		}
+	}
+}
+
+// pauseUntilReaddressed waits d, or until moved (when given) says a
+// provider about to be asked again was saved at another address. false:
+// ctx ended first.
+func pauseUntilReaddressed(ctx context.Context, d time.Duration, moved func() bool) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	edits := editsOf(moved)
+	if moved != nil && moved() {
+		return true // saved elsewhere while it was asked
+	}
+	for {
+		select {
+		case <-t.C:
+			return true
+		case <-ctx.Done():
+			return false
+		case <-edits:
+			if moved() {
+				return true
+			}
+			edits = provider.Edited()
+		}
+	}
+}
+
+// editsOf is provider.Edited when there is a moved to ask, else a channel
+// that never fires.
+func editsOf(moved func() bool) <-chan struct{} {
+	if moved == nil {
+		return nil
+	}
+	return provider.Edited()
+}
+
+// readdressedOf says whether any of cs is a Remote magpie saved at another
+// address since the request read it: the user typed its new address in
+// while the request paused before asking it again (le13ure on X). nil
+// when none of cs is a Remote magpie, for a pause that never wakes early.
+func readdressedOf(cs []candidate) func() bool {
+	if !slices.ContainsFunc(cs, func(c candidate) bool { return c.p.IsRemoteMagpie() }) {
+		return nil
+	}
+	return func() bool {
+		return slices.ContainsFunc(cs, func(c candidate) bool {
+			_, ok := provider.Readdressed(c.p)
+			return ok
+		})
 	}
 }

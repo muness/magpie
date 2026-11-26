@@ -20,7 +20,15 @@ package provider
 // gcloud's --impersonate-service-account does: the credentials' account
 // needs roles/iam.serviceAccountTokenCreator on it. Not read: the metadata
 // server of Compute Engine, Cloud Run and GKE, workload identity federation
-// (external_account), and Vertex's express mode API keys.
+// (external_account).
+//
+// A provider given an API key is asked as Vertex AI's express mode is
+// (https://docs.cloud.google.com/vertex-ai/generative-ai/docs/start/express-mode/overview):
+// the key in the x-goog-api-key header, at the global endpoint with no
+// project (https://aiplatform.googleapis.com/v1/publishers/google/models/<model>:streamGenerateContent),
+// which serves Gemini models alone. With a project too it is asked at that
+// project's address, signed by the key in place of a token. Either may go
+// to Vertex.BaseURL instead of Google's host.
 
 import (
 	"cmp"
@@ -40,8 +48,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,6 +57,8 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // VertexPreset is the preset's id.
@@ -69,6 +79,11 @@ type Vertex struct {
 	// Impersonate is the email of a service account the credentials are
 	// traded for, "" to ask as their own account.
 	Impersonate string `json:"impersonate,omitempty"`
+	// BaseURL is the root a provider with an API key asks at in place of
+	// Google's (a proxy, or a gateway that answers as Vertex AI does), with
+	// no /v1 after it. Only with a key: the Google token goes nowhere but
+	// Google's own address.
+	BaseURL string `json:"baseUrl,omitempty"`
 }
 
 // IsVertex reports whether the provider is Google Vertex AI.
@@ -86,6 +101,7 @@ func (v *Vertex) Normal() *Vertex {
 		Location:    strings.ToLower(strings.TrimSpace(v.Location)),
 		Credentials: strings.TrimSpace(v.Credentials),
 		Impersonate: strings.ToLower(strings.TrimSpace(v.Impersonate)),
+		BaseURL:     vertexRootOf(v.BaseURL),
 	}
 	if n == (Vertex{}) {
 		return nil
@@ -97,17 +113,47 @@ func (v *Vertex) Normal() *Vertex {
 var (
 	// a project's id (my-project-123), its number, or a domain-scoped
 	// one's (example.com:my-project)
-	vertexProject = regexp.MustCompile(`^[a-z0-9][a-z0-9.:-]*[a-z0-9]$`)
+	vertexProject = lazyre.New(`^[a-z0-9][a-z0-9.:-]*[a-z0-9]$`)
 	// global, us, eu or a region (us-central1, europe-west4)
-	vertexLocation = regexp.MustCompile(`^[a-z]+(-[a-z0-9]+)*$`)
-	vertexAccount  = regexp.MustCompile(`^[^\s@/]+@[^\s@/]+$`)
+	vertexLocation = lazyre.New(`^[a-z]+(-[a-z0-9]+)*$`)
+	vertexAccount  = lazyre.New(`^[^\s@/]+@[^\s@/]+$`)
 )
 
+// vertexRootOf is a base URL as it is kept: trimmed, https:// when it has
+// no scheme, no trailing slash and no /v1 (or /v1beta1) after the root.
+func vertexRootOf(u string) string {
+	u = strings.TrimRight(strings.TrimSpace(u), "/")
+	if u == "" {
+		return ""
+	}
+	if !strings.Contains(u, "://") {
+		u = "https://" + u
+	}
+	for _, suf := range []string{"/v1beta1", "/v1"} {
+		if b, ok := strings.CutSuffix(u, suf); ok && len(b) > len("https://") {
+			return strings.TrimRight(b, "/")
+		}
+	}
+	return u
+}
+
 // check is why a Vertex AI provider with v can't be saved, nil when it can.
-func (v *Vertex) check() error {
+// keyed is whether it has an API key, which stands in for the project.
+func (v *Vertex) check(keyed bool) error {
+	if v != nil && v.BaseURL != "" {
+		if !keyed {
+			return errors.New("a base URL is for an API key: Google credentials are sent only to Google's own address")
+		}
+		if u, err := url.Parse(v.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("%q is no base URL", v.BaseURL)
+		}
+	}
 	switch {
 	case v == nil || v.Project == "":
-		return errors.New("Google Vertex AI needs the id of your Google Cloud project")
+		if keyed {
+			return nil
+		}
+		return errors.New("Google Vertex AI needs the id of your Google Cloud project, or an API key")
 	case !vertexProject.MatchString(v.Project):
 		return fmt.Errorf("%q is no Google Cloud project id", v.Project)
 	case !vertexLocation.MatchString(v.Location):
@@ -157,21 +203,42 @@ func VertexForTest(root, token, iam string) func() {
 // ones an address can be made of.
 func (p Provider) vertexBase() string {
 	v := p.Vertex
-	if v == nil || !vertexProject.MatchString(v.Project) {
+	if v == nil {
+		v = &Vertex{}
+	}
+	keyed := p.Key != ""
+	root := ""
+	if keyed {
+		root = v.BaseURL
+	}
+	if v.Project == "" {
+		// express mode: the key alone, at the global endpoint
+		if !keyed {
+			return ""
+		}
+		return cmp.Or(root, vertexRoot("global")) + "/v1"
+	}
+	if !vertexProject.MatchString(v.Project) {
 		return ""
 	}
 	loc := cmp.Or(v.Location, "global")
 	if !vertexLocation.MatchString(loc) {
 		return ""
 	}
-	return vertexRoot(loc) + "/v1/projects/" + v.Project + "/locations/" + loc
+	return cmp.Or(root, vertexRoot(loc)) + "/v1/projects/" + v.Project + "/locations/" + loc
+}
+
+// VertexExpress is whether the provider is asked as Vertex AI's express
+// mode is: an API key and no project, which serves Gemini models alone.
+func (p Provider) VertexExpress() bool {
+	return p.IsVertex() && p.Key != "" && (p.Vertex == nil || p.Vertex.Project == "")
 }
 
 // VertexPath is where, after a Vertex AI provider's base, a request for
 // model goes: streamed, as the gateway asks every one there but a Gemini
 // client's own asked whole (VertexWholePath).
 func VertexPath(model string) string {
-	return "/publishers/google/models/" + url.PathEscape(model) + ":streamGenerateContent?alt=sse"
+	return "/publishers/google/models/" + GeminiModelPath(model) + ":streamGenerateContent?alt=sse"
 }
 
 // VertexPartner is whether model is one of Vertex AI's partner or open
@@ -232,7 +299,7 @@ func VertexClaudeRequest(path string, body []byte) (string, []byte, bool) {
 		if stream {
 			verb = ":streamRawPredict"
 		}
-		at += url.PathEscape(model) + verb
+		at += GeminiModelPath(model) + verb
 		delete(m, "model")
 	}
 	out, err := marshalRaw(m)
@@ -257,7 +324,7 @@ func marshalRaw(m map[string]json.RawMessage) ([]byte, error) {
 // VertexWholePath is where a request for model answered as one JSON body
 // goes.
 func VertexWholePath(model string) string {
-	return "/publishers/google/models/" + url.PathEscape(model) + ":generateContent"
+	return "/publishers/google/models/" + GeminiModelPath(model) + ":generateContent"
 }
 
 // vertexTest is the smallest request for model at a Vertex AI provider:
@@ -276,13 +343,13 @@ func vertexTest(q Provider, model string) (string, string) {
 	case vertexGeneration(m) < 3:
 		think = ""
 	}
-	return q.Base(Gemini) + "/publishers/google/models/" + url.PathEscape(model) + ":generateContent",
+	return q.Base(Gemini) + "/publishers/google/models/" + GeminiModelPath(model) + ":generateContent",
 		`{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{` + think + `"maxOutputTokens":16}}`
 }
 
 // vertexGen is the major version a Gemini id names: gemini-4-argon,
 // gemini-3.8-flash.
-var vertexGen = regexp.MustCompile(`^gemini-(\d+)`)
+var vertexGen = lazyre.New(`^gemini-(\d+)`)
 
 // vertexGeneration is the Gemini generation model names, 0 for an id that
 // names none (an alias such as gemini-flash-latest, which may be a 2.5).
@@ -297,18 +364,53 @@ func vertexGeneration(model string) int {
 
 // vertexModels are the models a location serves, as each answered
 // on 2026-10-06: every one at global (and Gemini 4 Argon, there since
-// 2026-10-13, #2155, and the partner models Google serves at global
-// alone, VertexPartner); Gemini 3's Flash models at us and
-// eu, which serve no Pro, preview or 2.5; Gemini 2.5 at a region, where a
-// few add one more (asia-northeast1's gemini-3.5-flash), typed in by hand.
+// 2026-10-13, #2155, Carbon since 11-10, Hydrogen since 11-12, #6452, and
+// Neon since 11-18, and the partner models Google serves at global alone,
+// VertexPartner); Gemini 3's Flash models at us and eu, which serve no
+// Pro, preview or 2.5, and Gemini 4, which Google's model pages give
+// PayGo at global, us and eu; Gemini 2.5 at a region, where a few add one
+// more (asia-northeast1's gemini-3.5-flash), typed in by hand. A Gemini 4
+// or later model that models.dev's google-vertex entry has and these
+// don't yet joins global, us and eu (vertexNewGemini).
 func vertexModels(loc string) []string {
 	switch cmp.Or(loc, "global") {
 	case "global":
-		return Preset(VertexPreset).Models
+		return vertexNewGemini(Preset(VertexPreset).Models)
 	case "us", "eu":
-		return []string{"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"}
+		return vertexNewGemini([]string{"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite",
+			"gemini-4-neon", "gemini-4-carbon", "gemini-4-hydrogen", "gemini-4-argon", "gemini-3.1-flash-lite"})
 	}
 	return []string{"gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"}
+}
+
+// vertexNewGemini is list with each Gemini model of generation 4 or later
+// that models.dev's google-vertex entry (the synced catalog) has and list
+// hasn't, newest first, ahead of list's own Gemini 4: a model Google
+// releases is offered once models.dev has it, not once magpie is given
+// its id (T_t__biu on X: no Gemini 4 Neon, a week after Google's
+// 2026-11-18 release, as Carbon and Hydrogen before it, #6452). Every
+// Gemini 4 so far is served at global, us and eu, which Google's model
+// pages say of each. Left out: a preview, which us and eu have never
+// served, and a cyber model (gemini-4-neon-cyber-permissive), which
+// Google gives on its allowlist alone.
+func vertexNewGemini(list []string) []string {
+	var add []string
+	for _, m := range catalog.ProviderShared("google-vertex") {
+		id := strings.ToLower(m.ID)
+		if vertexGeneration(id) < 4 || strings.Contains(id, "preview") || strings.Contains(id, "cyber") ||
+			slices.Contains(list, id) || slices.Contains(add, id) {
+			continue
+		}
+		add = append(add, id)
+	}
+	if len(add) == 0 {
+		return list
+	}
+	i := slices.IndexFunc(list, func(m string) bool { return vertexGeneration(m) >= 4 })
+	if i < 0 {
+		i = 0
+	}
+	return slices.Concat(list[:i], add, list[i:])
 }
 
 // vertexScope is what a token is minted for: Google Cloud's APIs.
@@ -570,7 +672,7 @@ func (c googleCreds) mint(ctx context.Context, top bool) (string, time.Time, err
 // impersonationURL is gcloud's …/serviceAccounts/<email>:generateAccessToken,
 // whose email is asked for at IAM Credentials: the token never goes to the
 // host the file names.
-var impersonationURL = regexp.MustCompile(`/serviceAccounts/([^/:]+):generateAccessToken$`)
+var impersonationURL = lazyre.New(`/serviceAccounts/([^/:]+):generateAccessToken$`)
 
 // impersonated is the service account an impersonated_service_account
 // file's URL names, "" for another kind.
@@ -594,7 +696,7 @@ func (e personRefused) Unwrap() error { return e.error }
 
 // legacyADC is the file gcloud keeps a signed-in account's credentials in
 // for other tools, under its folder: legacy_credentials/<account>/adc.json.
-var legacyADC = regexp.MustCompile(`^legacy_credentials/([^/]+)/adc\.json$`)
+var legacyADC = lazyre.New(`^legacy_credentials/([^/]+)/adc\.json$`)
 
 // signInAgain says how the person's sign-in in file is made anew: gcloud
 // writes its own files again, as they were made (impersonating account,
@@ -708,4 +810,16 @@ func impersonateFor(ctx context.Context, tok, account string, delegates []string
 		out.ExpireTime = time.Now().Add(time.Hour)
 	}
 	return out.AccessToken, out.ExpireTime, nil
+}
+
+// vertexExpressModels are the models express mode serves, as Google's
+// overview lists them: Gemini alone, none of the partner or Claude models.
+func vertexExpressModels() []string {
+	var out []string
+	for _, m := range vertexModels("global") {
+		if !VertexPartner(m) && !VertexClaude(m) {
+			out = append(out, m)
+		}
+	}
+	return out
 }

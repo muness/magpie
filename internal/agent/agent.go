@@ -116,6 +116,12 @@ type Field struct {
 	// ("model" for Claude Code's tiers and subagents): a profile's details
 	// say so, and Drift reads the field as on that one's model (#1050).
 	Follows string
+	// Own fields are the user's own settings of the agent's, never
+	// magpie's wiring (Claude Code's permission mode): magpie writes one
+	// only when the user picks it, so Disconnect, Reapply and a restore
+	// leave it as it is, and a profile neither keeps nor writes it. A
+	// value the user then sets in the agent itself stays theirs.
+	Own bool
 }
 
 // Agent is one supported coding agent.
@@ -153,6 +159,11 @@ type Agent struct {
 	// the name alone (Empryo, Cursor Private Inference). The setting says
 	// so for each one connected, rather than seeming to do nothing.
 	NoNames bool
+	// Nested: the agent is a part of another one (a Hermes profile,
+	// hermes#<name>) that the Library gives its own skills and servers. No
+	// list of agents or model picker shows it (DetectedIn leaves it out); its
+	// model is a line of the parent's row, and All and Find still reach it.
+	Nested bool
 	// Sync, for an agent that reads magpie's models from a file of its own
 	// rather than asking the gateway, rewrites that list as the catalog is
 	// now — where magpie wrote one; nothing else changes (see SyncCatalog).
@@ -201,6 +212,17 @@ type Agent struct {
 	// its sign-in only as it opens, sends nothing on it till it is opened
 	// again (MasterYi on Discord).
 	AppOut func() bool
+	// AppOutOff reports the user has turned the takeover (AppOut) off:
+	// Codex's sign-in set to Always ChatGPT, or Codex not connected. The
+	// takeover ending so is the user's change, not the reset's, and the
+	// Codex app's app-server is restarted for it (CodexTakeoverOff).
+	AppOutOff func() bool
+	// DeskAt is when magpie named its model list for the Codex app in
+	// Codex's config (deskList's model_catalog_json), zero while it
+	// names none or the time isn't known (named by a magpie before it
+	// was kept). The app-server reads the list only as it starts, so one
+	// running from before shows Codex's own models alone (CodexAppDesk).
+	DeskAt func() time.Time
 	// HoldMatters reports Codex takes magpie's models beside a ChatGPT
 	// sign-in, so that magpie is its provider while the Codex app holds
 	// the account (out), or is that already: what the app holds is read
@@ -219,16 +241,23 @@ type Agent struct {
 	// is that group's (#750).
 	Routed func() bool
 	// FailingOver reports an agent that isn't connected whose requests
-	// still go through magpie's gateway, for account failover alone (Codex
-	// signed in to ChatGPT with more of its accounts on in magpie, #1385):
-	// the Agents page says so and what turns it off, and the gateway lists
-	// it only its own models.
+	// still go through magpie's gateway, for account failover alone: what
+	// a magpie from before wrote in Codex's config by itself (#1385), till
+	// Sync takes it out (TylerBai_loveai on X). The Agents page says so,
+	// and the gateway lists it only its own models.
 	FailingOver func() bool
 	// EndFailover takes out what account failover wrote, for magpie
 	// quitting: left there, the agent would be pointed at a gateway that
 	// no longer answers, and retry till magpie is open again (Leon920717
-	// on X). The next start's Sync writes it again.
+	// on X).
 	EndFailover func() error
+	// TakeLeftovers takes out what magpie wrote that no Disconnect could
+	// name: an address at magpie's gateway whose marks are gone (magpie's
+	// folder deleted by hand, a fresh install beside an old config), which
+	// reads as not connected, so uninstalling would leave it pointing at a
+	// gateway that is gone for good (#3866). Uninstall runs it after the
+	// disconnects. It answers whether it changed anything.
+	TakeLeftovers func() (bool, error)
 	// Follow, for an agent whose own picker moves its main model where
 	// magpie keeps other settings following it (Claude Code's /model and
 	// its tiers), brings those along to the model picked there. Run as the
@@ -279,6 +308,10 @@ type Agent struct {
 	// to start it on magpie, a function magpie gave their shells (agy);
 	// "" when there is none, and Launch is the way.
 	Typed func() string
+	// Start, for such an agent, is what `magpie <id> run` starts it with:
+	// its command, the variables and its model flag, the model "" while
+	// it isn't on magpie's, when it starts as it is.
+	Start func() Starting
 	// SplitSuffix, for an agent whose model values carry something of its
 	// own after the model that varies from value to value (omp's thinking
 	// level, "…:max"), splits a value into the model the picker offers and
@@ -303,6 +336,10 @@ type Agent struct {
 	// is the model's on the command line: magpie claude opus sets the
 	// model, where another field's name alone shows that field.
 	ModelAliases []string
+	// Telemetry, when set, turns the agent's own telemetry to its vendor
+	// off in its config (telemetry.go). It is not a field: a profile
+	// saved before would turn it back on.
+	Telemetry *Telemetry
 	// detect, when set, says whether the agent is here in place of looking
 	// for its files and binary: a distro's, probed once.
 	detect func() bool
@@ -320,7 +357,8 @@ type Agent struct {
 	wslVersion string
 	// unreached, for an agent in a WSL distro, is why its folder there
 	// can't be opened: a link the distro couldn't resolve (distro.open)
-	unreached error
+	unreached      error
+	claudeSettings *ClaudeSettings
 	// move, when set, points the agent's config at to where it names the
 	// gateway at from: an address of WSL's that changed (#1013).
 	move func(from, to string) error
@@ -329,6 +367,10 @@ type Agent struct {
 	// that is known yet, and the proxy and where it is set; ok with no
 	// proxy when it sends them straight there (see codex_proxy.go).
 	viaProxy func() (ok, known bool, proxy, from string)
+	// through, when set, puts magpie's provider in the agent's config at
+	// the gateway behind a proxy's prefix ("" for the gateway itself):
+	// Hermes's, through billion-context's /bili/ (HermesThrough)
+	through func(prefix string) error
 	// dirShared says Dir is a folder another agent keeps its files in too
 	// (omp's, when PI_CODING_AGENT_DIR points it at Pi's): that it is there
 	// says nothing of this agent.
@@ -338,10 +380,21 @@ type Agent struct {
 	// ~/.cursor (MCP servers, skills, hooks, chats) is the Cursor editor's
 	// too, so the Library and Sessions call it Cursor (SharedName).
 	shared string
+	// sharedApp, when set, reports whether an app of the vendor's that
+	// reads the shared folder is here, the folder or not: VS Code and
+	// GitHub Copilot's JetBrains plugin read ~/.copilot's
+	// copilot-instructions.md before anything has made the folder.
+	sharedApp func() bool
 	// pathOwn, when set, says whether the file at Path is this agent's,
 	// not one another tool wrote there first: a JetBrains plugin's
 	// settings.json in Qoder CN's folder (#1495).
 	pathOwn func() bool
+	// signIn is the file a sign-in added in magpie writes in Dir for the
+	// agent when it has none of its own (Codex's auth.json, Claude Code's
+	// .credentials.json off the Mac): a folder holding only that is
+	// magpie's, no sign the agent is here (jiangshangmuyun on X: Codex,
+	// never installed, listed after a ChatGPT account was added).
+	signIn string
 	// sign, when set, is one more sign the agent is here, for a folder
 	// that is dirShared: a file only the agent (or its own app) writes
 	// there (the Qoder app's status file, #2138).
@@ -399,7 +452,15 @@ func (a *Agent) SharedName() string {
 // but what the other app reads there too, the Library's MCP servers and
 // skills, is still given.
 func (a *Agent) SharedHere() bool {
-	return a.shared != "" && a.WSL == "" && a.Dir != "" && !Taken(a.Dir) && agentDir(a.Dir)
+	return a.shared != "" && a.WSL == "" && a.Dir != "" && !Taken(a.Dir) && (agentDir(a.Dir) || a.SharedRead())
+}
+
+// SharedRead reports whether an app of the agent's vendor that reads its
+// shared folder is here (sharedApp): VS Code, or GitHub Copilot's JetBrains
+// plugin, for Copilot CLI's ~/.copilot. A folder left by the CLI's
+// uninstall is then no leftover: that app still reads it.
+func (a *Agent) SharedRead() bool {
+	return a.shared != "" && a.WSL == "" && a.Dir != "" && a.sharedApp != nil && !Taken(a.Dir) && a.sharedApp()
 }
 
 // Detected reports whether the agent seems to be installed or configured.
@@ -412,10 +473,10 @@ func (a *Agent) Detected() bool {
 	if a.Dir != "" && Taken(a.Dir) {
 		return false
 	}
-	if _, err := os.Stat(a.Path); err == nil && (a.pathOwn == nil || a.pathOwn()) {
+	if _, ok := statKind(a.Path); ok && (a.pathOwn == nil || a.pathOwn()) {
 		return true
 	}
-	if a.Dir != "" && !a.dirShared && agentDir(a.Dir) {
+	if a.Dir != "" && !a.dirShared && agentDir(a.Dir, a.signIn) {
 		return true
 	}
 	if a.sign != nil && a.sign() {
@@ -441,21 +502,23 @@ func (a *Agent) Detected() bool {
 // and added that to the user's PATH, or a self-update restarting with the
 // PATH it had then, never listed it, while the sign-in, which asked
 // FindTool, found it (#839, #1482). A mise wrapper script found there is
-// given as the program it runs (proc.LookPath). "" when it is in none.
+// given as the program it runs (proc.LookPath). Linux and macOS are no
+// different when magpie is started from a desktop launcher: its PATH has no
+// ~/.local/bin, where the official Antigravity CLI installer puts agy
+// (Xuanwo on X). "" when it is in none.
 func binAt(name string) string {
 	if p, err := proc.LookPath(name); err == nil {
 		return p
 	}
-	if runtime.GOOS == "windows" {
-		return proc.FindTool(name)
-	}
-	return ""
+	return proc.FindTool(name)
 }
 
 // agentDir reports whether p is a folder an agent itself made. Skill
 // installers (npx skills and the like) make <folder>/skills for every agent
 // they know, installed or not; a folder holding nothing else is theirs.
-func agentDir(p string) bool {
+// own names a file magpie may have written there itself (Agent.signIn),
+// no sign either.
+func agentDir(p string, own ...string) bool {
 	es, err := os.ReadDir(p)
 	if err != nil {
 		return isDir(p)
@@ -464,7 +527,7 @@ func agentDir(p string) bool {
 		return true
 	}
 	for _, e := range es {
-		if n := e.Name(); n != "skills" && n != ".DS_Store" && !(e.IsDir() && leftover[strings.ToLower(n)]) {
+		if n := e.Name(); n != "skills" && n != ".DS_Store" && !(e.IsDir() && leftover[strings.ToLower(n)]) && !(!e.IsDir() && slices.Contains(own, n)) {
 			return true
 		}
 	}
@@ -482,8 +545,8 @@ var leftover = map[string]bool{"logs": true, "log": true, "debug": true, "diagno
 // p, or one it is in, would be: nothing can be written under it.
 func Taken(p string) bool {
 	for d := filepath.Clean(p); ; {
-		if st, err := os.Stat(d); err == nil {
-			return !st.IsDir()
+		if dir, ok := statKind(d); ok {
+			return !dir
 		}
 		up := filepath.Dir(d)
 		if up == d {
@@ -620,10 +683,15 @@ func (a *Agent) OwnModels(cur map[string]string) bool {
 }
 
 // Detected returns the agents present on this machine, in display order.
-func Detected() []*Agent {
+func Detected() []*Agent { return DetectedIn(All()) }
+
+// DetectedIn is Detected among all, a list of All() the caller has built
+// already: a page that lists the agents and looks them up by name builds
+// All once, not once for each.
+func DetectedIn(all []*Agent) []*Agent {
 	var out []*Agent
-	for _, a := range All() {
-		if a.Detected() {
+	for _, a := range all {
+		if a.Detected() && !a.Nested {
 			out = append(out, a)
 		}
 	}

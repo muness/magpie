@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // edgeReset is the 503 ChatGPT's front (Cloudflare, then Envoy) answers,
 // as text, when the backend behind it closed the connection before any
 // reply.
-var edgeReset = regexp.MustCompile(`(?i)upstream connect error or disconnect/reset before headers`)
+var edgeReset = lazyre.New(`(?i)upstream connect error or disconnect/reset before headers`)
 
 // edgeUnbuffered is the 507 the same Envoy answers when its first try at
 // the backend failed and the request is more than it buffers to try again
@@ -22,7 +23,7 @@ var edgeReset = regexp.MustCompile(`(?i)upstream connect error or disconnect/res
 // reset, at any size, since the 507 itself says the body was large.
 // sparrowu93 (#2034, pi) was told the 507 as it came, which pi doesn't
 // ask again for.
-var edgeUnbuffered = regexp.MustCompile(`(?i)exceeded request buffer limit while retrying upstream`)
+var edgeUnbuffered = lazyre.New(`(?i)exceeded request buffer limit while retrying upstream`)
 
 // codexDropBody is the request size from which that 503 may be about the
 // request. ylorn (Discord, v0.1.1179) got it for every Codex turn a PNG
@@ -105,5 +106,5 @@ func edgeSaidDrop(status int, head []byte) bool {
 // codexReset says a failure is a large request's reset codexDropped read:
 // no account's fault, and asked again.
 func codexReset(status int, body []byte) bool {
-	return status == http.StatusServiceUnavailable && bytes.Contains(body, []byte(codexResetSaid))
+	return status == http.StatusServiceUnavailable && bodyHas(body, codexResetSaid)
 }

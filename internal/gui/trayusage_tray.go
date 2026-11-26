@@ -12,6 +12,7 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
 
+	"github.com/yetone/magpie/internal/egress"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
@@ -33,6 +34,9 @@ func (h *host) watchTrayUsage() {
 	// another account answering, or the agent switched to another: a card
 	// following the account in use reads it at once (#1516)
 	provider.OnServedMoved(onTrayUsage)
+	// the Claude accounts' way out moved into, or out of, a region
+	// Anthropic doesn't list: the tooltip says so at once
+	egress.OnChange(onTrayUsage)
 	// the taskbar turned dark or light: the figure in its colour
 	if runtime.GOOS == "windows" {
 		h.app.Event.OnApplicationEvent(events.Windows.SystemThemeChanged, func(*application.ApplicationEvent) { onTrayUsage() })
@@ -53,10 +57,15 @@ func (h *host) watchTrayUsage() {
 			cancel()
 			if s.TrayNoLogos {
 				cells = trayPlain(cells)
+			} else if s.TrayAnthropicMark {
+				cells = trayAnthropic(cells)
 			}
 			if tip == "" {
 				currency, rate := trayCurrency()
 				tip = trayIdleTip(lang, trayMoney(trayTotalSum(usage.Today), s.TrayNoCost), currency, rate)
+			}
+			if w := trayEgressTip(lang, trayEgress()); w != "" {
+				tip = w + "\n" + tip
 			}
 			// Windows' tray shows no text: the first card's figure is its
 			// icon instead (traynumber.go), drawn for the taskbar's size and
@@ -155,7 +164,7 @@ func (h *host) trayCellClick(id string) {
 	if id == "" {
 		return
 	}
-	if settings.Load().Tray == "window" {
+	if settings.Shared().Tray == "window" {
 		h.ShowMain(quotaView(id))
 		return
 	}

@@ -7,6 +7,10 @@ import "strings"
 // rule may send that request to a cheaper, faster model (provider.Rule's
 // Compact). The prompts are the agents' own, read from each one's release.
 
+// KindCompact is the Kind of a call an agent made to compact its
+// conversation (usage's "Compaction" purpose).
+const KindCompact = "compact"
+
 // compactLead is how far into the system prompt, or into a text part of the
 // last user message, an agent's compaction prompt may begin. Each agent puts
 // its prompt first or behind a short lead of its own (Claude Code's billing
@@ -65,6 +69,10 @@ var compactAsks = []compactAsk{
 	// system prompt above, which a route that drops it loses.
 	{ask: "Merge the previous summary with the new conversation."},
 	{ask: "Here is the full conversation to compact."},
+	// DeepSeek Harness (compaction-basic's COMPACTION_INSTRUCTION, a user
+	// message after the conversation): its llm-pi-ai routes, magpie's
+	// among them, send no x-deepseek-harness-compact mark (#5395)
+	{ask: "You are now acting as a compaction engine for this AI coding assistant."},
 }
 
 // leads reports whether p begins within compactLead bytes of text's start.

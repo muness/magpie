@@ -61,10 +61,13 @@ it takes images. List them from there rather than shipping a list: the
 user adds and removes providers in magpie. Reasoning is asked in your
 API's own field (`reasoning_effort`, `reasoning.effort`, Anthropic's
 `thinking` or `output_config.effort`). `?format=text` gives the ids one a
-line. The list holds chat models only. Ask for image and video models
-with `?kind=image,video` (or `?kind=chat,image,video`, or `?kind=all`).
-Each of them is marked `"kind": "image"` or `"kind": "video"` and goes to
-`/v1/images/generations` or `/v1/videos`, never to a chat route.
+line. The list holds chat models only. Ask for image, video, embedding
+and rerank models with `?kind=image,video,embedding,rerank` (or
+`?kind=chat,image`, any of them, or `?kind=all`). Each of them is marked
+`"kind": "image"`, `"video"`, `"embedding"` or `"rerank"` and goes to
+`/v1/images/generations`, `/v1/videos`, `/v1/embeddings` or `/v1/rerank`,
+never to a chat route. Cherry Studio, which can't ask and tells an image
+or embedding model from a chat one by its id, is listed every kind.
 
 **A vendor's own fields.** `/v1/images/generations` and `/v1/videos`
 take OpenAI's fields and pass the others on to a vendor that takes them:
@@ -95,6 +98,9 @@ key; a key held to a budget, models or accounts sees its own calls and
 routes alone, and is refused the quotas unless its owner lets it see
 those of what it may use (`magpie gateway-key quotas <id> on`, #2216;
 its own limit, and what holds it, is `GET /v1/magpie/limit`).
+To keep a ledger of your own, read the requests as changes with `GET
+/v1/magpie/usage/requests?cursor=start` (stable `id`s, the vendors' ids
+under `original_ids`, `next_cursor`; `cursor=now` for what comes after).
 Calls your app makes to its vendor itself can be reported with `POST
 /v1/magpie/usage/requests` (one record or up to 5000 a post, in
 `usage.jsonl`'s shape, each with a `rid`; past times are kept, so a
@@ -140,8 +146,9 @@ app offers decides its shape:
   the row then asks the user to confirm in your app without claiming an
   import status. magpie writes nothing of yours. This suits an app that keeps
   its providers in a database or encrypted.
-- **Your app has a local API while it runs** (Alma, at `localhost:23001`):
-  magpie adds itself as a provider and sets the default model through it.
+- **Your app has a local API while it runs** (Alma, at `localhost:23001`;
+  Shelley, on its Unix socket): magpie adds itself as a provider and sets the
+  default model through it.
 
 A pull request needs: the adapter and its registration, `UA` (what your
 User-Agent begins with, lower-case) so Usage knows your calls, an icon in
@@ -173,6 +180,10 @@ config, so it is not how an app registers itself.
   and agent rows come from adapters in magpie's source.
 - `magpie://import` links add a *provider* (a source of models, with its
   key), not an agent or an app; see [Import links](reference.md#import-links).
+- `magpie://plugin?name=<npm package>` and a plugin page's
+  `magpie.openPlugin(name)` open the package's sheet in Plugins, where the
+  user reads it and presses Install; neither installs it. See
+  [Plugin links](reference.md#plugin-links).
 
 Questions, or an adapter you'd like to discuss first: open an issue at
 <https://github.com/yetone/magpie/issues> or ask on

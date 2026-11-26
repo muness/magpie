@@ -2,8 +2,10 @@ package provider
 
 import (
 	"net/url"
-	"regexp"
+	"slices"
 	"strings"
+
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // A custom provider can be given a Gemini API (#1346): Google's own at
@@ -13,11 +15,12 @@ import (
 
 // geminiMethod is a Gemini endpoint pasted whole, cut back to its base:
 // …/models/gemini-2.5-pro:streamGenerateContent?alt=sse, or …/models.
-var geminiMethod = regexp.MustCompile(`/models(?:/[^/?#]*)?(?:[?#].*)?$`)
+var geminiMethod = lazyre.New(`/models(?:/[^/?#]*)?(?:[?#].*)?$`)
 
 // GeminiBase is the base a Gemini URL is kept as: trimmed, an endpoint or
-// the model list pasted whole cut back to the base, and a bare host given
-// Google's version (/v1beta), as the Gemini API's SDKs add it.
+// the model list pasted whole cut back to the base. Only Google's own bare
+// host is given its version (/v1beta); any other URL stays as typed, so a
+// relay's root is not rewritten on the next open (JNDliuliuM on X).
 func GeminiBase(u string) string {
 	u = strings.TrimRight(strings.TrimSpace(u), "/")
 	if u == "" {
@@ -27,16 +30,80 @@ func GeminiBase(u string) string {
 		u = "https://" + u
 	}
 	u = strings.TrimRight(geminiMethod.ReplaceAllString(u, ""), "/")
+	if pu, err := url.Parse(u); err == nil && strings.EqualFold(pu.Hostname(), "generativelanguage.googleapis.com") && strings.Trim(pu.Path, "/") == "" {
+		return u + "/v1beta"
+	}
+	return u
+}
+
+// geminiVersioned is GeminiBase with the /v1beta a bare host of any vendor
+// is asked at, for a detection that proposes a base rather than keeping one
+// the user typed.
+func geminiVersioned(u string) string {
+	u = GeminiBase(u)
 	if pu, err := url.Parse(u); err == nil && pu.Host != "" && strings.Trim(pu.Path, "/") == "" {
 		return u + "/v1beta"
 	}
 	return u
 }
 
+// GeminiAsked is the base a Gemini API is asked at: the saved base, and a
+// bare host given /v1beta, as Google's SDKs add the version to a base_url
+// with no path. GeminiBase keeps a relay's root as typed (JNDliuliuM on X),
+// so the version is added here, where a request goes: WandAPI's
+// https://api.wandapi.ai was asked at /models/… and refused (equinox0253
+// on X). A base with a path of its own (/v1beta, a relay's /gemini) is
+// asked as typed.
+func GeminiAsked(u string) string {
+	if u == "" || geminiKept(u) {
+		return u
+	}
+	return geminiVersioned(u)
+}
+
+// geminiKept reports, without allocating, that geminiVersioned would give u
+// back as it is: a scheme, a path of its own with no trailing slash, query,
+// fragment or /models, and no space around it. Host asks Base(Gemini) on
+// every look (TestHostBuildsNoList), and a saved base is already this.
+func geminiKept(u string) bool {
+	if strings.TrimSpace(u) != u || strings.HasSuffix(u, "/") || strings.ContainsAny(u, "?#") || strings.Contains(u, "/models") {
+		return false
+	}
+	i := strings.Index(u, "://")
+	if i <= 0 {
+		return false
+	}
+	j := strings.IndexByte(u[i+3:], '/')
+	return j > 0
+}
+
+// GeminiModelPath is model as every Gemini and Vertex AI path names it
+// after models/: each slash-separated segment escaped and the slashes
+// kept, so a relay's namespaced id (example/model-demo) is asked at
+// /models/example/model-demo, the path the relay routes by, not
+// /models/example%2Fmodel-demo (#6695, LuoRuiyao on X). An id with an
+// empty, . or .. segment, which a server or proxy could clean into a
+// path outside models/, goes as one escaped segment instead. An id with
+// the models/ Google's own lists name a model by (AI Studio's
+// OpenAI-compatible /models lists "models/gemini-…") is asked without
+// it, since the path already has one: drawn at models/models/… the
+// Gemini API answered 404 (Dani Ariyanto on Discord, Nano Banana 2.1).
+func GeminiModelPath(model string) string {
+	model = strings.TrimPrefix(model, "models/")
+	segs := strings.Split(model, "/")
+	for i, s := range segs {
+		if s == "" || s == "." || s == ".." {
+			return url.PathEscape(model)
+		}
+		segs[i] = url.PathEscape(s)
+	}
+	return strings.Join(segs, "/")
+}
+
 // GeminiPath is the path under a Gemini base model is asked at: streamed as
 // server-sent events (alt=sse) when stream, else one JSON reply.
 func GeminiPath(model string, stream bool) string {
-	m := url.PathEscape(strings.TrimPrefix(model, "models/"))
+	m := GeminiModelPath(model)
 	if stream {
 		return "/models/" + m + ":streamGenerateContent?alt=sse"
 	}
@@ -73,4 +140,31 @@ func (p *Provider) aiStudioNative() {
 // the OpenAI-compatible list's, which is the Gemini API's list again.
 func (p Provider) AIStudioPair() bool {
 	return strings.EqualFold(p.Chat, AIStudioChat) && strings.EqualFold(p.Gemini, AIStudioGemini)
+}
+
+// AgentGemini reports whether an agent that asks each model on one API
+// (omp, OmO) is wired to ask model on Gemini's own API rather than the one
+// Native names: a Gemini model at a provider of the user's with a Gemini
+// URL that serves it there, which Native would put on Anthropic's Messages
+// (a relay with no Chat for it) or whose Base URL the user gave as the
+// Gemini one. Native names OpenAI's and Anthropic's APIs only, so
+// TJHHHH's Tokenflow relay (Anthropic and Gemini URLs, on Discord) had
+// omp ask gemini-4 on Messages, and every turn went out translated to
+// Gemini. A provider whose Chat serves the model keeps it there, as
+// before (TestOmpGeminiModelsAskedOnGeminisAPI's hybrid), and so does a
+// model the user set to an API of its own (APIs names that one alone).
+func (p Provider) AgentGemini(model string) bool {
+	if p.Gemini == "" || p.Account != nil || p.IsVertex() || p.IsRemoteMagpie() || p.NamedOnlyOn(Gemini) || !geminiNamed(model) {
+		return false
+	}
+	if apis := p.APIs(model); apis != nil && !slices.Contains(apis, Gemini) {
+		return false
+	}
+	return Protocol(p.BaseAPI) == Gemini || p.Native(model) == Anthropic
+}
+
+// geminiNamed is whether model is one of Google's Gemini models by its
+// name, after any vendor prefix (google/gemini-3-pro, models/gemini-…).
+func geminiNamed(model string) bool {
+	return strings.HasPrefix(strings.ToLower(model[strings.LastIndex(model, "/")+1:]), "gemini")
 }

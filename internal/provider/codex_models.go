@@ -10,24 +10,29 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
-	"runtime"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/codexcat"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/source"
 )
 
-// codexClientVersion is the Codex CLI version the models list is asked for
-// when Codex CLI has not asked itself yet: the list leaves out models newer
-// than the client asking.
-const codexClientVersion = "0.159.0"
+// codexClientVersion is the oldest Codex CLI version the models list is
+// asked for and requests say they are: npm's latest @openai/codex on
+// 2026-11-18. The list leaves out models newer than the client asking
+// (each entry's minimal_client_version): GPT-6.2 Sol and Astra need
+// 0.166.0, and at the 0.159.0 this was before, a user with no newer Codex
+// CLI never saw them (zzstar101 and m0eaki on X). A fixed version goes
+// stale as Codex releases, so npm's latest counts too (codexPublished).
+const codexClientVersion = "0.169.1"
 
 // codexModels asks the ChatGPT backend which Codex models the account's own
 // plan has — a Free account lists fewer than a Plus or Pro one, and one it
@@ -35,7 +40,21 @@ const codexClientVersion = "0.159.0"
 // models_cache.json, but that one is of whichever account Codex CLI last
 // asked with, if it ran at all.
 func codexModels(ctx context.Context, sign func(context.Context, *http.Request, []byte) error) ([]catalog.Model, error) {
-	u := CodexBase + "/models?client_version=" + url.QueryEscape(codexVersion())
+	ms, _, err := codexModelsAsked(ctx, sign)
+	return ms, err
+}
+
+// codexModelsAsked is codexModels, and the client version the list was
+// asked for: the backend lists a model only to a client new enough for
+// it, so a list is kept with it (codexListBehind).
+func codexModelsAsked(ctx context.Context, sign func(context.Context, *http.Request, []byte) error) ([]catalog.Model, string, error) {
+	ver := codexVersion()
+	ms, err := codexModelsAt(ctx, sign, ver)
+	return ms, ver, err
+}
+
+func codexModelsAt(ctx context.Context, sign func(context.Context, *http.Request, []byte) error, ver string) ([]catalog.Model, error) {
+	u := CodexBase + "/models?client_version=" + url.QueryEscape(ver)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -43,7 +62,7 @@ func codexModels(ctx context.Context, sign func(context.Context, *http.Request, 
 	if err := sign(ctx, req, nil); err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +103,7 @@ func CodexLiveList(ctx context.Context) ([]byte, error) {
 	if err := p.Account.sign(ctx, req, nil); err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -109,6 +128,18 @@ func CodexLiveList(ctx context.Context) ([]byte, error) {
 	return b, nil
 }
 
+// CodexClientVersion is the Codex client version the backend's model
+// list is asked for now (codexVersion): a list asked for an older one may
+// lack a model the backend lists only to a newer client.
+func CodexClientVersion() string { return codexVersion() }
+
+// CodexVersionBehind says a list asked for Codex version asked is behind
+// now, the version magpie asks as (CodexClientVersion), or its version
+// isn't known (codexListBehind).
+func CodexVersionBehind(asked, now string) bool {
+	return asked == "" || asked != now && newerVersion(asked, now) != asked
+}
+
 var codexVersionCache struct {
 	sync.Mutex
 	v  string
@@ -116,7 +147,8 @@ var codexVersionCache struct {
 }
 
 // codexVersion is the client version the models list is asked for: the
-// newest of the Codex CLI installed, the one Codex CLI last asked with and
+// newest of the Codex CLI installed, the one Codex CLI last asked with,
+// a Codex seen through the gateway, npm's latest (codexPublished) and
 // codexClientVersion. The list leaves out models newer than the client
 // asking, and Codex CLI's models_cache.json keeps the version it was written
 // with until Codex next asks — after an update that brought new models
@@ -144,7 +176,80 @@ func codexVersion() string {
 		}
 		codexVersionCache.v, codexVersionCache.at = v, time.Now()
 	}
-	return newerVersion(codexVersionCache.v, codexSeen.get())
+	return newerVersion(newerVersion(codexVersionCache.v, codexSeen.get()), codexPublished())
+}
+
+// codexNpmLatest is where npm says which @openai/codex is latest, the
+// release its installs and `npm i -g @openai/codex` get; a var so tests
+// can serve one.
+var codexNpmLatest = codexNpmRegistry
+
+const codexNpmRegistry = "https://registry.npmjs.org/@openai/codex/latest"
+
+// codexPublishedEvery is how often npm is asked again.
+const codexPublishedEvery = 6 * time.Hour
+
+var codexPublishedCache struct {
+	sync.Mutex
+	v      string    // the latest read, "" before one is
+	at     time.Time // when it was last asked
+	asking bool
+}
+
+// codexPublished is npm's latest Codex CLI as last read, "" before it is:
+// asked in the background at most every codexPublishedEvery, through the
+// mirrors when npm doesn't answer, and never from a test binary unless a
+// test points codexNpmLatest at a fake.
+func codexPublished() string {
+	codexPublishedCache.Lock()
+	defer codexPublishedCache.Unlock()
+	v, u := codexPublishedCache.v, codexNpmLatest
+	if codexPublishedCache.asking || time.Since(codexPublishedCache.at) < codexPublishedEvery || testing.Testing() && u == codexNpmRegistry {
+		return v
+	}
+	codexPublishedCache.asking = true
+	go func() {
+		found := codexAskPublished(u)
+		codexPublishedCache.Lock()
+		if found != "" {
+			codexPublishedCache.v = found
+		}
+		codexPublishedCache.at, codexPublishedCache.asking = time.Now(), false
+		codexPublishedCache.Unlock()
+	}()
+	return v
+}
+
+var codexReleaseRe = lazyre.New(`^\d{1,4}\.\d{1,4}\.\d{1,6}$`)
+
+// codexAskPublished is the version u says is latest, or "" when it can't
+// be read or isn't a release version (an alpha is never named: the
+// backend's lists and requests are a release's).
+func codexAskPublished(u string) string {
+	c := &http.Client{Timeout: 8 * time.Second, Transport: http.DefaultClient.Transport}
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Accept", "application/json")
+	res, err := source.Do(c, req)
+	if err != nil {
+		return ""
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return ""
+	}
+	var got struct {
+		Version any `json:"version"`
+	}
+	if json.NewDecoder(io.LimitReader(res.Body, 4<<20)).Decode(&got) != nil {
+		return ""
+	}
+	if v, _ := got.Version.(string); codexReleaseRe.MatchString(v) {
+		return v
+	}
+	return ""
 }
 
 // codexCLIVersion is what the codex CLI at exe says its version is; a var
@@ -230,19 +335,9 @@ var codexExecutable = func() string {
 	if p, err := proc.LookPath("codex"); err == nil {
 		return p
 	}
-	names := []string{"codex"}
-	if runtime.GOOS == "windows" {
-		names = []string{"codex.cmd", "codex.exe", "codex"}
-	}
-	for _, d := range proc.UserBinDirs() {
-		for _, n := range names {
-			p := filepath.Join(d, n)
-			if st, err := os.Stat(p); err == nil && !st.IsDir() {
-				return p
-			}
-		}
-	}
-	return ""
+	// on Windows npm's codex.cmd, never the sh shim npm leaves alone when
+	// an install fails partway, which Windows can't run (CLJY on Discord)
+	return proc.ToolIn("codex", proc.UserBinDirs())
 }
 
 // parseCodexModels reads the backend's list, the listed ones in its order.
@@ -334,6 +429,64 @@ func (a *Account) Lists(model string) bool {
 	return slices.ContainsFunc(live, func(m catalog.Model) bool { return m.ID == model })
 }
 
+// listLags says the account's own list, which leaves model out
+// (Lists), can't say the plan lacks it: the list is older than the model,
+// as magpie knows it. That is so when an account in listing (those whose
+// lists have it) has had it only since after this one's list was fetched,
+// the vendor giving the model since, or when a ChatGPT account's list was
+// asked for an older Codex than magpie speaks as now, or for one it didn't
+// keep, as the backend lists a model only to a client new enough for it
+// (wudao_85256 on Discord: two Plus accounts, the second's list asked
+// before gpt-6.1-sol was listed to the Codex asking, and Routing said "its
+// plan doesn't list gpt-6.1-sol", never asking it, not even with the
+// first out of its allowance). Such a list says nothing of the model:
+// unknown, the account asked as one that lists it.
+func (a *Account) listLags(model string, listing []AccountOn) bool {
+	if a == nil || a.plugin != nil || a.Agent == "claude" {
+		return false // their lists are of another kind (pluginLists, claudeLists)
+	}
+	key := accountModels(a.Agent, a.User)
+	_, fetched, ok := catalog.Live(key)
+	if !ok {
+		return false
+	}
+	if a.Agent == "codex" && codexListBehind(catalog.LiveAsked(key)) {
+		return true
+	}
+	ids := []string{model}
+	if a.Agent == "antigravity" {
+		if variants, family := AntigravityVariants(model); family {
+			ids = ids[:0]
+			for _, id := range variants {
+				ids = append(ids, id)
+			}
+		}
+	}
+	for _, o := range listing {
+		if o.Account == nil || o.Account.plugin != nil || o.Account.Agent != a.Agent {
+			continue
+		}
+		for _, id := range ids {
+			if since, ok := catalog.LiveSince(accountModels(o.Account.Agent, o.Account.User), id); ok && since.After(fetched.Add(listRound)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// listRound is how far apart two accounts' lists may be fetched and still
+// count as one look: lists fetched in one refresh are moments apart, and a
+// model one has and the other lacks there is the plans' difference, not
+// a list older than the model (TestCodexProviderListsEveryAccountsModels,
+// TestAntigravityPoolRoutesDiscoveredModels).
+const listRound = 10 * time.Minute
+
+// codexListBehind says a ChatGPT account's list asked for Codex version
+// asked is behind the one magpie asks as now, or its version wasn't kept:
+// a model the backend lists only to a newer client may be missing from it.
+func codexListBehind(asked string) bool { return CodexVersionBehind(asked, codexVersion()) }
+
 // Levels are the reasoning levels the account's own list gives the model —
 // a Free ChatGPT plan's may be fewer than a Plus one's — and ok is false
 // when that list wasn't fetched, doesn't have the model or gives it none.
@@ -386,13 +539,19 @@ func (a *Account) Tiers(model string) (tiers []string, ok bool) {
 // high, doesn't lower the request a Plus one beside it answers (#520). The
 // gateway sends each account only the models and levels its own list has
 // (Account.Lists, Account.Levels) first.
-func codexPoolModels(ms []catalog.Model) []catalog.Model {
+func codexPoolModels(ms []catalog.Model) []catalog.Model { return poolModels("codex", ms) }
+
+// poolModels is ms, the list of agent's account in use first, with what
+// the agent's other accounts on add to it, as codexPoolModels says: a
+// Copilot account's plan lists other models than another's too
+// (copilotPoolModels).
+func poolModels(agent string, ms []catalog.Model) []catalog.Model {
 	var lists [][]catalog.Model
-	for _, l := range Logins("codex") {
+	for _, l := range Logins(agent) {
 		if l.Active || !l.On {
 			continue
 		}
-		if live, _, ok := catalog.Live(accountModels("codex", l.User)); ok {
+		if live, _, ok := catalog.Live(accountModels(agent, l.User)); ok {
 			lists = append(lists, live)
 		}
 	}
@@ -445,9 +604,14 @@ func levelRank(e string) int {
 // /codex/models calls from one address for accounts no Codex was using
 // (the audit after owl's deactivated accounts, 10-30). A plan's models
 // change seldom: once a day, one account a look, so they drift apart.
+// codexBehindRetry is how long a saved account's list asked for an older
+// Codex (codexListBehind) waits after a try before it is asked again:
+// each such list is asked at once, as one with none, but one that keeps
+// failing waits.
 const (
 	codexSavedListAge = 24 * time.Hour
 	codexSavedAtOnce  = 1
+	codexBehindRetry  = time.Hour
 )
 
 // codexSavedAsked is when each saved account's list was last asked for,
@@ -481,13 +645,29 @@ func codexFetchSaved(ctx context.Context) {
 		if l.Active || !l.On {
 			continue
 		}
-		_, at, ok := catalog.Live(accountModels("codex", l.User))
+		key := accountModels("codex", l.User)
+		_, at, ok := catalog.Live(key)
 		if !ok {
 			fresh = append(fresh, due{l.User, at})
 			continue
 		}
-		if a := codexSavedAsked.m[strings.ToLower(l.User)]; a.After(at) {
-			at = a
+		asked := codexSavedAsked.m[strings.ToLower(l.User)]
+		if codexListBehind(catalog.LiveAsked(key)) && now.Sub(asked) >= codexBehindRetry {
+			// asked for an older Codex than magpie speaks as now: its
+			// list may lack what the backend lists to the newer one
+			fresh = append(fresh, due{l.User, at})
+			continue
+		}
+		if now.Sub(asked) >= codexBehindRetry && slices.ContainsFunc(ls, func(o Login) bool {
+			return !strings.EqualFold(o.User, l.User) && catalog.LiveNewest(accountModels("codex", o.User)).After(at.Add(listRound))
+		}) {
+			// another account's list has had a model only since this one
+			// was fetched: asked again, so it says whether the plan has it
+			fresh = append(fresh, due{l.User, at})
+			continue
+		}
+		if asked.After(at) {
+			at = asked
 		}
 		if now.Sub(at) >= codexSavedListAge {
 			stale = append(stale, due{l.User, at})
@@ -503,8 +683,8 @@ func codexFetchSaved(ctx context.Context) {
 		user := d.user
 		sign := codexSign(func(ctx context.Context) (string, string, error) { return savedLoginToken(ctx, "codex", user) })
 		// through the account's own proxy, if it has one
-		if ms, err := codexModels(ViaLogin(ctx, "codex", user), sign); err == nil {
-			catalog.SaveLive(accountModels("codex", user), CodexBase, ms)
+		if ms, ver, err := codexModelsAsked(ViaLogin(ctx, "codex", user), sign); err == nil {
+			catalog.SaveLiveAsked(accountModels("codex", user), CodexBase, ver, ms)
 		}
 	}
 }
@@ -571,10 +751,33 @@ func CodexNativeHidden() map[string]bool {
 	return out
 }
 
+// CodexOwnLeftOut is the rule for Show Codex's own models turned off
+// (OwnModelsHidden, iiiiiimone on X): it says of a slug in the sign-in's
+// list whether Codex's list leaves it out, so the picker offers magpie's
+// models alone. A model magpie serves on a ChatGPT account of the user's
+// stays, as the Agents page's picker keeps it (Served), and so does keep,
+// the one Codex is set to, which Codex would otherwise run on fallback
+// metadata. nil while the switch is on. Hidden jobs (codex-auto-review) are
+// the caller's to leave.
+func CodexOwnLeftOut(keep string) func(slug string) bool {
+	if !OwnModelsHidden("codex") {
+		return nil
+	}
+	shown, _ := CatalogFor("codex")
+	served := map[string]bool{keep: true}
+	for _, e := range shown {
+		if CodexOwn(e) {
+			served[e.Model] = true
+		}
+	}
+	return func(slug string) bool { return !served[slug] }
+}
+
 // CodexOrder is where each model of Codex's list goes when the user put
 // them in an order of their own on the Agents page (#855), by the slug
 // Codex knows it by — a ChatGPT account's own by its bare one, as the
-// backend lists it — and whether they did. A model it doesn't name keeps
+// backend lists it, and by magpie's id, as magpie lists one the backend's
+// list lacks — and whether they did. A model it doesn't name keeps
 // its place after them.
 func CodexOrder() (map[string]int, bool) {
 	order := ModelOrder("codex")
@@ -591,12 +794,19 @@ func CodexOrder() (map[string]int, bool) {
 		if !ok {
 			continue
 		}
-		slug := e.ID
-		if CodexOwn(e) {
-			slug = e.Model
+		put := func(slug string) {
+			if cur, seen := out[slug]; !seen || i < cur {
+				out[slug] = i
+			}
 		}
-		if cur, seen := out[slug]; !seen || i < cur {
-			out[slug] = i
+		put(e.ID)
+		// the account's own goes by its bare slug where the backend's list
+		// has it, and by magpie's id where that list lacks it
+		// (CodexListedBeside): GPT-6.2, beside a list asked for before it
+		// came, went last in the Codex app's picker wherever it was put
+		// (Wangalan167673 on X)
+		if CodexOwn(e) {
+			put(e.Model)
 		}
 	}
 	return out, true
@@ -627,6 +837,10 @@ func buildCodexListTag(kind string) string {
 				ms = append(ms, catalog.Model{ID: "+" + e.ID})
 			}
 		}
+	}
+	// and Codex's own models left out of its list (OwnModelsHidden)
+	if OwnModelsHidden("codex") {
+		ms = append(ms, catalog.Model{ID: "~ownoff"})
 	}
 	off := slices.Sorted(maps.Keys(CodexNativeHidden()))
 	for _, slug := range off {
@@ -721,9 +935,10 @@ func CodexNativePicked() (map[string]bool, bool) {
 func CodexNativeWindow(restore bool) func(slug string) (n, most int, ok bool) {
 	p, _ := find(All(), "codex")
 	live, _, _ := catalog.Live("codex")
+	capped := settings.Shared()
 	return func(slug string) (int, int, bool) {
 		if n := p.ContextOf(slug); n > 0 {
-			return n, 0, true
+			return capped.CappedOwn(n), 0, true
 		}
 		if !restore {
 			return 0, 0, false
@@ -733,7 +948,7 @@ func CodexNativeWindow(restore bool) func(slug string) (n, most int, ok bool) {
 				// a list without the max (saved before magpie kept
 				// it) leaves the cache's own; Window still raises it to
 				// the window when it's below
-				return m.Context, m.MaxContext, true
+				return capped.Capped(m.Context), capped.Capped(m.MaxContext), true
 			}
 		}
 		return 0, 0, false
@@ -751,8 +966,9 @@ func CodexNativeWindow(restore bool) func(slug string) (n, most int, ok bool) {
 // Codex Plus account.
 func CodexWindow(user, slug string) int {
 	p, _ := find(All(), "codex")
+	capped := settings.Shared()
 	if n := p.ContextOf(slug); n > 0 {
-		return n
+		return capped.CappedOwn(n)
 	}
 	var lists [][]catalog.Model
 	if user != "" {
@@ -767,7 +983,7 @@ func CodexWindow(user, slug string) int {
 	for _, ms := range lists {
 		for _, m := range ms {
 			if n := catalog.Window(m.Context); m.ID == slug && n > 0 {
-				return n
+				return capped.Capped(n)
 			}
 		}
 	}
@@ -780,6 +996,13 @@ func CodexWindow(user, slug string) int {
 func codexWindowsTag() []catalog.Model {
 	p, _ := find(All(), "codex")
 	var out []catalog.Model
+	if n := settings.Shared().ContextCap; n > 0 {
+		id := "~cap"
+		if settings.Shared().ContextCapAll {
+			id = "~capall"
+		}
+		out = append(out, catalog.Model{ID: id, Context: n})
+	}
 	for _, k := range slices.Sorted(maps.Keys(p.Contexts)) {
 		out = append(out, catalog.Model{ID: "=" + k, Context: p.Contexts[k]})
 	}
@@ -799,18 +1022,21 @@ func codexListedIf(shown []Entry, members func(id string) []Member, listed func(
 	var ms []catalog.Model
 	// named among all shown: the account's own, which the backend lists,
 	// are in Codex's picker beside these
-	labels := Labels(shown)
+	labels := LabelsFor("codex", shown)
 	seen := described()
 	s := settings.Load().ForAgent("codex")
 	find := func(id string) (Group, []Member, bool) { return Group{}, members(id), true }
 	apart := codexApart(shown, labels, listed)
+	// read once a list, and only where a model may need it (UltraOn)
+	ultra := sync.OnceValue(UltraModels)
 	for i, e := range shown {
 		if !listed(e) {
 			continue
 		}
 		m := catalog.Model{ID: e.ID, Name: labels[i], Efforts: CodexEfforts(e), Images: e.Images || seen, Context: e.Context, AgentsV2: e.AgentsV2, Codex: e.Codex, Apart: apart[i]}
 		m.Compact = CompactFor(s, e, find)
-		CodexTiers(&m, e, members)
+		CodexTiersWith(&m, e, members, ultra)
+		CodexSeals(&m, e, members)
 		ms = append(ms, m)
 	}
 	return ms
@@ -893,8 +1119,16 @@ func codexApart(shown []Entry, labels []string, listed func(Entry) bool) []strin
 // CodexTiers sets on m what Codex is offered on e's service tiers
 // (codexcat.Entries turns them into the entry's service_tiers): one source
 // for every list Codex is handed, the gateway's and the models.json file
-// magpie writes for a Codex CLI that names magpie its provider (#1530).
+// magpie writes for a Codex CLI that names magpie its provider (#1530), and
+// the /v1/models another magpie that has this one as its provider reads
+// them from (RemoteTiers, #1234).
 func CodexTiers(m *catalog.Model, e Entry, members func(id string) []Member) {
+	CodexTiersWith(m, e, members, sync.OnceValue(UltraModels))
+}
+
+// CodexTiersWith is CodexTiers with UltraModels read through ultra, once
+// for a whole list.
+func CodexTiersWith(m *catalog.Model, e Entry, members func(id string) []Member, ultra func() map[string]bool) {
 	// a provider the user added by its address is sent the tier Codex
 	// asks for as it is (hsiangron on X)
 	m.OwnTier = e.Group == "" && e.Provider.Preset == "" && e.Provider.Account == nil && e.Provider.ID != ""
@@ -906,13 +1140,13 @@ func CodexTiers(m *catalog.Model, e Entry, members func(id string) []Member) {
 		m.Tiers = e.Tiers
 	}
 	if e.Group != "" {
-		fast := false
+		fast, ultrafast := false, false
 		for _, mb := range members(e.ID) {
 			if a := mb.Provider.Account; a != nil && a.Agent == "codex" && strings.HasPrefix(mb.Model, "gpt-") {
 				m.Fast = true
-				break
 			}
 			fast = fast || CanFast(mb.Provider, mb.Model)
+			ultrafast = ultrafast || UltraOn(mb.Provider, mb.Model, ultra())
 		}
 		// a group with another member that has a fast mode (an OpenAI or
 		// Anthropic key's, a relay's GPT, Cursor's, a plugin's) is offered
@@ -923,17 +1157,60 @@ func CodexTiers(m *catalog.Model, e Entry, members func(id string) []Member) {
 		if !m.Fast && fast {
 			m.Tiers = []string{codexFastTier}
 		}
+		// and Ultrafast where a member offers it, which the gateway asks of
+		// that member, asking one that has none for priority in its place
+		// (tierMate): a magpie that has this one as its provider was
+		// offered Fast alone on such a group (OoopsHh on X)
+		if ultrafast {
+			m.Tiers = []string{codexFastTier, codexUltraTier}
+		}
 		return
 	}
 	// so is a model of its own that has one, which no tier above names
 	// (an Anthropic key's Opus, an OpenAI key's GPT, a Cursor account's)
-	if len(m.Tiers) == 0 && CanFast(e.Provider, e.Model) {
+	if len(m.Tiers) == 0 && CanFast(*e.Provider, e.Model) {
 		m.Tiers = []string{codexFastTier}
 	}
+	// and Ultrafast where its key or account offers it (UltraOn: an OpenAI
+	// key's gpt-6.2-sol, a ChatGPT account whose plan has it), which only
+	// Codex's own list said: a magpie in Docker, with no Codex there,
+	// offered Fast alone to the magpie that has it as its provider
+	// (OoopsHh on X)
+	if slices.Contains(m.Tiers, codexFastTier) && !slices.Contains(m.Tiers, codexUltraTier) && UltraOn(*e.Provider, e.Model, ultra()) {
+		m.Tiers = append(slices.Clip(m.Tiers), codexUltraTier)
+	}
+}
+
+// CodexSeals sets m.Seals: e's provider, or a member of its group, is one
+// of no sign-in on the Responses API, which may seal a V2 lead's subagent
+// tasks as the ChatGPT backend does (#1109). A ChatGPT account's model says
+// so already (codex/, a group's Fast); another account's (Copilot) seals
+// none.
+func CodexSeals(m *catalog.Model, e Entry, members func(id string) []Member) {
+	if e.Group == "" {
+		m.Seals = maySeal(*e.Provider)
+		return
+	}
+	for _, mb := range members(e.ID) {
+		if maySeal(mb.Provider) {
+			m.Seals = true
+			return
+		}
+	}
+}
+
+// maySeal says p is of no sign-in and speaks the Responses API, as the
+// gateway's canSeal does (its Base, not Speaks: a list asks it of every
+// model).
+func maySeal(p Provider) bool {
+	return p.Account == nil && p.ID != "" && p.Base(Responses) != ""
 }
 
 // codexFastTier is Fast's service tier as Codex sends it.
 const codexFastTier = "priority"
+
+// codexUltraTier is Codex's Ultra Fast, the tier faster than priority.
+const codexUltraTier = "ultrafast"
 
 // CodexListRevoked says err, from CodexLiveList, is the backend calling
 // Codex's sign-in revoked (SignInRevoked), not a refusal a refresh mends,

@@ -71,6 +71,9 @@ func dashScopeBody(model string, d drawing) ([]byte, error) {
 	if d.Mask != nil {
 		return nil, errors.New("DashScope's image models take no mask: say in the prompt which part of the image to change")
 	}
+	if d.Markup != nil {
+		return nil, errors.New("DashScope's image models take no markup layer: say in the prompt what to change")
+	}
 	size, err := dashScopeSize(d.Size)
 	if err != nil {
 		return nil, err
@@ -80,7 +83,16 @@ func dashScopeBody(model string, d drawing) ([]byte, error) {
 		content = append(content, map[string]string{"image": pic.dataURL()})
 	}
 	content = append(content, map[string]string{"text": d.Prompt})
+	// no watermark unless the caller asks for one (watermark: true)
 	params := map[string]any{"watermark": false}
+	if v, ok := d.Extra["watermark"]; ok {
+		if d.Form {
+			v = formValue("watermark", v, nil)
+		}
+		if on, isBool := v.(bool); isBool {
+			params["watermark"] = on
+		}
+	}
 	if d.N > 1 {
 		params["n"] = d.N
 	}

@@ -93,6 +93,42 @@ func codexLookEvery(u map[string]SubscriptionQuota) time.Duration {
 	return loginSwitchEvery
 }
 
+// codexIdleAfter is how long no Codex session file has been written for
+// Codex to count idle, and codexIdleLookEvery how often the account Codex
+// is signed in to is read then, in place of loginSwitchEvery: nothing
+// runs on the account, so a reading every five minutes told nothing new
+// and asked chatgpt.com 288 times a day (dludream on Discord). Requests
+// magpie sends on the account keep its windows current from what each
+// reply says (NoteCodexLimits), and a session written to again has the
+// next look read it at once (codexDue).
+const (
+	codexIdleAfter     = 30 * time.Minute
+	codexIdleLookEvery = 30 * time.Minute
+)
+
+// codexIdle says whether Codex has written no session in codexIdleAfter.
+// A var so tests can say.
+var codexIdle = func(now time.Time) bool {
+	return codexSessionsQuiet(codexHome(), now, codexIdleAfter)
+}
+
+// codexDue says whether a full look of KeepOnAnAccountWithRoom reads
+// Codex's accounts at now: next, when the last look set it, has come, or
+// that look found Codex idle (idle) and it no longer is.
+func codexDue(now, next time.Time, idle bool) bool {
+	return !now.Before(next) || idle && !codexIdle(now)
+}
+
+// codexEveryAt is how long after a look at now the next reads Codex's
+// accounts, given every (codexLookEvery), and whether that is for Codex
+// being idle: only an account not near out waits the longer while idle.
+func codexEveryAt(every time.Duration, now time.Time) (time.Duration, bool) {
+	if every >= loginSwitchEvery && codexIdle(now) {
+		return codexIdleLookEvery, true
+	}
+	return every, false
+}
+
 // CodexOutUntil is when the ChatGPT account Codex is signed in to has room
 // again, as last read: the latest reset of the windows used up. Zero when
 // it isn't out or the reading doesn't say.
@@ -126,9 +162,10 @@ const SpentShare = 98
 // SpentShareOf is the share past which routing counts an account spent:
 // SpentShare, but In order sends requests to the first until a window of it
 // is used up or the vendor refuses it, so there an account at 98% is still
-// tried in its turn (#530); Until used up stays on one until then too.
+// tried in its turn (#530); Until used up, and Before expiry, one by one,
+// stay on one until then too.
 func SpentShareOf(routing string) float64 {
-	if routing == Ordered || routing == Drain {
+	if routing == Ordered || routing == Drain || routing == PaceDrain {
 		return 100
 	}
 	return SpentShare
@@ -161,13 +198,14 @@ func loginSwitching(agent string) (share float64, keep bool) {
 // does Codex's go back when it is routed Until used up: the gateway then
 // keeps its requests on the account it moved to (routes.Drain), so Codex
 // signed back in to the first showed that one in use while the other's
-// allowance was spent (WalterAIBuilder on X); it stays with the requests.
+// allowance was spent (WalterAIBuilder on X); it stays with the requests,
+// and so under Before expiry, one by one, which stays on one as well.
 func returnsToFirst(agent string) bool {
 	for _, p := range storedFile().Providers {
 		if p.ID == agent {
 			// kept on the first (KeepLogin), set aside under SwitchOnly,
 			// is still the user's word that the first comes first
-			return p.Routing == Ordered || p.KeepLogin || agent == "codex" && !p.SwitchOnly && p.Routing != Drain
+			return p.Routing == Ordered || p.KeepLogin || agent == "codex" && !p.SwitchOnly && p.Routing != Drain && p.Routing != PaceDrain
 		}
 	}
 	return agent == "codex"
@@ -249,6 +287,11 @@ func NextLogin(ctx context.Context, agent string) (from, to string, back, ok boo
 	if leftAlone(agent) {
 		return "", "", false, false // magpie has no say in its sign-in, or was told to leave it be
 	}
+	if agent == "claude" && claudeTokenInUse() != "" {
+		// on a setup-token the user switched it to, whose allowance can't
+		// be read: it stays there till they switch it again
+		return "", "", false, false
+	}
 	var spares []Login
 	var first *Login
 	ls := Logins(agent)
@@ -256,13 +299,13 @@ func NextLogin(ctx context.Context, agent string) (from, to string, back, ok boo
 		switch {
 		case l.Active:
 			from = l.User
-		case l.Returns:
+		case l.Returns && switchable(l):
 			first = &ls[i]
 		}
 		// never one Codex keeps signed in in another folder (switchSavedLogin)
 		// nor one added by a setup-token, which Claude Code can't be
-		// signed in to
-		if !l.Active && l.On && l.Lapsed == "" && l.home == "" && !l.Token {
+		// signed in to, nor one kept access token only (switchable)
+		if !l.Active && l.On && l.Lapsed == "" && switchable(l) {
 			spares = append(spares, l)
 		}
 	}
@@ -293,6 +336,13 @@ func NextLogin(ctx context.Context, agent string) (from, to string, back, ok boo
 	}
 	u := someLoginUsage(ctx, agent, from, firstUser)
 	now := time.Now()
+	// the model families Claude Code is on: an account out for one
+	// family's limit alone (Claude Code's "You've hit your Fable limit")
+	// is out only for Claude Code on that family (claudeSaidOutFor)
+	var fams []string
+	if agent == "claude" {
+		fams = claudeOnFamilies(now)
+	}
 	// an account at its usage cap is spent as one at the share below
 	// (account_caps.go): it is moved off, and none is moved to or back to
 	// till the window it filled renews
@@ -304,7 +354,8 @@ func NextLogin(ctx context.Context, agent string) (from, to string, back, ok boo
 	// nothing for it, and a workspace seat at its owner's limit or a spend
 	// cap is held with every window under the share
 	if first != nil && first.On && first.Lapsed == "" && returnsToFirst(agent) {
-		if q, known := u[first.User]; known && q.Error == "" && !q.Held && !usedPast(q, backShare, now) && !capped(first.User, q) {
+		if q, known := u[first.User]; known && q.Error == "" && !q.Held && !usedPast(q, backShare, now) && !capped(first.User, q) &&
+			(agent != "claude" || !claudeSaidOutFor(first.User, fams, now)) {
 			return from, first.User, true, true
 		}
 	}
@@ -325,7 +376,12 @@ func NextLogin(ctx context.Context, agent string) (from, to string, back, ok boo
 	// A window whose reset has passed counts as started again (usedPast),
 	// on every account, however its reading came
 	q, known := u[from]
-	if keep || !known || q.Error != "" || !q.Held && !usedPast(q, share, now) && !capped(from, q) {
+	// a Claude account /usage can't read that Claude Code was refused on
+	// for its limit is spent as one read past the share (claudeOutUnread)
+	// and so is one Claude Code said hit its limit, till the reset it
+	// named (claudeSaidOut), whatever an older reading says
+	out := agent == "claude" && (claudeOutUnread(from, fams, known, q, now) || claudeSaidOutFor(from, fams, now))
+	if keep || !out && (!known || q.Error != "" || !q.Held && !usedPast(q, share, now) && !capped(from, q)) {
 		return "", "", false, false
 	}
 	if agent == "codex" && !q.Held && !capped(from, q) && spendsFirst(from, q) {
@@ -344,29 +400,44 @@ func NextLogin(ctx context.Context, agent string) (from, to string, back, ok boo
 	// it has more than the one it is on by roomMargin, so that the agent
 	// isn't moved to and fro between two all but even; else it stays
 	best, most := "", math.Inf(-1)
-	if !q.Held {
+	if !q.Held && !out {
 		most = roomLeft(q, share, AccountCapsOf(agent, from), now) + roomMargin
 	}
+	stale := ""
 	for _, l := range spares {
 		q, known := u[l.User]
-		if agent == "claude" && (!known || unreadSpare(q)) {
-			// a saved Claude account magpie has no reading of: read now,
-			// by Claude Code's /usage in its own directory, one account at
-			// a time and only till one has room
-			q, known = readSpare(ctx, l)
+		old := false
+		if agent == "claude" {
+			// a saved Claude account magpie has no reading of, or one too
+			// old to go by: read now, by Claude Code's /usage in its own
+			// directory, one account at a time and only till one has room
+			var out bool
+			if q, known, old, out = claudeSpare(ctx, l, fams, q, known, now); out {
+				continue
+			}
 		}
 		if !known || q.Error != "" || q.Held {
 			continue
 		}
 		if !usedPast(q, share, now) && !capped(l.User, q) {
+			if old {
+				// still too old to go by: every spare read freshly first
+				if stale == "" {
+					stale = l.User
+				}
+				continue
+			}
 			return from, l.User, false, true
 		}
-		if r := roomLeft(q, share, AccountCapsOf(agent, l.User), now); r > most {
+		if r := roomLeft(q, share, AccountCapsOf(agent, l.User), now); r > most && !old {
 			best, most = l.User, r
 		}
 	}
 	if best != "" {
 		return from, best, false, true
+	}
+	if stale != "" {
+		return from, stale, false, true
 	}
 	return "", "", false, false
 }
@@ -394,8 +465,8 @@ func roomLeft(q SubscriptionQuota, share float64, caps WindowCaps, now time.Time
 			continue
 		}
 		line := share
-		if c, _ := caps.Of(w.Name); c > 0 && float64(c) < line {
-			line = float64(c)
+		if c, _, _ := caps.limitShare(w.Name, w.Limit, false); c > 0 && c < line {
+			line = c
 		}
 		room = min(room, line-w.Used)
 	}
@@ -438,22 +509,40 @@ func NextInOrder(ctx context.Context, agent string) (to string, over bool, err e
 	share, _ := loginSwitching(agent)
 	u := someLoginUsage(ctx, agent, users...)
 	now := time.Now()
+	var fams []string
+	if agent == "claude" {
+		fams = claudeOnFamilies(now)
+	}
 	best, most := "", math.Inf(-1)
+	stale := ""
 	for _, l := range order {
 		q, known := u[l.User]
-		if agent == "claude" && (!known || unreadSpare(q)) {
-			q, known = readSpare(ctx, l)
+		old := false
+		if agent == "claude" {
+			var out bool
+			if q, known, old, out = claudeSpare(ctx, l, fams, q, known, now); out {
+				continue
+			}
 		}
 		if !known || q.Error != "" || q.Held {
 			continue
 		}
 		caps := AccountCapsOf(agent, l.User)
 		if !usedPast(q, share, now) && !capReached(q, caps, now) {
+			if old {
+				if stale == "" {
+					stale = l.User
+				}
+				continue
+			}
 			return l.User, false, nil
 		}
-		if r := roomLeft(q, share, caps, now); r > most {
+		if r := roomLeft(q, share, caps, now); r > most && !old {
 			best, most = l.User, r
 		}
+	}
+	if best == "" && stale != "" {
+		return stale, false, nil
 	}
 	if best == "" {
 		return "", false, fmt.Errorf("magpie has no reading of %s's other accounts' usage: name the one to switch to (magpie accounts switch %s <email>)", agent, agent)
@@ -461,11 +550,30 @@ func NextInOrder(ctx context.Context, agent string) (to string, over bool, err e
 	return best, true, nil
 }
 
+// claudeSpare is the saved Claude account l's reading for the switch,
+// read (q as routing has it, known: there is one): read again now
+// (readSpare) when there is none to go by (unreadSpare) or it is too old
+// (staleSpare). out says Claude Code said the account hit its limit and
+// the reset it named hasn't come (claudeSaidOut), whatever the reading:
+// it is passed over. old says the reading is still too old after.
+func claudeSpare(ctx context.Context, l Login, fams []string, q SubscriptionQuota, known bool, now time.Time) (_ SubscriptionQuota, _ bool, old, out bool) {
+	if claudeSaidOutFor(l.User, fams, now) {
+		return q, known, false, true
+	}
+	if !known || unreadSpare(q) || staleSpare(q, now) {
+		q, known = readSpare(ctx, l)
+		if claudeSaidOutFor(l.User, fams, now) {
+			return q, known, false, true
+		}
+	}
+	return q, known, known && staleSpare(q, now), false
+}
+
 // unreadSpare says q, a saved Claude account's reading, has nothing to go
 // by: never read (a /usage not run), or a read that failed for a reason
 // not the account's own. Its /usage is then run (readSpare).
 func unreadSpare(q SubscriptionQuota) bool {
-	return q.Error != "" && (readDeferred(q.Error) || !claudeUsageDenied.MatchString(q.Error))
+	return q.Error != "" && (readDeferred(q.Error) || !claudeDenied(q.Error))
 }
 
 // readSpare is the reading of the saved Claude account l, its /usage run
@@ -595,9 +703,14 @@ var codexWasUsedUp atomic.Bool
 // room again: the Codex app sends nothing at all for an account that is
 // out, a magpie model's turn included, so the agent package then makes
 // magpie Codex's provider, and puts it back beside the sign-in after
-// (#540). Only a change is told.
-func noteCodexUsedUp(now bool) {
-	if codexWasUsedUp.Swap(now) != now {
+// (#540). Only a change is told: from the last look's answer, or from
+// known, what CodexUsedUpKnown said before this look read again, which
+// is what the sync last went by. Codex signed in by hand to an account
+// whose kept reading said held made magpie its provider at that sync,
+// and the look's fresh "room" was the same as its last answer (for the
+// account Codex was on before), so nothing told the sync again.
+func noteCodexUsedUp(known, now bool) {
+	if codexWasUsedUp.Swap(now) != now || known != now {
 		catalog.Touched()
 	}
 }
@@ -619,6 +732,10 @@ func KeepOnAnAccountWithRoom(ctx context.Context) {
 		}
 	}()
 	var full time.Time // when the next full look is due; zero: now
+	// when a full look next reads Codex's accounts (zero: the first), and
+	// whether the last that did found Codex idle
+	var codexNext time.Time
+	codexWasIdle := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -641,19 +758,31 @@ func KeepOnAnAccountWithRoom(ctx context.Context) {
 			t.Reset(min(time.Until(full), claudeLookEvery))
 			continue
 		}
+		now := time.Now()
+		readCodex := codexDue(now, codexNext, codexWasIdle)
+		// what the sync last went by, before this look reads again
+		known := readCodex && CodexUsedUpKnown()
 		for _, agent := range switchedAgents {
+			if agent == "codex" && !readCodex {
+				continue
+			}
 			lookAtSignIn(ctx, agent)
 		}
 		// a sign-in made in Claude Code itself, or a proxy picked since,
 		// takes its account's proxy too (#1807)
 		syncClaudeProxyEnvNow()
-		c, cancel := context.WithTimeout(ctx, time.Minute)
-		noteCodexUsedUp(CodexUsedUp(c))
-		restartCodexAppLeftOnSpent(c)
-		cancel()
+		if readCodex {
+			c, cancel := context.WithTimeout(ctx, time.Minute)
+			noteCodexUsedUp(known, CodexUsedUp(c))
+			restartCodexAppLeftOnSpent(c)
+			cancel()
+			var codexEvery time.Duration
+			codexEvery, codexWasIdle = codexEveryAt(codexLookEvery(knownLoginUsage("codex")), time.Now())
+			codexNext = time.Now().Add(codexEvery)
+		}
 		// Codex's own sign-in refused for good, or signed in again since
 		noteCodexGoneNow()
-		every := codexLookEvery(knownLoginUsage("codex"))
+		every := min(loginSwitchEvery, max(time.Until(codexNext), 0))
 		full = time.Now().Add(every)
 		signInsLooked(true)
 		t.Reset(min(every, claudeLookEvery))

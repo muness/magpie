@@ -103,10 +103,14 @@ func TestCodexCatalogToolSearch(t *testing.T) {
 	if e := full.Models[0]; e["context_window"] != float64(996147) || e["auto_compact_token_limit"] != nil || e["max_context_window"] != nil {
 		t.Errorf("full context: %v", e)
 	}
-	for _, off := range []string{"tool_mode", "use_responses_lite", "multi_agent_version", "model_messages"} {
+	for _, off := range []string{"tool_mode", "use_responses_lite", "model_messages"} {
 		if v, ok := e[off]; ok {
 			t.Errorf("%s = %v", off, v)
 		}
+	}
+	// V2 for the Ultra it offers (TestUltraOnOtherVendorsModels)
+	if v := e["multi_agent_version"]; v != "v2" {
+		t.Errorf("multi_agent_version = %v", v)
 	}
 }
 
@@ -194,7 +198,7 @@ func TestCodexCatalogSaysTextOnly(t *testing.T) {
 		t.Fatalf("%+v", got.Models)
 	}
 	text, sees, group, found := got.Models[0], got.Models[1], got.Models[2], got.Models[3]
-	if !strings.Contains(text.Description, "text only") || !strings.Contains(text.Description, "Names & levels") || !catalog.MagpieAdded("", text.Slug, text.Description) {
+	if !strings.Contains(text.Description, "text only") || !strings.Contains(text.Description, "Model settings") || !catalog.MagpieAdded("", text.Slug, text.Description) {
 		t.Errorf("text-only model: %q", text.Description)
 	}
 	if sees.Description != "Sees via magpie" || group.Description != "Words via magpie" || found.Description != "Found via magpie" {

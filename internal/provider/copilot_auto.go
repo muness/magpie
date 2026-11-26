@@ -205,7 +205,7 @@ func copilotAutoResolve(ctx context.Context, app copilotApp, fresh bool) (copilo
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("X-GitHub-Api-Version", copilotAutoVersion)
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return copilotAutoSession{}, errors.New("Copilot Auto: " + err.Error())
 	}
@@ -287,7 +287,7 @@ func copilotAutoRoute(ctx context.Context, app copilotApp, s copilotSession, bas
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("X-GitHub-Api-Version", copilotAutoV2Version)
-	res, err := http.DefaultClient.Do(req)
+	res, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return copilotAutoSession{}, err.Error(), false
 	}
@@ -305,14 +305,14 @@ func copilotAutoRoute(ctx context.Context, app copilotApp, s copilotSession, bas
 	case res.StatusCode/100 != 2:
 		return copilotAutoSession{}, APIError(b, res.Status), false
 	case json.Unmarshal(b, &v) != nil || v.Token == "" || v.Selected.ID == "":
-		return copilotAutoSession{}, "picked no model: " + clipLine(string(b)), false
+		return copilotAutoSession{}, "picked no model: " + clipLine(QuotedReply(b)), false
 	case copilotRefuses(app.Token, v.Selected.ID):
 		return copilotAutoSession{}, "picked " + v.Selected.ID + ", which the account was refused", true
 	}
 	// the pick's endpoints, which the account's list may not give
 	copilotSeenMu.Lock()
 	if _, ok := copilotSeen[v.Selected.ID]; !ok || len(v.Selected.Endpoints) > 0 {
-		copilotSeen[v.Selected.ID] = copilotAPIs(v.Selected.Endpoints)
+		copilotSee(v.Selected.ID, v.Selected.Endpoints)
 	}
 	copilotSeenMu.Unlock()
 	exp := time.Now().Add(copilotAutoReuse).Unix()
@@ -438,7 +438,16 @@ func copilotAutoHeld(token string, a *copilotAutoSession) bool {
 var (
 	copilotSeenMu sync.Mutex
 	copilotSeen   = map[string][]string{}
+	// copilotSeenWS: the models served over the Responses WebSocket
+	copilotSeenWS = map[string]bool{}
 )
+
+// copilotSee keeps what Copilot said model is served on; under
+// copilotSeenMu.
+func copilotSee(model string, endpoints []string) {
+	copilotSeen[model] = copilotAPIs(endpoints)
+	copilotSeenWS[model] = slices.Contains(endpoints, "ws:/responses")
+}
 
 func copilotSeenAPIs(model string) []Protocol {
 	copilotSeenMu.Lock()
@@ -465,7 +474,7 @@ func ForgetCopilotForTest() {
 	copilotTerms, copilotPicks = map[string]map[string]bool{}, map[string][]string{}
 	copilotTermsMu.Unlock()
 	copilotSeenMu.Lock()
-	copilotSeen = map[string][]string{}
+	copilotSeen, copilotSeenWS = map[string][]string{}, map[string]bool{}
 	copilotSeenMu.Unlock()
 	copilotRefusedMu.Lock()
 	copilotRefusedAt = map[string]map[string]time.Time{}

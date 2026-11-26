@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 
 	"github.com/yetone/magpie/internal/masking"
 	"github.com/yetone/magpie/internal/pii"
@@ -21,6 +22,11 @@ type privacyModelJSON struct {
 	// a request held back for it (masking.ModelOn)
 	Chosen bool `json:"chosen,omitempty"`
 	pii.Status
+	// Folder is where the models are kept (pii.Root, as ~ for the home),
+	// FolderSet that the user picked it
+	Folder    string `json:"folder"`
+	FolderSet bool   `json:"folderSet,omitempty"`
+	pii.Moving
 	MinScore     float64      `json:"minScore"`
 	DefaultScore float64      `json:"defaultScore"`
 	Models       []pii.Status `json:"models"`
@@ -37,6 +43,7 @@ func privacyModelState() privacyModelJSON {
 	for _, m := range models() {
 		out.Models = append(out.Models, m.Now())
 	}
+	out.Folder, out.FolderSet, out.Moving = tilde(pii.Root()), pii.Custom(), pii.MoveState()
 	return out
 }
 
@@ -49,8 +56,10 @@ func privacyModelState() privacyModelJSON {
 // model downloaded, or picks model: while it is on, that is turning it on
 // as model (the one before masks until model is downloaded); while off,
 // the pick is kept for turning it on; score keeps s as the threshold of
-// model (the one masking uses, with none), 0 for its default.
-func privacyModelRoutes(mux *http.ServeMux) {
+// model (the one masking uses, with none), 0 for its default; folder moves
+// the downloaded models to dir (the system's picker for "", magpie's cache
+// for "default") in the background, which the state's moving says.
+func privacyModelRoutes(mux *http.ServeMux, w Windows) {
 	mux.HandleFunc("GET /api/privacy-model", func(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, privacyModelState())
 	})
@@ -59,13 +68,14 @@ func privacyModelRoutes(mux *http.ServeMux) {
 			Do    string  `json:"do"`
 			Model string  `json:"model"`
 			Score float64 `json:"score"`
+			Dir   string  `json:"dir"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			fail(rw, err)
 			return
 		}
-		if in.Model != "" && in.Model != pii.PrivacyFilter && in.Model != pii.AstrLinkGuard {
-			fail(rw, fmt.Errorf("model is %s or %s, not %q", pii.PrivacyFilter, pii.AstrLinkGuard, in.Model))
+		if in.Model != "" && !slices.ContainsFunc(models(), func(m pii.Model) bool { return m.ID() == in.Model }) {
+			fail(rw, fmt.Errorf("unknown local masking model %q", in.Model))
 			return
 		}
 		st := settings.Load()
@@ -82,6 +92,17 @@ func privacyModelRoutes(mux *http.ServeMux) {
 			default:
 				err = settings.SetRedactModelName(in.Model)
 			}
+		case "folder":
+			// "" asks with the system's picker; "default" is magpie's cache
+			dir := in.Dir
+			if dir == "" {
+				if dir, err = w.ChooseFolder("Choose a folder for the local models"); err != nil || dir == "" {
+					break // cancelled: nothing moved
+				}
+			} else if dir == "default" {
+				dir = ""
+			}
+			err = pii.MoveTo(dir)
 		case "score":
 			id := in.Model
 			if id == "" {
@@ -124,7 +145,7 @@ func privacyModelRoutes(mux *http.ServeMux) {
 				}
 			}
 		default:
-			err = fmt.Errorf("do is on, off, cancel, remove, pick or score, not %q", in.Do)
+			err = fmt.Errorf("do is on, off, cancel, remove, pick, folder or score, not %q", in.Do)
 		}
 		if err != nil {
 			fail(rw, err)
@@ -140,7 +161,11 @@ func privacyModelRoutes(mux *http.ServeMux) {
 // is stopped; was is let go once id masks.
 func turnOn(id, was string) error {
 	m := modelOf(id)
-	if !m.Supported() {
+	installed := m.Installed()
+	if !m.Supported() || !installed && !m.ManagesWeights() {
+		if why := m.Now().Failed; why != "" {
+			return fmt.Errorf("%s", why)
+		}
 		return fmt.Errorf("the local masking model doesn't run on this system yet")
 	}
 	for _, o := range models() {
@@ -156,7 +181,7 @@ func turnOn(id, was string) error {
 			m.Warm()
 		}
 	}
-	if m.Installed() {
+	if installed {
 		on()
 		return nil
 	}

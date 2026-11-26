@@ -31,7 +31,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -39,6 +38,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 const (
@@ -89,13 +89,63 @@ var codexReaders = func(at place) []CodexReader {
 			out = append(out, CodexReader{Kind: "app", Version: installedVersion(filepath.Join(dir, "resources", "codex"))})
 		}
 	}
-	if extensionHere(at.home, "openai.chatgpt") {
-		out = append(out, CodexReader{Kind: "ide"})
+	return append(out, extensionCodexReaders(at.home)...)
+}
+
+// extensionCodexReaders are the Codexes the editors' OpenAI extension
+// (openai.chatgpt) carries, one per installed copy, in VS Code's
+// ~/.vscode/extensions, VS Code Server's, and each fork's (Cursor,
+// Windsurf, VSCodium, …). The extension ships its codex at
+// <ext>/bin/<target>/codex, with the version in the codex-package.json
+// beside it ("0.169.0-alpha.11.1" in chatgpt 26.51111 on Linux and
+// Windows alike); one whose version can't be read is "" (unknown, not old).
+// A copy the editor marked obsolete (.obsolete) is not run any more.
+func extensionCodexReaders(home string) []CodexReader {
+	var out []CodexReader
+	es, err := os.ReadDir(home)
+	if err != nil {
+		return nil
+	}
+	for _, e := range es {
+		if !strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		root := filepath.Join(home, e.Name(), "extensions")
+		xs, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		var obsolete map[string]bool
+		if b, err := os.ReadFile(filepath.Join(root, ".obsolete")); err == nil {
+			json.Unmarshal(b, &obsolete)
+		}
+		for _, x := range xs {
+			n := strings.ToLower(x.Name())
+			if !x.IsDir() || !strings.HasPrefix(n, "openai.chatgpt-") || obsolete[x.Name()] {
+				continue
+			}
+			out = append(out, CodexReader{Kind: "ide", Version: extensionCodexVersion(filepath.Join(root, x.Name()))})
+		}
 	}
 	return out
 }
 
-var codexPackageVersionRe = regexp.MustCompile(`"version"\s*:\s*"([^"]+)"`)
+// extensionCodexVersion is the version in an extension copy's
+// codex-package.json (bin/<target>/, or bin/), "" when none is readable.
+func extensionCodexVersion(dir string) string {
+	paths, _ := filepath.Glob(filepath.Join(dir, "bin", "*", "codex-package.json"))
+	paths = append(paths, filepath.Join(dir, "bin", "codex-package.json"))
+	for _, p := range paths {
+		if b, err := os.ReadFile(p); err == nil {
+			if m := codexPackageVersionRe.FindSubmatch(b); m != nil {
+				return strings.TrimSpace(string(m[1]))
+			}
+		}
+	}
+	return ""
+}
+
+var codexPackageVersionRe = lazyre.New(`"version"\s*:\s*"([^"]+)"`)
 
 // bundledCodexVersion is the version of the codex a Codex app bundle
 // ships (Contents/Resources/codex-cli/codex-package.json, "version":
@@ -201,7 +251,20 @@ func codexAsyncSync(path, key string, routed, on bool, percent int, tableOK bool
 	if raw := stashShared()[key]; raw != "" {
 		json.Unmarshal([]byte(raw), &st)
 	}
+	// what was written is stashed however the sync ends: a write after
+	// it that fails never leaves magpie's threshold or table in the file
+	// unstashed, where it would read as the user's and lock the setting
 	was := st
+	defer func() {
+		if st != was {
+			if st == (codexAsyncStash{}) {
+				forget(key)
+			} else {
+				b, _ := json.Marshal(st)
+				stash(map[string]string{key: string(b)})
+			}
+		}
+	}()
 	want := routed && on
 	useTable := want && tableOK
 	if !useTable {
@@ -323,14 +386,6 @@ func codexAsyncSync(path, key string, routed, on bool, percent int, tableOK bool
 		}
 	}
 
-	if st != was {
-		if st == (codexAsyncStash{}) {
-			forget(key)
-		} else {
-			b, _ := json.Marshal(st)
-			stash(map[string]string{key: string(b)})
-		}
-	}
 	return nil
 }
 

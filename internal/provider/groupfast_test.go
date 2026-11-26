@@ -1,6 +1,8 @@
 package provider
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -16,7 +18,7 @@ func fastHome(t *testing.T) {
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	for _, p := range []Provider{
 		{ID: "oa", Name: "OpenAI", Key: "k", Responses: "https://api.openai.com/v1", Models: []string{"gpt-6.1-sol", "text-embedding-3"}},
-		{ID: "an", Name: "Anthropic", Key: "k", Anthropic: "https://api.anthropic.com", Models: []string{"claude-opus-5-5", "claude-opus-4-8-20260501", "claude-sonnet-5"}},
+		{ID: "an", Name: "Anthropic", Key: "k", Anthropic: "https://api.anthropic.com", Models: []string{"claude-opus-5-5", "claude-opus-4-8-20260501", "claude-sonnet-5", "claude-fable-5-2", "claude-fable-5-1"}},
 		{ID: "rl", Name: "Relay", Key: "k", Chat: "https://relay.example/v1", Anthropic: "https://relay.example", Models: []string{"gpt-6.1-sol", "claude-opus-5-5", "odd:fast"}},
 	} {
 		if err := Save(p); err != nil {
@@ -45,6 +47,8 @@ func TestCanFast(t *testing.T) {
 		{*an, "claude-opus-5-5", true},
 		{*an, "claude-opus-4-8-20260501", true},
 		{*an, "claude-sonnet-5", false},
+		{*an, "claude-fable-5-2", true}, // fast mode from its launch
+		{*an, "claude-fable-5-1", false},
 		{*rl, "claude-opus-5-5", false}, // Claude's speed isn't asked of a relay
 	} {
 		if got := CanFast(c.p, c.model); got != c.want {
@@ -135,5 +139,64 @@ func TestSaveGroupFast(t *testing.T) {
 		if err == nil || !(strings.Contains(err.Error(), "no fast mode") || strings.Contains(err.Error(), "takes no :fast")) {
 			t.Errorf("%s: %v", m, err)
 		}
+	}
+}
+
+// A GPT model on a provider the user added by its address can be sent
+// Ultrafast where OpenAI offers it on the model (KoiLx0 on X): Codex's own
+// entry for it lists the tier, as Codex itself is offered it there, or
+// OpenAI's API serves it so (OoopsHh on X: in Docker there is no Codex CLI
+// and no entry). Not on a model Codex's entry gives Fast alone, nor one it
+// has no entry for, nor on another vendor's model.
+func TestCanUltraOwnProvider(t *testing.T) {
+	fastHome(t)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	rl, _ := Find("rl")
+	oa, _ := Find("oa")
+	if UltraOn(*rl, "gpt-6.1-mini", nil) || UltraOn(*rl, "gpt-6-sol", nil) {
+		t.Fatal("Ultrafast with no list saying so")
+	}
+	// with no list at all: the models OpenAI's API serves at Ultrafast
+	if !UltraOn(*rl, "gpt-6.1-sol", nil) || !UltraOn(*oa, "gpt-6.1-sol", nil) {
+		t.Error("gpt-6.1-sol: no Ultrafast where OpenAI's API serves it")
+	}
+	for m, want := range map[string]bool{
+		"gpt-6-astra": true, "gpt-6.2-astra": true, "openai/gpt-6.2-sol": true, "GPT-6-Astra-2026-09-14": true, "gpt-6.1-sol-20261001": true,
+		"gpt-6-sol": false, "gpt-6.1-terra": false, "gpt-6.2-astra-mini": false, "gpt-6.2": false, "claude-opus-5-5": false,
+	} {
+		if OpenAIUltra(m) != want {
+			t.Errorf("OpenAIUltra(%q) = %v", m, !want)
+		}
+	}
+	cache := `{"etag":"e1","models":[
+		{"slug":"gpt-6.1-sol","description":"x","service_tiers":[{"id":"priority","name":"Fast"},{"id":"ultrafast","name":"Ultra Fast"}]},
+		{"slug":"gpt-6.1-mini","description":"x","service_tiers":[{"id":"priority","name":"Fast"}]}]}`
+	if err := os.WriteFile(filepath.Join(codexHome, "models_cache.json"), []byte(cache), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		p     Provider
+		model string
+		want  bool
+	}{
+		{*rl, "gpt-6.1-sol", true},
+		{*rl, "openai/GPT-6.1-sol-2026-05-01", true},
+		{*rl, "gpt-6.1-mini", false},
+		{*rl, "gpt-7", false},
+		{*rl, "claude-opus-5-5", false},
+		// OpenAI's own API, on the models its Ultrafast mode names
+		{*oa, "gpt-6.1-sol", true},
+		{*oa, "gpt-6-sol", false},
+		{*oa, "gpt-6.1-mini", false},
+		{*oa, "claude-opus-5-5", false},
+	} {
+		if got := UltraOn(c.p, c.model, nil); got != c.want {
+			t.Errorf("%s/%s: Ultrafast %v, want %v", c.p.ID, c.model, got, c.want)
+		}
+	}
+	// one of Codex's accounts listing it says so too
+	if !UltraOn(*rl, "gpt-7", map[string]bool{"gpt-7": true}) {
+		t.Error("an account's Ultrafast not taken")
 	}
 }

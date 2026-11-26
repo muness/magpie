@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,30 +20,45 @@ const libraryUsage = `magpie library                     what the library gives 
   magpie library instructions        print the shared instructions
   magpie library instructions set <file|->   replace them with a file's text (- for stdin)
   magpie library instructions agents <a,b…|none>   the agents that get them
-  magpie library mcp add <name> <url | command args…> [agents=a,b…] [--local]
+  magpie library mcp add <name> <url | command args…> [agents=a,b…] [header=K=V…] [env=K=V…] [timeout=SECS] [idle=SECS|never] [--local]
+                                     header= is for a URL, env= for a command; the program's own words go after --
+  magpie library mcp set <name> header=K=V | header-=K | env=K=V | env-=K | timeout=SECS | idle=SECS|never   change one setting of a server
+                                     idle= is how long a server magpie runs (the router's, Codex's) is kept unused, never to keep it
+  magpie library mcp show <name>     print the server as the library keeps it, as JSON
   magpie library mcp agents <name> <a,b…|none>
   magpie library mcp local <name> on|off   keep it to this computer: a sync or a backup never carries it, and one
                                      coming in neither takes it away nor puts another computer's in its place
+  magpie library mcp here <name> <command args…> | off   start a synced server with this command on this computer alone,
+                                     the others keeping the synced one (its name, agents and note still sync); off goes back to it
+  magpie library mcp off|on <name>   take it from every agent, project and app, keeping its settings; on gives it back as it was
   magpie library mcp rm <name>
   magpie library mcp router on|off   give each agent one MCP server, magpie, in place of the library's (magpie runs them, once for every agent)
   magpie library mcp router <name> shared|direct   with the router on, share the server through it (the default) or keep it each
                                      agent's own entry, as with the router off: for one that reads its project from the folder it starts in
   magpie library skill agents <name> <a,b…|none>
+  magpie library skill router on|off   give each agent one skill, magpie-skills, that lists the library's: it reads the one a task needs
+  magpie library skill router <name> routed|direct   with the router on, list the skill there (the default) or keep it each agent's own
   magpie library skill off-here <name>   turn it off on this computer only: a sync neither carries that nor turns it back on
   magpie library skill on-here <name>    …and on again here
   magpie library skill hand-over <name…>|--all   move skills kept in ~/.agents/skills into the library's folder: the agents that read them
                                      there keep them, ticked, and you can turn each off
   magpie library skill hand-back <name>  …and back into ~/.agents/skills, where those agents read it whatever is ticked
-  magpie library skill rm <name>     (skills are installed from the app's Library page)
-  magpie library skill rm --all [--yes]   every skill out of the library and the agents (asks first; --yes doesn't)
-  magpie library skill rm --gone [--yes]  every skill an update found removed from its source (asks first; --yes doesn't)
+  magpie library skill rm <name> [--no-backup]   (skills are installed from the app's Library page)
+                                     its folder goes to magpie's backups; --no-backup deletes it (a folder of yours it links to stays)
+  magpie library skill rm --all [--yes] [--no-backup]   every skill out of the library and the agents (asks first; --yes doesn't)
+  magpie library skill rm --gone [--yes] [--no-backup]  every skill an update found removed from its source (asks first; --yes doesn't)
   magpie library skill update [name] fetch a skill from GitHub again; with no name, every one from there
                                      (one changed here is left as it is; update it by name with --replace-edits)
   magpie library skill how link|copy [agent]   give skills as links to the library's or as copies: every agent's way, or one agent's
   magpie library skill how default <agent>     the agent goes the library's way again
   magpie library skill where agents|shared     skills go to the agents ticked, or also into ~/.agents/skills for every agent and tool that reads it
+  magpie library skill auto-update on|off      fetch each skill from GitHub or git again by itself when it changes there (one changed here stays)
   magpie library skill use-library <name> <agent>   an agent's own skill by that name is in the way: set it aside, link the library's
   magpie library skill keep-own <name> <agent>      …or keep the agent's, and take the agent off the library's
+  magpie library plugin [list]       the library's plugins (Library › Claude plugins): magpie library plugin help
+  magpie library plugin import <folder | owner/repo | git address> [plugin…] [agents=a,b…|none]   put a source's plugins in the library, as Library › Claude plugins does
+  magpie library project …           a project folder's own skills (Library › Projects): magpie library project help
+  magpie library native              what plugins Codex and Claude Code and packages Pi installed themselves declare (read only; the agent loads them)
   magpie library rtk                 which agents run their shell commands through RTK (rtk-ai.app), to save tokens
   magpie library rtk on|off <agent>  switch it (on with RTK's own installer; off works with RTK gone)
   magpie library rtk install         install RTK (Homebrew, winget, or RTK's own script)
@@ -102,30 +118,55 @@ func libraryCmd(args []string) error {
 		switch {
 		case len(rest) >= 3 && rest[0] == "add":
 			var cmd, agents []string
-			local := false
-			for _, a := range rest[2:] {
-				if a == "--local" {
-					local = true
-				} else if v, ok := strings.CutPrefix(a, "agents="); ok {
-					if agents, err = libraryAgents(v, "mcp"); err != nil {
-						return err
-					}
-				} else {
-					cmd = append(cmd, a)
+			var o library.ServerOpts
+			if cmd, o, err = library.SplitServerWords(rest[2:]); err != nil {
+				return err
+			}
+			for _, v := range o.Agents {
+				var as []string
+				if as, err = libraryAgents(v, "mcp"); err != nil {
+					return err
 				}
+				agents = append(agents, as...)
 			}
 			var s library.Server
 			if s, err = library.ServerOf(rest[1], cmd); err != nil {
 				return err
 			}
-			if agents != nil {
+			if o.HasAgent {
 				s.Agents = agents
 			}
-			s.Local = local
+			if err = o.Apply(&s); err != nil {
+				return err
+			}
 			res, err = library.SaveServer("", s)
 			if len(s.Agents) == 0 {
 				unused = s.Name
 			}
+		case len(rest) >= 3 && rest[0] == "set" && !strings.HasPrefix(rest[1], "-"):
+			// header, env, timeout and idle of a server in the library, one at a time (#6111)
+			var cmd []string
+			var o library.ServerOpts
+			if cmd, o, err = library.SplitServerWords(rest[2:]); err != nil {
+				return err
+			}
+			if len(cmd) > 0 || o.HasAgent || o.Local != nil {
+				return fmt.Errorf("set takes header=K=V, env=K=V, header-=K, env-=K, timeout=SECS and idle=SECS|never, not %q", strings.Join(cmd, " "))
+			}
+			res, err = library.SetServer(rest[1], o)
+		case len(rest) == 2 && rest[0] == "show" && !strings.HasPrefix(rest[1], "-"):
+			v, rerr := library.Read(nil)
+			if rerr != nil {
+				return rerr
+			}
+			for _, s := range v.Servers {
+				if s.Name == rest[1] {
+					b, _ := json.MarshalIndent(s.Server, "", "  ")
+					fmt.Println(string(b))
+					return nil
+				}
+			}
+			return fmt.Errorf("no server called %s", rest[1])
 		case len(rest) == 3 && rest[0] == "agents":
 			var as []string
 			if as, err = libraryAgents(rest[2], "mcp"); err == nil {
@@ -140,6 +181,28 @@ func libraryCmd(args []string) error {
 				}
 				return nil
 			}
+		case len(rest) >= 3 && rest[0] == "here" && !strings.HasPrefix(rest[1], "-"):
+			// this computer's own command for a synced server (#3836, #6426)
+			cmd := rest[2:]
+			if len(cmd) > 0 && cmd[0] == "--" {
+				cmd = cmd[1:]
+			}
+			if len(rest) == 3 && rest[2] == "off" {
+				cmd = nil
+			} else if len(cmd) == 0 {
+				return fmt.Errorf("usage:\n  %s", libraryUsage)
+			}
+			if res, err = library.ServerHere(rest[1], cmd); err == nil && len(res.Changed) == 0 && len(res.Problems) == 0 {
+				if cmd == nil {
+					fmt.Println(green.Render("✓"), rest[1], "runs the synced command here again")
+				} else {
+					fmt.Println(green.Render("✓"), rest[1], "runs", strings.Join(cmd, " "), "on this computer; your other computers keep the synced command")
+				}
+				return nil
+			}
+		case len(rest) == 2 && (rest[0] == "on" || rest[0] == "off") && !strings.HasPrefix(rest[1], "-"):
+			// off for everyone, kept with its settings; on again as it was
+			res, err = library.ServerOn(rest[1], rest[0] == "on")
 		case len(rest) == 2 && rest[0] == "rm":
 			res, err = library.RemoveServer(rest[1])
 		case len(rest) == 2 && (rest[0] == "router" || rest[0] == "hub") && (rest[1] == "on" || rest[1] == "off"):
@@ -165,6 +228,10 @@ func libraryCmd(args []string) error {
 			if res, err = removeEverySkill(rest[1:]); res == nil && err == nil {
 				return nil
 			}
+		case len(rest) == 2 && rest[0] == "router" && (rest[1] == "on" || rest[1] == "off"):
+			res, err = library.SetSkillRouter(rest[1] == "on")
+		case len(rest) == 3 && rest[0] == "router" && (rest[2] == "routed" || rest[2] == "direct") && !strings.HasPrefix(rest[1], "-"):
+			res, err = library.SkillRouterHow(rest[1], rest[2] == "direct")
 		case len(rest) == 2 && (rest[0] == "off-here" || rest[0] == "on-here") && !strings.HasPrefix(rest[1], "-"):
 			res, err = library.SkillHere(rest[1], rest[0] == "on-here")
 		case len(rest) >= 2 && rest[0] == "hand-over":
@@ -175,8 +242,8 @@ func libraryCmd(args []string) error {
 			if res, err = library.HandBackSkill(rest[1]); err == nil {
 				fmt.Println(green.Render("✓"), rest[1], "is back in", filepath.Join("~", ".agents", "skills", rest[1]))
 			}
-		case len(rest) == 2 && rest[0] == "rm":
-			res, err = library.RemoveSkill(rest[1])
+		case (len(rest) == 2 || len(rest) == 3 && rest[2] == "--no-backup") && rest[0] == "rm" && !strings.HasPrefix(rest[1], "-"):
+			res, err = library.RemoveSkillsHow([]string{rest[1]}, len(rest) == 2)
 		case len(rest) == 3 && rest[0] == "use-library":
 			res, err = library.UseLibrarySkill(rest[1], rest[2])
 		case len(rest) == 3 && rest[0] == "keep-own":
@@ -212,11 +279,19 @@ func libraryCmd(args []string) error {
 			res, err = library.SetSkillHow(agent, how)
 		case len(rest) == 2 && rest[0] == "where" && (rest[1] == library.SkillsInAgents || rest[1] == library.SkillsInShared):
 			res, err = library.SetSkillsWhere(rest[1])
+		case len(rest) == 2 && rest[0] == "auto-update" && (rest[1] == "on" || rest[1] == "off"):
+			res, err = library.SetAutoUpdateSkills(rest[1] == "on")
 		default:
 			return fmt.Errorf("usage:\n  %s", libraryUsage)
 		}
+	case "native":
+		return libraryNativeCmd(rest)
 	case "rtk":
 		return rtkCmd(rest)
+	case "project", "projects":
+		return libraryProjectCmd(rest)
+	case "plugin", "plugins":
+		return libraryPluginCmd(rest)
 	case "help", "-h", "--help":
 		fmt.Print("  " + libraryUsage)
 		return nil
@@ -242,10 +317,12 @@ func libraryCmd(args []string) error {
 // terminal; with no terminal to ask on, only --yes takes them. A library
 // with no skills is said, and answers a nil result.
 func removeEverySkill(args []string) (*library.Result, error) {
-	yes := false
+	yes, keep := false, true
 	for _, a := range args {
 		switch a {
 		case "--all":
+		case "--no-backup":
+			keep = false
 		case "--yes", "-y":
 			yes = true
 		default:
@@ -268,14 +345,18 @@ func removeEverySkill(args []string) (*library.Result, error) {
 		if !term.IsTerminal(int(os.Stdin.Fd())) {
 			return nil, fmt.Errorf("this removes all %s; run it with --yes to do so without being asked", plural(len(names), "skill"))
 		}
-		fmt.Printf("Remove all %s (%s) from the library and every agent? Folders magpie keeps go to its backups; folders of your own are only unlinked. [y/N] ",
-			plural(len(names), "skill"), strings.Join(names, ", "))
+		where := "Folders magpie keeps go to its backups"
+		if !keep {
+			where = "Folders magpie keeps are deleted, with no backup"
+		}
+		fmt.Printf("Remove all %s (%s) from the library and every agent? %s; folders of your own are only unlinked. [y/N] ",
+			plural(len(names), "skill"), strings.Join(names, ", "), where)
 		line, _ := stdin().ReadString('\n')
 		if a := strings.ToLower(strings.TrimSpace(line)); a != "y" && a != "yes" {
 			return nil, fmt.Errorf("nothing removed")
 		}
 	}
-	res, err := library.RemoveSkills(names)
+	res, err := library.RemoveSkillsHow(names, keep)
 	if err != nil {
 		return nil, err
 	}
@@ -293,10 +374,12 @@ func removeEverySkill(args []string) (*library.Result, error) {
 // update or a check found its source without, asked about first, naming
 // the ones changed here.
 func removeGoneSkills(args []string) (*library.Result, error) {
-	yes := false
+	yes, keep := false, true
 	for _, a := range args {
 		switch a {
 		case "--gone":
+		case "--no-backup":
+			keep = false
 		case "--yes", "-y":
 			yes = true
 		default:
@@ -327,14 +410,18 @@ func removeGoneSkills(args []string) (*library.Result, error) {
 		if !term.IsTerminal(int(os.Stdin.Fd())) {
 			return nil, fmt.Errorf("this removes %s removed from their source; run it with --yes to do so without being asked", plural(len(names), "skill"))
 		}
-		fmt.Printf("Remove %s removed from their source (%s) from the library and every agent? The library's folders go to magpie's backups. [y/N] ",
-			plural(len(names), "skill"), strings.Join(shown, ", "))
+		where := "The library's folders go to magpie's backups."
+		if !keep {
+			where = "The library's folders are deleted, with no backup."
+		}
+		fmt.Printf("Remove %s removed from their source (%s) from the library and every agent? %s [y/N] ",
+			plural(len(names), "skill"), strings.Join(shown, ", "), where)
 		line, _ := stdin().ReadString('\n')
 		if a := strings.ToLower(strings.TrimSpace(line)); a != "y" && a != "yes" {
 			return nil, fmt.Errorf("nothing removed")
 		}
 	}
-	res, err := library.RemoveGoneSkills(names)
+	res, err := library.RemoveGoneSkillsHow(names, keep)
 	if err != nil {
 		return nil, err
 	}
@@ -452,6 +539,9 @@ func libraryStatus() error {
 		fmt.Printf("  %s %s → %s\n", bold.Render(s.Name), muted.Render(what), on(s.Agents))
 		if s.Local {
 			fmt.Println("   ", muted.Render("not synced: a sync never carries it to your other computers · magpie library mcp local "+s.Name+" off"))
+		}
+		if sh := s.Shared; sh != nil {
+			fmt.Println("   ", muted.Render("this computer's own command; the others run "+strings.TrimSpace(sh.Command+" "+strings.Join(sh.Args, " "))+" · magpie library mcp here "+s.Name+" off"))
 		}
 		if s.Hub == library.HubDirect {
 			fmt.Println("   ", muted.Render("direct: each agent's own entry, never through the hub · magpie library mcp hub "+s.Name+" shared"))

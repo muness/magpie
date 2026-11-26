@@ -124,7 +124,7 @@ func (p Provider) OwnPaused() bool {
 // afresh had none, and a second WorkBuddy AI account queued 62s with the
 // wait set to 1s (#1899).
 func (p Provider) AlsoOn() []Provider {
-	out := p.alsoOn()
+	out := p.alsoOn(false)
 	for i, q := range out {
 		out[i] = withPicks(q, p)
 	}
@@ -132,31 +132,33 @@ func (p Provider) AlsoOn() []Provider {
 }
 
 // alsoOn is AlsoOn as each sign-in makes its accounts, without the
-// provider's settings.
-func (p Provider) alsoOn() []Provider {
+// provider's settings; withOff, the accounts turned off too, each marked
+// off (Account.off), for a test to be sent to one before it is turned on
+// (testAccounts).
+func (p Provider) alsoOn(withOff bool) []Provider {
 	if p.IsPlugin() {
-		return pluginAlsoOn(*p.Account.plugin)
+		return pluginAlsoOn(*p.Account.plugin, withOff)
 	}
 	if p.Account != nil && p.Account.Agent == "copilot" {
-		return copilotAlsoOn()
+		return copilotAlsoOn(withOff)
 	}
 	if p.Account != nil && p.Account.Agent == ChatGPTAPIID {
-		return siwcAlsoOn()
+		return siwcAlsoOn(withOff)
 	}
 	if p.Account != nil && (p.Account.Agent == "gemini" || p.Account.Agent == "antigravity") {
-		return googleAlsoOn(p.Account.Agent)
+		return googleAlsoOn(p.Account.Agent, withOff)
 	}
 	if p.Account == nil || p.Account.token != nil && !p.Account.standIn || (p.Account.Agent != "claude" && p.Account.Agent != "codex") {
 		return nil
 	}
 	var out []Provider
 	for _, l := range Logins(p.Account.Agent) {
-		if l.Active || l.first || !l.On {
+		if l.Active || l.first || !l.On && !withOff {
 			continue
 		}
 		agent, user := l.Agent, l.User
 		a := *p.Account
-		a.User, a.Plan, a.standIn = user, l.Plan, false
+		a.User, a.Plan, a.standIn, a.off = user, l.Plan, false, !l.On
 		a.token = func(ctx context.Context) (string, error) {
 			tok, _, err := savedLoginToken(ctx, agent, user)
 			return tok, err
@@ -177,6 +179,17 @@ func (p Provider) alsoOn() []Provider {
 		out = append(out, q)
 	}
 	return out
+}
+
+// offIf is q marked as an account the user turned off when off (alsoOn's
+// withOff).
+func offIf(q Provider, off bool) Provider {
+	if off && q.Account != nil {
+		a := *q.Account
+		a.off = true
+		q.Account = &a
+	}
+	return q
 }
 
 // Token is the access token of a saved account in use beside the agent's
@@ -248,7 +261,8 @@ func renewSaved(ctx context.Context, agent, user string, force bool, stale strin
 		// (万贤凯 on Discord). So it is renewed where Codex keeps it, as
 		// Codex's own (codexTokenRenewing), and the copy is left as it is:
 		// a switch away saves it afresh from Codex's.
-		return codexTokenRenewing(ctx, codexHome(), stale)
+		tok, accountID, err := codexTokenRenewing(ctx, codexHome(), stale)
+		return tok, codexOwnWorkspace(*l, accountID), err
 	}
 	if home := codexHeldIn(*l); home != "" {
 		// the same for an account Codex is signed in to in another of
@@ -267,7 +281,7 @@ func renewSaved(ctx context.Context, agent, user string, force bool, stale strin
 			}
 			return "", "", err
 		}
-		return tok, accountID, nil
+		return tok, codexOwnWorkspace(*l, accountID), nil
 	}
 	var auth []byte
 	switch agent {
@@ -280,6 +294,10 @@ func renewSaved(ctx context.Context, agent, user string, force bool, stale strin
 		accountID = a.Tokens.AccountID
 		if accountID == "" {
 			accountID = claimString(jwtClaims(a.Tokens.IDToken), "https://api.openai.com/auth", "chatgpt_account_id")
+		}
+		if l.AccessOnly {
+			// never refreshed: that would sign out where it came from
+			return accessOnlyToken(user, l.Lapsed, a, accountID, force, stale)
 		}
 		if stale != "" {
 			if a.Tokens.AccessToken != stale {
@@ -329,6 +347,21 @@ func heldByCodex(l savedLogin) bool {
 		return true
 	}
 	return sameRefresh(live.Auth, l.Auth)
+}
+
+// codexOwnWorkspace is the workspace the saved ChatGPT account l is, for
+// a token read where Codex holds its sign-in (heldByCodex, codexHeldIn),
+// whose own workspace is held: one sign-in reaches every workspace of its
+// login, one refresh token for all, and the Codex app's workspace switch
+// rewrites only which one auth.json routes to. Taken as it was, the
+// account not in use read the one in use's plan, allowance and resets,
+// and spent them (JdAZzzzzz on X: a Team seat read as the personal
+// Prolite). held when l doesn't say.
+func codexOwnWorkspace(l savedLogin, held string) string {
+	if _, ws := codexWho(l.Auth); ws != "" {
+		return ws
+	}
+	return held
 }
 
 // codexHeldRefusal is a refresh OpenAI refused for an account Codex is

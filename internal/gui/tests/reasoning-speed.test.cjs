@@ -5,10 +5,15 @@
 // over the 1.5 s after counted 2200 tokens in 1.5 s, 1,467 tok/s; it is 200
 // in 1.5 s, 133. An older route without its own reasoning count takes its
 // served try's; a reply that reasoned and wrote only tool calls tells no
-// speed of its own (the Usage page's row tells the least its answer wrote
-// at); one that didn't reason is timed as before. The Routing page's rows,
+// speed of its own, and both the Routing page's row and the Usage page's
+// tell the least its answer wrote at (zzzkl3994 on Discord); one that didn't reason is timed as before. The Routing page's rows,
 // a session's average and the Usage page's rows and their tooltip all say
 // it, in English, Chinese, Japanese and German; no backend, the API is faked.
+// A reply whose stream showed when it began to reason counts all its output,
+// reasoning and tool calls included, from its first output (Archivemylife on
+// X): a Codex turn's preamble, reasoning and shell call, 1,239 tokens over
+// the 18.4 s from its first token, is 67 tok/s, not its 630-token call in
+// the 1.6 s after its last reasoning, 386.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -24,15 +29,17 @@ const at = (i) => new Date(now.getTime() - (i + 1) * 60e3).toISOString();
 const timing = [
   [2200, 2000, 0, 15500, 14000, 14000], // the turn: 200 in 1.5 s, 133 tok/s
   [1300, 0, 1000, 9000, 6000, 6000],    // an older route: 300 in 3 s, 100 tok/s
-  [1500, 1400, 0, 9000, 8000, 0],       // reasoning, then tool calls only: none measured, ≥100 on the Usage row
+  [1500, 1400, 0, 9000, 8000, 0],       // reasoning, then tool calls only: none measured, ≥100 on both pages
   [500, 0, 0, 7000, 2000, 2000],         // no reasoning: 500 in 5 s, 100 tok/s
   [1500, 1400, 0, 15000, 1000, 0],      // paced visible reasoning: 107 tok/s
-  [1500, 1400, 0, 9000, 8000, 0],       // a late summary stays untimed, ≥100 on the Usage row
+  [1500, 1400, 0, 9000, 8000, 0],       // a late summary stays untimed, ≥100 on both pages
   [120, 0, 0, 9000, 1000, 0],           // mixed redacted thinking without a reasoning count
+  [1239, 609, 0, 21114, 2720, 19484],   // preamble, reasoning seen at 3.2 s, a shell call: 1239 in 18.4 s, 67 tok/s
 ];
 const routes = timing.map(([out, reasoning, usageReasoning, ms, ttft, firstText], i) => ({
   ...(i === 4 ? { firstReasoning: 1000, flow: 12000 } : {}),
   ...(i === 6 ? { reasoningHidden: true, flow: 7000 } : {}),
+  ...(i === 7 ? { firstReasoning: 3166, reasoningHidden: true } : {}),
   id: 100 - i, seq: 100 - i, time: at(i), agent: "codex", session: "think-chat", model: "codex/gpt-6.1-sol", provider: "codex",
   order: [seat], tries: [{ id: seat.id, model: seat.model, start: at(i), done: true, status: 200, ms, ttft, firstText }],
   done: true, status: 200, ms, ttft, firstText, tokens: out + 9000, out, ...(reasoning ? { reasoning } : {}),
@@ -41,13 +48,15 @@ const routes = timing.map(([out, reasoning, usageReasoning, ms, ttft, firstText]
 const rows = timing.map(([out, reasoning, usageReasoning, ms, ttft, firstText], i) => ({
   ...(i === 4 ? { first_reasoning_ms: 1000, flow_ms: 12000 } : {}),
  ...(i === 6 ? { reasoning_hidden: true, flow_ms: 7000 } : {}),
+  ...(i === 7 ? { first_reasoning_ms: 3166, reasoning_hidden: true } : {}),
   route_id: 100 - i, t: at(i), agent: "codex", agentName: "Codex", icon: "codex-color", provider: "codex", providerName: "Codex",
   host: "test@example.com", req: "codex/gpt-6.1-sol", model: "gpt-6.1-sol", served: "gpt-6.1-sol", in: 9000, out,
   ...(reasoning || usageReasoning ? { reasoning: reasoning || usageReasoning } : {}), ms, ttft_ms: ttft, ...(firstText ? { first_text_ms: firstText } : {}),
   status: 200, ep: "/backend-api/codex/responses", cost: 0.01, priced: true,
 }));
-// what the server sums: 1000 answer tokens plus 1500 visible output tokens in 23.5 s
-const M = { id: "gpt-6.1-sol", calls: 7, input: 63000, output: 8620, cache_read: 0, cache_write: 0, cost: 0.04, timed: 4, ttft_ms: 30000, decode_ms: 23500, decode_out: 2500 };
+// what the server sums: 1000 answer tokens plus 1500 visible output tokens in
+// 23.5 s, and the Codex turn's 1239 in 18.394 s
+const M = { id: "gpt-6.1-sol", calls: 8, input: 72000, output: 9859, cache_read: 0, cache_write: 0, cost: 0.05, timed: 5, ttft_ms: 32720, decode_ms: 41894, decode_out: 3739 };
 
 function serve(lang) {
   const state = { agents: [{ id: "codex", name: "Codex", path: "/t/c.toml", icon: "codex-color", fields: [] }], profiles: [], settings: { lang, theme: "light" } };
@@ -79,11 +88,11 @@ function serve(lang) {
 }
 
 const L = {
-  "zh-TW": { s: (n) => `${n} token/秒`, speed: "速度", note: /首個正文後/, rule: /有推理的回覆只算正文部分/ },
-  en: { s: (n) => `${n} tok/s`, speed: "Speed", note: /200 answer tokens in 1\.5 s after the first text, the 2,000 reasoning tokens before it left out/, rule: /A reply that reasoned counts only its answer/ },
-  zh: { s: (n) => `${n} token/秒`, speed: "速度", note: /首个正文后 1\.5 秒 输出 200 个正文 token，之前的 2,000 个推理 token 不计/, rule: /有推理的回复只算正文部分/ },
-  ja: { s: (n) => `${n} トークン/秒`, speed: "速度", note: /回答 200 トークン（その前の推論 2,000 トークンは含めず）/, rule: /推論した応答は/ },
-  de: { s: (n) => `${n} Token/s`, speed: "Tempo", note: /200 Antwort-Token in .* nach dem ersten Text, ohne die 2\.000 Reasoning-Token davor/, rule: /Eine Antwort mit Reasoning/ },
+  "zh-TW": { s: (n) => `${n} token/秒`, speed: "速度", note: /首個正文後/, rule: /推理和工具呼叫/ },
+  en: { s: (n) => `${n} tok/s`, speed: "Speed", note: /200 answer tokens in 1\.5 s after the first text, the 2,000 reasoning tokens before it left out/, rule: /[Rr]easoning and tool calls/ },
+  zh: { s: (n) => `${n} token/秒`, speed: "速度", note: /首个正文后 1\.5 秒 输出 200 个正文 token，之前的 2,000 个推理 token 不计/, rule: /推理和工具调用/ },
+  ja: { s: (n) => `${n} トークン/秒`, speed: "速度", note: /回答 200 トークン（その前の推論 2,000 トークンは含めず）/, rule: /推論とツール呼び出し/ },
+  de: { s: (n) => `${n} Token/s`, speed: "Tempo", note: /200 Antwort-Token in .* nach dem ersten Text, ohne die 2\.000 Reasoning-Token davor/, rule: /Reasoning und Tool-Aufrufe/ },
 };
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -96,7 +105,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       page.setDefaultTimeout(5000);
       page.setDefaultNavigationTimeout(60000);
       const errors = [];
-      page.on("pageerror", (e) => errors.push(e.message));
+      page.on("pageerror", (e) => { if (engine === "webkit" && /due to access control checks/.test(e.message)) return; errors.push(e.message); }); // a goto in WebKit can cut off a fetch (#1350)
       await page.route("**/*", serve(lang));
 
       // the Routing page: each row, and the session's average
@@ -107,11 +116,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const speedOf = async (i) => (await reqs.nth(i).locator(".speed").count()) ? (await reqs.nth(i).locator(".speed .v").textContent()).trim() : "";
       assert.equal(await speedOf(0), w.s(133), "the turn's answer, not 1,467");
       assert.equal(await speedOf(1), w.s(100), "an older route's reasoning is its try's");
-      assert.equal(await speedOf(2), "", "tool calls after reasoning tell no speed");
+      assert.equal(await speedOf(2), "≥" + w.s(100), "tool calls after reasoning tell the least, as the Usage row");
       assert.equal(await speedOf(3), w.s(100), "no reasoning: as before");
       assert.equal(await speedOf(4), w.s(107), "visible reasoning timed from its first delta");
-      assert.equal(await speedOf(5), "", "late hidden summary stays untimed");
+      assert.equal(await speedOf(5), "≥" + w.s(100), "a late hidden summary tells the least, as the Usage row");
  assert.equal(await speedOf(6), "", "redacted reasoning stays untimed without a count");
+      assert.equal(await speedOf(7), w.s(67), "all the Codex turn's output from its first token, not its call's 386");
       assert.match(await reqs.nth(0).locator(".speed").getAttribute("title"), w.rule);
       await reqs.nth(0).click();
       await page.waitForTimeout(200);
@@ -120,8 +130,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator(".rt-group-by button").nth(1).click();
       const group = page.locator("button.rt-session").first();
       await group.waitFor();
-      // Hidden reasoning is excluded; visible reasoning adds its own decode window.
-      assert.equal((await group.locator(".speed .v").textContent()).trim(), w.s(106));
+      // Hidden reasoning is excluded; visible reasoning adds its own decode window,
+      // and so does the Codex turn: 3739 tokens in 41.894 s
+      assert.equal((await group.locator(".speed .v").textContent()).trim(), w.s(89));
       assert.match(await group.locator(".speed").getAttribute("title"), w.rule);
 
       // the Usage page's requests: each row, its tooltip, and the period's
@@ -144,8 +155,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal((await cell(4).textContent()).trim(), w.s(107));
       assert.equal((await cell(5).textContent()).trim(), "≥" + w.s(100));
  assert.equal((await cell(6).textContent()).trim(), "—");
+      assert.equal((await cell(7).textContent()).trim(), w.s(67));
       const kpi = page.locator("#ledKpi .blk").nth(4);
-      assert.equal((await kpi.locator(".v").textContent()).trim(), w.s(106));
+      assert.equal((await kpi.locator(".v").textContent()).trim(), w.s(89));
       assert.match(await kpi.getAttribute("title") || await kpi.locator("[title]").first().getAttribute("title"), w.rule);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, "no sideways scroll");
       assert.deepEqual(errors, []);

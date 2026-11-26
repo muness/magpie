@@ -41,10 +41,13 @@ func quick(t *testing.T, busy *fakeBusy, u *updater) {
 	oldBusy, oldSettle, oldMost, oldTick, oldRecheck := gatewayBusy, idleSettle, waitMost, waitTick, waitRecheck
 	gatewayBusy, idleSettle, waitMost, waitTick = busy.get, 80*time.Millisecond, time.Minute, 5*time.Millisecond
 	waitRecheck = func(*updater, bool) {}
+	oldAt, oldOpen := usedAt.Swap(0), usedOpen.Swap(false) // no window used
 	t.Cleanup(func() {
 		u.cancelWait()
 		u.loops.Wait()
 		gatewayBusy, idleSettle, waitMost, waitTick, waitRecheck = oldBusy, oldSettle, oldMost, oldTick, oldRecheck
+		usedAt.Store(oldAt)
+		usedOpen.Store(oldOpen)
 	})
 }
 
@@ -159,9 +162,12 @@ func TestRestartWhenIdle(t *testing.T) {
 	}
 }
 
-// Versions out while a restart waits collapse into the newest: the restart
-// is into the last one, downloaded once the gateway is idle, not into each.
-func TestRestartWhenIdleIntoTheNewest(t *testing.T) {
+// Versions out while a click's restart waits for the gateway don't change
+// what it goes into: the one downloaded and waiting, with downloads on a
+// click too, and nothing downloaded again (sakamotokurome on X). The new
+// version's first check finds the newer ones.
+func TestRestartWhenIdleIntoTheWaiting(t *testing.T) {
+	sandboxHome(t)
 	busy := &fakeBusy{}
 	u := &updater{}
 	quick(t, busy, u)
@@ -195,6 +201,7 @@ func TestRestartWhenIdleIntoTheNewest(t *testing.T) {
 	if j := u.json(); j.State != "ready" || j.Latest != "0.1.11" {
 		t.Fatalf("%+v", j)
 	}
+	downloadsOnClick(t)
 	busy.set(gateway.Busy{Requests: 1})
 	into := make(chan string, 4)
 	u.waitIdle(func() bool {
@@ -202,20 +209,20 @@ func TestRestartWhenIdleIntoTheNewest(t *testing.T) {
 		into <- u.latest.Version
 		u.mu.Unlock()
 		return true
-	}, false)
+	}, true)
 	latest.Store("0.1.12")
 	time.Sleep(30 * time.Millisecond)
 	latest.Store("0.1.13")
 	busy.set(gateway.Busy{})
 	select {
 	case v := <-into:
-		if v != "0.1.13" {
+		if v != "0.1.11" {
 			t.Fatalf("restarted into %s", v)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("never restarted: %+v", u.json())
 	}
-	if j := u.json(); j.State != "ready" || j.Latest != "0.1.13" {
+	if j := u.json(); j.State != "ready" || j.Latest != "0.1.11" || u.staged == "" {
 		t.Fatalf("%+v", j)
 	}
 }

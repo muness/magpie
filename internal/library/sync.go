@@ -24,6 +24,9 @@ type Result struct {
 	// fetched again and the ones that couldn't be (What is skill:<name>)
 	Updated   []string  `json:"updated,omitempty"`
 	Unupdated []Problem `json:"unupdated,omitempty"`
+	// Current is, for an update of one skill, that skill when what was
+	// fetched is the files it already had
+	Current []string `json:"current,omitempty"`
 	// Gone are, for an update of skills, the ones their sources no longer
 	// have: removed there, not failed (skill_gone.go)
 	Gone []string `json:"gone,omitempty"`
@@ -43,6 +46,18 @@ type Result struct {
 	Installed []string  `json:"installed,omitempty"`
 	Had       []string  `json:"had,omitempty"`
 	Skipped   []Problem `json:"skipped,omitempty"`
+	// Linked are, for skills installed from GitHub, the ones the library
+	// had from a folder by that name that now follow GitHub, with its
+	// files (skill_link.go); LinkedKept those of them whose own files
+	// weren't GitHub's, kept with the backups
+	Linked     []string `json:"linked,omitempty"`
+	LinkedKept []string `json:"linkedKept,omitempty"`
+	// Subagents is, for subagents imported from a repository, what was
+	// added, updated, had already, and left as changed here
+	Subagents *SubagentsImported `json:"subagents,omitempty"`
+	// Commands is, for slash commands imported from the agents, what was
+	// added and the library's own given to more agents
+	Commands *CommandsImported `json:"commands,omitempty"`
 	// dropped are the servers taken out of an agent's config, as it had
 	// them, whose processes go once no agent runs them (mcp_reap.go)
 	dropped []*Server
@@ -96,13 +111,23 @@ func (l *Library) sync() *Result {
 func syncSteps(all, gone []*Target, b *backups, res *Result) []func(*Library) {
 	// a skill whose app moved it is followed first, for every agent to
 	// get the moved one (skill_moved.go)
-	steps := []func(*Library){func(l *Library) { l.followMovedSkills() }}
+	// an edit made in a subagent's own file too (subagent_file.go)
+	steps := []func(*Library){func(l *Library) { l.followMovedSkills(); l.markDangling(); l.followSubagentFiles() }}
 	for _, t := range all {
 		steps = append(steps, func(l *Library) {
-			l.syncInstructions(t, b, res)
+			if claudeCode(t) {
+				// a plugin Claude Code loads itself isn't given it again
+				// (claude_native_overlap.go)
+				defer l.claudeAside()()
+			}
+			l.syncInstructions(t, all, b, res, true)
+			l.syncMCP2(t, b, res)
 			l.syncMCP(t, b, res)
 			l.syncHooks(t, b, res)
+			l.syncEnv(t, b, res)
 			l.syncSubagents(t, b, res)
+			l.syncCommands(t, b, res)
+			l.syncRules(t, b, res)
 		})
 	}
 	// an edit made in an agent's copy of a skill goes to the library first,
@@ -111,8 +136,10 @@ func syncSteps(all, gone []*Target, b *backups, res *Result) []func(*Library) {
 	steps = append(steps, func(l *Library) { l.takeEdits(append(slices.Clone(all), gone...), res) })
 	for _, t := range gone {
 		steps = append(steps, func(l *Library) {
+			l.syncMCP2(t, b, res)
 			l.syncMCP(t, b, res)
 			l.syncHooks(t, b, res)
+			l.syncEnv(t, b, res)
 			l.syncSkills(t, res, all)
 		})
 	}
@@ -129,13 +156,18 @@ func syncSteps(all, gone []*Target, b *backups, res *Result) []func(*Library) {
 					steps = append(steps, func(l *Library) { l.syncDesktopSkills(t, res) })
 				}
 			case (t.Skills != "" && realDir(t.Skills) == shared) == first:
-				steps = append(steps, func(l *Library) { l.syncSkills(t, res, all) })
+				steps = append(steps, func(l *Library) {
+					if claudeCode(t) {
+						defer l.claudeAside()()
+					}
+					l.syncSkills(t, res, all)
+				})
 			}
 		}
 	}
 	// magpie's copies in a WSL distro no agent there is linked to any more
 	steps = append(steps, func(l *Library) { l.sweepWSLStores(append(slices.Clone(all), gone...), res) })
-	return append(steps, func(l *Library) { l.syncProjects(res) })
+	return append(steps, func(l *Library) { l.syncProjects(res) }, func(l *Library) { l.writeSubagentFiles() })
 }
 
 // Sync writes the library into the agents again: after an agent is
@@ -317,6 +349,7 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 				s, res.run[s.Name] = via, spec
 			}
 		}
+		s = t.MCP.withCmdVars(s)
 		s = wroteStartup(s, a.Startup[s.Name])
 		old := entries[s.Name]
 		if err := t.MCP.foreign(old); err != nil {
@@ -375,6 +408,86 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 	}
 }
 
+// syncMCP2 writes the Library's MCP servers into a second runtime's file,
+// for an agent that runs more than one and reads each in its own format:
+// Cindy's Pi reads pi-agent-home/mcp.json (fmtPiNative) beside its Codex
+// config.toml (targets.go). It reconciles that file to the servers syncMCP
+// keeps in the shared applied list, so it runs just before syncMCP, while
+// a.MCP still holds the last sync's set: a server unticked since is taken
+// out of this file too, each one still given is written. The applied list
+// stays syncMCP's to set; this only mirrors the same servers in the other
+// format. Hub routing (mcp_hub.go) isn't carried here: with it on, Cindy's
+// Codex gets the one hub entry and its Pi the servers direct.
+func (l *Library) syncMCP2(t *Target, b *backups, res *Result) {
+	if res.unreached(t) || t.MCP2 == nil || t.Agent == nil {
+		return
+	}
+	f := t.MCP2
+	id := t.Agent.ID
+	a := l.applied(id)
+	base := gatewayOf(t)
+	given := map[string]*Server{}
+	for _, s := range l.MCP {
+		if slices.Contains(s.Agents, id) {
+			given[s.Name] = s
+		}
+	}
+	if len(given) == 0 && len(a.MCP) == 0 {
+		return
+	}
+	entries, err := f.entries()
+	if err != nil {
+		res.fail(id, "mcp", err)
+		return
+	}
+	write := func(what string, fn func() error) {
+		for _, p := range f.files() {
+			if err := b.keep(id, p); err != nil {
+				res.fail(id, what, err)
+				return
+			}
+		}
+		if err := fn(); err != nil {
+			res.fail(id, what, err)
+			return
+		}
+		res.changed(id)
+	}
+	// a server unticked since the last sync leaves this file too
+	for _, name := range a.MCP {
+		if _, ok := given[name]; ok {
+			continue
+		}
+		if _, ok := entries[name]; ok || f.holds(name) {
+			write("mcp:"+name, func() error { return f.del(name) })
+		}
+	}
+	for name, s := range given {
+		s = through(s, base)
+		if err := f.supports(s); err != nil {
+			res.fail(id, "mcp:"+name, err)
+			continue
+		}
+		s, _ = f.side(s)
+		if !f.WSL {
+			s = npxDirect(s)
+		}
+		s = f.withCmdVars(s)
+		s = wroteStartup(s, a.Startup[s.Name])
+		old := entries[s.Name]
+		if err := f.foreign(old); err != nil {
+			res.fail(id, "mcp:"+s.Name, err)
+			continue
+		}
+		if old != nil {
+			if cur, ok := f.current(s.Name, old, s); ok && cur.same(s) && f.has(s) && !f.behind(s, old) {
+				continue
+			}
+		}
+		write("mcp:"+s.Name, func() error { return f.putEntry(s, f.merged(s, old)) })
+	}
+}
+
 // ---- the page -------------------------------------------------------------
 
 // AgentView is an agent as the page lists it, with where it keeps each.
@@ -389,12 +502,24 @@ type AgentView struct {
 	ProjectSkills string `json:"projectSkills,omitempty"`
 	// ProjectMCP is the file, in a project, it reads MCP servers from
 	ProjectMCP string `json:"projectMCP,omitempty"`
+	// ProjectSubagents is the folder in a project it reads subagents from
+	ProjectSubagents string `json:"projectSubagents,omitempty"`
+	// ProjectHooks is the file in a project it reads hooks from, which a
+	// project's plugins' hooks are written into (project_plugins.go)
+	ProjectHooks string `json:"projectHooks,omitempty"`
+	// ProjectInstructions is the file in a project it reads the
+	// project's instructions from, when there is none yet
+	ProjectInstructions string `json:"projectInstructions,omitempty"`
 	// ProjectNoSSE: its project file can't take a server over SSE
-	ProjectNoSSE bool     `json:"projectNoSSE,omitempty"`
-	SkillsAlso   []string `json:"skillsAlso,omitempty"`
-	Note         string   `json:"note,omitempty"`
-	NoSSE        bool     `json:"noSSE,omitempty"`
-	NoRemote     bool     `json:"noRemote,omitempty"`
+	ProjectNoSSE bool `json:"projectNoSSE,omitempty"`
+	// ProjectOff and ProjectSkillOff: a server, or a skill, it has from
+	// the Library can be turned off for it in one project (project_scope.go)
+	ProjectOff      bool     `json:"projectOff,omitempty"`
+	ProjectSkillOff bool     `json:"projectSkillOff,omitempty"`
+	SkillsAlso      []string `json:"skillsAlso,omitempty"`
+	Note            string   `json:"note,omitempty"`
+	NoSSE           bool     `json:"noSSE,omitempty"`
+	NoRemote        bool     `json:"noRemote,omitempty"`
 	// NoEnvRefs: it reads no ${NAME} from its MCP config, so a server
 	// whose headers or environment have one isn't given to it (envref.go)
 	NoEnvRefs bool `json:"noEnvRefs,omitempty"`
@@ -411,15 +536,29 @@ type AgentView struct {
 	// magpie) or own (it has an entry called magpie of its own); "" for one
 	// given none of the hub's servers
 	Hub string `json:"hub,omitempty"`
+	// SkillRouter, with the skill router on, is "on" for an agent whose
+	// skills folder is given magpie-skills, or why it keeps each skill's
+	// own link (routerWhy): copies, liveagent, shared, taken or own; or
+	// "none" for an agent whose folder takes it and has no skill to list
+	SkillRouter string `json:"skillRouter,omitempty"`
 	// How is the way it is given its skills, link or copy, and HowOwn its
 	// own over the library's; MustCopy is one that can only take copies
-	// (in WSL)
-	How      string `json:"how,omitempty"`
-	HowOwn   bool   `json:"howOwn,omitempty"`
-	MustCopy bool   `json:"mustCopy,omitempty"`
+	// (in WSL, Claude Desktop, LiveAgent). CopyWhy is why it gets copies
+	// without asking for them (copyWhy): desktop, liveagent, wsl,
+	// junction, or shared with CopyWith, the agents given copies that read
+	// the very same folder
+	How      string   `json:"how,omitempty"`
+	HowOwn   bool     `json:"howOwn,omitempty"`
+	MustCopy bool     `json:"mustCopy,omitempty"`
+	CopyWhy  string   `json:"copyWhy,omitempty"`
+	CopyWith []string `json:"copyWith,omitempty"`
 	// Gone: not installed here any more, and listed only for what magpie
 	// gave it to be taken out (held); it is given nothing new
 	Gone bool `json:"gone,omitempty"`
+	// Remote: not on this computer, and connected to the MCP router at its
+	// own address from another one (remote_agents.go): it is given the
+	// router's servers alone, and magpie writes nothing for it
+	Remote bool `json:"remote,omitempty"`
 	// Asleep is the WSL distro, not running now, the agent is in: it is
 	// listed by what magpie last knew of it (wsl_asleep.go), and a change
 	// for it is written there when the distro next runs. Unseen: magpie
@@ -443,6 +582,7 @@ type ServerView struct {
 // SkillView is a library skill as the page shows it.
 type SkillView struct {
 	Name        string            `json:"name"`
+	Bundle      string            `json:"bundle,omitempty"` // the plugin it came with
 	Description string            `json:"description"`
 	Source      string            `json:"source,omitempty"`
 	Kind        string            `json:"kind"`             // github, git, folder, or "" for one kept in the library
@@ -469,6 +609,9 @@ type SkillView struct {
 	// in the library or in an agent's copy: an update replaces that, so
 	// the page asks first (#1449)
 	Edited bool `json:"edited,omitempty"`
+	// Pending is one a sync brought by its source and not yet fetched
+	// from there on this computer (Skill.Pending): Update tries again
+	Pending bool `json:"pending,omitempty"`
 	// Gone is when its source was found without it: removed there, the
 	// page offers to take it out (skill_gone.go)
 	Gone string `json:"gone,omitempty"`
@@ -477,6 +620,13 @@ type SkillView struct {
 	OffHere bool `json:"offHere,omitempty"`
 	// Note is the user's own note on it (Skill.Note)
 	Note string `json:"note,omitempty"`
+	// Manual: its SKILL.md sets disable-model-invocation (meta.Manual)
+	Manual bool `json:"manual,omitempty"`
+	// Router is "direct" for one the skill router leaves out (Skill.Router)
+	Router string `json:"router,omitempty"`
+	// Back are the agents it was brought in from: Remove gives it back
+	// to them as they had it (Skill.Home)
+	Back []string `json:"back,omitempty"`
 }
 
 // View is the Library page.
@@ -487,30 +637,60 @@ type View struct {
 	// this computer can take of them (hooks.go)
 	Hooks      []HookView      `json:"hooks"`
 	HookAgents []HookAgentView `json:"hookAgents"`
+	// Env are the library's variables, and EnvAgents what each agent on
+	// this computer can take of them (env.go)
+	Env       []EnvView      `json:"env"`
+	EnvAgents []EnvAgentView `json:"envAgents"`
 	// Subagents are the library's subagents, and SubagentAgents what
 	// each agent on this computer makes of them (subagents.go)
 	Subagents      []SubagentView      `json:"subagents"`
 	SubagentAgents []SubagentAgentView `json:"subagentAgents"`
-	FoundServers   []Found             `json:"foundServers"`
-	Skills         []SkillView         `json:"skills"`
-	FoundSkills    []FoundSkill        `json:"foundSkills"`
-	// NewSkills are skills a check found its skills' repositories to have
-	// added beside them, to add or set aside
-	NewSkills    []NewSkill        `json:"newSkills"`
-	Projects     []ProjectView     `json:"projects"`
-	Instructions *InstructionsView `json:"instructions"`
-	Dir          string            `json:"dir"`
-	Backups      string            `json:"backups"`
-	SkillGroups  []SkillGroup      `json:"skillGroups"`
-	CopySkills   bool              `json:"copySkills"` // the library gives skills as copies (#896)
+	// Commands are the library's slash commands, and CommandAgents what
+	// the agents that can take them do with them
+	Commands      []CommandView      `json:"commands"`
+	CommandAgents []CommandAgentView `json:"commandAgents"`
+	// Rules are the library's rules, and RuleAgents what the agents that
+	// can take them do with them (rules.go)
+	Rules        []RuleView      `json:"rules"`
+	RuleAgents   []RuleAgentView `json:"ruleAgents"`
+	FoundServers []Found         `json:"foundServers"`
+	// FoundHooks are the hooks the agents run that magpie didn't give
+	// them (hooks_found.go)
+	FoundHooks []FoundHook `json:"foundHooks"`
+	// Plugins are the plugins kept as one item each (plugin.go)
+	Plugins     []PluginView `json:"plugins"`
+	Skills      []SkillView  `json:"skills"`
+	FoundSkills []FoundSkill `json:"foundSkills"`
+	// NewSkills are skills a check found its skills' repositories, or
+	// the folders they were added from, to have beside them since, to
+	// add or set aside
+	NewSkills []NewSkill `json:"newSkills"`
+	// CheckFolders is whether a check looks in folders the user added
+	// skills from, which the page then offers with no remote skill
+	CheckFolders bool          `json:"checkFolders,omitempty"`
+	Projects     []ProjectView `json:"projects"`
+	// ClaudeInstalled are the plugins Claude Code has installed itself,
+	// which a project can turn on for its folder (project_claude_plugins.go)
+	ClaudeInstalled []ClaudePluginView `json:"claudeInstalled"`
+	Instructions    *InstructionsView  `json:"instructions"`
+	Dir             string             `json:"dir"`
+	Backups         string             `json:"backups"`
+	SkillGroups     []SkillGroup       `json:"skillGroups"`
+	CopySkills      bool               `json:"copySkills"` // the library gives skills as copies (#896)
 	// SharedSkills: every skill on here is in ~/.agents/skills too
 	// (skills_shared.go), at SharedDir
 	SharedSkills bool   `json:"sharedSkills"`
 	SharedDir    string `json:"sharedDir"`
+	// AutoUpdateSkills: the skills from GitHub and git repositories are
+	// updated by themselves (skill_autoupdate.go)
+	AutoUpdateSkills bool `json:"autoUpdateSkills"`
 	// MCPHub: the agents are given magpie's one MCP server in place of
 	// the library's (#2679), at HubPath<agent> on the gateway
 	MCPHub  bool   `json:"mcpHub"`
 	HubPath string `json:"hubPath"`
+	// SkillRouter: the agents are given magpie's one skill, magpie-skills,
+	// listing their skills in place of a link of each (skill_router.go)
+	SkillRouter bool `json:"skillRouter"`
 	// HubNote is what the router says of itself to the agents (settings'
 	// RouterNote), and HubName what it says with none: this computer's
 	// name, to an agent on another computer (gateway.hubWhere)
@@ -519,6 +699,19 @@ type View struct {
 	// HubAllTools: every agent is given the router's tools whole, none on
 	// demand (settings' RouterAllTools, gateway.hubOnDemand)
 	HubAllTools bool `json:"hubAllTools"`
+	// HubCode: the router gives every agent run_code beside its tools
+	// (settings' RouterNoCode, gateway.hubCodeOn)
+	HubCode bool `json:"hubCode"`
+	// HubFindsItself names the agents given every tool whole, as they
+	// search their tools themselves, and HubOnDemandOver how many tools an
+	// agent is given whole at most (gateway.HubFindsItself,
+	// gateway.HubOnDemandOver): the Tools on demand row says them
+	HubFindsItself  []string `json:"hubFindsItself"`
+	HubOnDemandOver int      `json:"hubOnDemandOver"`
+	// HubOnDemandQuery is the query the address for other apps takes to
+	// give its tools on demand (gateway.HubOnDemandQuery): Connect's
+	// Other apps tab gives that address too
+	HubOnDemandQuery string `json:"hubOnDemandQuery"`
 	// CheckDue is set when the skills from GitHub weren't checked for
 	// updates since magpie started, or not for a while: the page checks
 	// them as it shows them (#1449)
@@ -559,16 +752,59 @@ func readView(problems []Problem, glance bool) (*View, error) {
 	// a skill whose app moved it to its new version's folder is linked
 	// there (skill_moved.go); what was kept of the links is let go then,
 	// for the rest of the read to see the new one
-	if l.followMovedSkills() {
+	moved := l.followMovedSkills()
+	if l.markDangling() || moved {
 		forget()
 		forget = readParts()
 		if err := l.save(); err != nil {
 			return nil, err
 		}
 	}
-	// a plugin's tools, a server of their own (plugin_tools.go): saved,
-	// and given to the agents by a sync of their own
-	if l.adoptPlugins() {
+	// a skill that went in beside itself before magpie told the two
+	// apart (skill_beside.go) is folded back on the next read, not only on
+	// the next change: upgrading alone left blog-team beside blog (Refeccd
+	// on X). The agents' links follow at once, as after a change: a
+	// folded copy's folder is gone, and theirs would point at nothing.
+	if slices.ContainsFunc(l.Skills, func(s *Skill) bool { return s.Called != "" && s.Source.remote() }) {
+		if folded := l.foldBeside(); len(folded) > 0 {
+			forget()
+			forget = func() {}
+			if err := l.save(); err != nil {
+				return nil, err
+			}
+			res := l.sync()
+			if err := l.save(); err != nil {
+				return nil, err
+			}
+			problems = append(slices.Clone(problems), res.Problems...)
+			forget = readParts()
+		}
+	}
+	// a skill folder copied into the library's own by hand is listed
+	// (skill_adopt.go, jwaitq on Discord). Not on a glance: bringing one
+	// in reads the agents' skill folders through, which a glance never
+	// waits on (#541); the read after it brings it in
+	if !glance {
+		if adopted, given := l.adoptLibraryFolders(); len(adopted) > 0 {
+			forget()
+			forget = func() {}
+			if err := l.save(); err != nil {
+				return nil, err
+			}
+			if given {
+				res := l.sync()
+				if err := l.save(); err != nil {
+					return nil, err
+				}
+				problems = append(slices.Clone(problems), res.Problems...)
+			}
+			forget = readParts()
+		}
+	}
+	// a plugin's tools, a server of their own (plugin_tools.go), and a
+	// Remote magpie's router (bridge_mcp.go): saved, and given to the
+	// agents by a sync of their own
+	if plugins, bridges := l.adoptPlugins(), l.adoptBridges(); plugins || bridges {
 		if err := l.save(); err != nil {
 			return nil, err
 		}
@@ -581,16 +817,43 @@ func readView(problems []Problem, glance bool) (*View, error) {
 	// the agents are found once for the whole read: finding them looks
 	// through every agent's folders, in WSL too (#1624)
 	targets, asleep := targetsAsleep(false)
-	v := &View{Agents: []AgentView{}, Servers: []ServerView{}, Skills: []SkillView{}, FoundSkills: []FoundSkill{}, Instructions: l.instructionsView(targets, asleep), Dir: Dir(), Backups: BackupDir(), CopySkills: l.CopySkills, SharedSkills: l.SharedSkills, SharedDir: sharedSkillsDir(), MCPHub: l.MCPHub, HubPath: gateway.HubMCPPath, HubNote: settings.Shared().RouterNote, HubName: gateway.HostName(), HubAllTools: settings.Shared().RouterAllTools, Partial: glance}
+	v := &View{Agents: []AgentView{}, Servers: []ServerView{}, Skills: []SkillView{}, FoundSkills: []FoundSkill{}, Instructions: l.instructionsView(targets, asleep), Dir: Dir(), Backups: BackupDir(), CopySkills: l.CopySkills, SharedSkills: l.SharedSkills, SharedDir: sharedSkillsDir(), AutoUpdateSkills: l.AutoUpdateSkills, MCPHub: l.MCPHub, SkillRouter: l.SkillRouter, HubPath: gateway.HubMCPPath, HubNote: settings.Shared().RouterNote, HubName: gateway.HostName(), HubAllTools: settings.Shared().RouterAllTools, HubCode: !settings.Shared().RouterNoCode, HubFindsItself: hubFindsItself(), HubOnDemandOver: gateway.HubOnDemandOver, HubOnDemandQuery: gateway.HubOnDemandQuery, Partial: glance}
+	// each agent's skills folder as it really is, links followed: the
+	// agents reading the same one get copies together (copyWhy)
+	skillsAt := map[*Target]string{}
+	for _, t := range targets {
+		if t.Skills != "" {
+			skillsAt[t] = realDir(t.Skills)
+		}
+	}
 	for _, t := range targets {
 		av := AgentView{ID: t.Agent.ID, Name: t.Agent.Name, Icon: t.Agent.Icon, Instructions: t.Instructions, Skills: t.Skills,
-			SkillsAlso: t.SkillsAlso, Note: t.Note, MCPVia: t.MCPVia, ProjectSkills: ProjectSkillsDir(t.Agent.ID), ProjectMCP: ProjectMCPFile(t.Agent.ID),
+			SkillsAlso: t.SkillsAlso, Note: t.Note, MCPVia: t.MCPVia, ProjectSkills: ProjectSkillsDir(t.Agent.ID), ProjectMCP: ProjectMCPFile(t.Agent.ID), ProjectSubagents: ProjectSubagentsDir(t.Agent.ID), ProjectHooks: ProjectHooksFile(t.Agent.ID),
+			ProjectInstructions: ProjectInstrFile(t.Agent.ID),
+			ProjectOff:          slices.Contains(projectOffAgents, t.Agent.ID), ProjectSkillOff: slices.Contains(projectSkillOffAgents, t.Agent.ID),
 			ProjectNoSSE: ProjectNoSSE(t.Agent.ID)}
 		if t.Skills != "" {
 			_, av.HowOwn = l.SkillHow[t.Agent.ID]
 			av.How, av.MustCopy = l.howOf(t.Agent.ID), t.Copy || t.Desktop != nil
-			if av.MustCopy {
+			var sharers []*Target
+			for _, o := range targets {
+				if o != t && o.Skills != "" && skillsAt[o] == skillsAt[t] {
+					sharers = append(sharers, o)
+				}
+			}
+			av.CopyWhy, av.CopyWith = l.copyWhy(t, sharers)
+			if av.MustCopy || av.CopyWhy == copyShared {
 				av.How = HowCopy
+			}
+			if l.SkillRouter {
+				av.SkillRouter = "on"
+				if why := l.routerWhy(t, av.How == HowCopy); why != "" {
+					av.SkillRouter = why
+				} else if a := l.Applied[t.Agent.ID]; !t.Gone && (a == nil || !a.Router) {
+					// the folder takes it, yet no skill is listed there:
+					// none is ticked for the agent, or each is kept direct
+					av.SkillRouter = routerNone
+				}
 			}
 		}
 		if t.MCP != nil {
@@ -632,6 +895,8 @@ func readView(problems []Problem, glance bool) (*View, error) {
 			v.Agents = append(v.Agents, av)
 		}
 	}
+	// an agent on another computer using the router (remote_agents.go)
+	v.Agents = append(v.Agents, l.remoteViews(v.Agents)...)
 	of := func(what string) map[string]string {
 		m := map[string]string{}
 		for _, p := range problems {
@@ -669,12 +934,23 @@ func readView(problems []Problem, glance bool) (*View, error) {
 		v.Servers = append(v.Servers, sv)
 	}
 	v.Hooks, v.HookAgents = l.hooksView(append(slices.Clone(targets), gone...), asleep, of)
+	v.Env, v.EnvAgents = l.envView(append(slices.Clone(targets), gone...), of)
 	v.Subagents, v.SubagentAgents = l.subagentsView(targets, asleep, of)
+	v.Commands, v.CommandAgents = l.commandsView(targets, asleep, of)
+	v.Rules, v.RuleAgents = l.rulesView(targets, asleep, of)
+	v.Plugins = l.pluginsView()
 	tr := &tracer{}
 	for _, s := range l.Skills {
-		sv := SkillView{Name: s.Name, Agents: append([]string{}, s.Agents...), Icon: skillIcon(s), Problems: of("skill:" + s.Name), Repo: tr.repoOf(s), OffHere: s.OffHere, Note: s.Note}
+		sv := SkillView{Name: s.Name, Bundle: s.Bundle, Agents: append([]string{}, s.Agents...), Icon: skillIcon(s), Problems: of("skill:" + s.Name), Repo: tr.repoOf(s), OffHere: s.OffHere, Note: s.Note, Router: s.Router, Pending: s.Pending}
 		if s.Source != nil {
 			sv.Source, sv.Kind = s.Source.String(), s.Source.Kind
+		}
+		if canPutBack(s) {
+			for _, e := range s.Home.Entries {
+				if !slices.Contains(sv.Back, e.Agent) {
+					sv.Back = append(sv.Back, e.Agent)
+				}
+			}
 		}
 		// linked from a folder elsewhere is what the library's entry is, not
 		// what was written down when it came in: a linked folder moved in by
@@ -709,7 +985,7 @@ func readView(problems []Problem, glance bool) (*View, error) {
 			sv.Origin = o.String()
 		}
 		if m, ok := readMeta(skillDir(s.Name)); ok {
-			sv.Description = m.Description
+			sv.Description, sv.Manual = m.Description, m.Manual
 		} else {
 			sv.Missing = true
 		}
@@ -722,8 +998,13 @@ func readView(problems []Problem, glance bool) (*View, error) {
 	for i := range v.FoundServers {
 		v.FoundServers[i].Icon = serverIcon(l, v.FoundServers[i].Server)
 	}
+	v.FoundHooks = foundHooksOf(l, targets)
 	v.NewSkills = newSkills(l)
+	v.CheckFolders = l.addedFromFolders()
 	v.Projects = projectViews(l, problems)
+	if v.ClaudeInstalled = ReadClaudeInstalled(); v.ClaudeInstalled == nil {
+		v.ClaudeInstalled = []ClaudePluginView{}
+	}
 	v.SkillGroups = l.skillGroups()
 	v.CheckDue = checkDue(l)
 	if glance {
@@ -770,10 +1051,22 @@ func SaveServer(old string, s Server) (*Result, error) {
 			if s.DisabledTools == nil {
 				s.DisabledTools = l.MCP[i].DisabledTools
 			}
+			// so do the accounts, which have calls of their own
+			if s.Accounts == nil && s.Account == "" {
+				s.Accounts, s.Account = l.MCP[i].Accounts, l.MCP[i].Account
+				_ = s.checkAccounts()
+			}
 			// a plugin's server stays the plugin's, and on this computer
 			if p := l.MCP[i].Plugin; p != "" && s.Plugin == "" {
 				s.Plugin, s.Local = p, true
 			}
+			// still off, it still knows whom to give it back to
+			if len(s.Agents) == 0 && !s.Hidden {
+				s.Hidden, s.Paused = l.MCP[i].Hidden, l.MCP[i].Paused
+			}
+			// a Remote magpie's router stays its own while it is at the
+			// provider's address and key (bridge_mcp.go)
+			keptBridge(l.MCP[i], &s)
 			l.MCP = slices.Delete(l.MCP, i, i+1)
 			if old != s.Name {
 				l.renameProjectServers(old, s.Name)
@@ -831,29 +1124,22 @@ func serversAgents(names, agents []string, on bool) (*Result, error) {
 				return fmt.Errorf("no server called %s", name)
 			}
 		}
-		mcp := map[string]*mcpFile{}
-		// a stopped distro's agents, by what magpie last knew of them
-		shapes := map[string]*shape{}
+		var r reach
 		if on {
-			ts, asleep := targetsAsleep(false)
-			for _, t := range ts {
-				if t.MCP != nil {
-					mcp[t.Agent.ID] = t.MCP
-				}
-			}
-			for _, a := range asleep {
-				if sh := shapeOf(a); sh != nil {
-					shapes[a.ID] = sh
-				}
-			}
+			r = reachNow(l)
 		}
 		for _, s := range l.MCP {
 			if names != nil && !slices.Contains(names, s.Name) {
 				continue
 			}
+			// an agent's every server leaves out a plugin's hidden from
+			// every agent on the Plugins page; named, it is shown
+			if names == nil && on && s.Hidden {
+				continue
+			}
 			kept := slices.DeleteFunc(slices.Clone(s.Agents), func(a string) bool { return slices.Contains(agents, a) })
 			for _, a := range agents {
-				if on && mcp[a] != nil && mcp[a].supports(s) == nil || on && shapes[a] != nil && shapes[a].reaches(s) {
+				if on && r.takes(a, s) {
 					kept = append(kept, a)
 				} else if on && slices.Contains(s.Agents, a) {
 					kept = append(kept, a) // one it has already stays, whatever it says of it
@@ -863,6 +1149,45 @@ func serversAgents(names, agents []string, on bool) (*Result, error) {
 		}
 		return nil
 	})
+}
+
+// reach is which agents a server can be given: those whose MCP file
+// supports it, a stopped distro's by what magpie last knew of them, and
+// one on another computer (remote_agents.go) any the router serves.
+type reach struct {
+	mcp    map[string]*mcpFile
+	shapes map[string]*shape
+	remote []string
+	order  []string // every agent it knows, as found
+}
+
+func reachNow(l *Library) reach {
+	r := reach{mcp: map[string]*mcpFile{}, shapes: map[string]*shape{}}
+	ts, asleep := targetsAsleep(false)
+	for _, t := range ts {
+		if t.MCP != nil {
+			r.mcp[t.Agent.ID] = t.MCP
+			r.order = append(r.order, t.Agent.ID)
+		}
+	}
+	for _, a := range asleep {
+		if sh := shapeOf(a); sh != nil {
+			r.shapes[a.ID] = sh
+			r.order = append(r.order, a.ID)
+		}
+	}
+	for _, id := range l.RemoteAgents {
+		if r.mcp[id] == nil && r.shapes[id] == nil {
+			r.remote = append(r.remote, id)
+			r.order = append(r.order, id)
+		}
+	}
+	return r
+}
+
+func (r reach) takes(a string, s *Server) bool {
+	return r.mcp[a] != nil && r.mcp[a].supports(s) == nil || r.shapes[a] != nil && r.shapes[a].reaches(s) ||
+		slices.Contains(r.remote, a) && inHub(s, a)
 }
 
 // RemoveServer takes a server out of the library and out of every agent
@@ -921,6 +1246,10 @@ func removeServer(l *Library, name string) error {
 		return fmt.Errorf("no server called %s", name)
 	}
 	k := serverKey(l.MCP[i])
+	if b := l.MCP[i].Bridge; b != "" {
+		// a Remote magpie's router taken out: its editor's switch is off
+		l.BridgesOn = slices.DeleteFunc(l.BridgesOn, func(id string) bool { return id == b })
+	}
 	l.MCP = slices.Delete(l.MCP, i, i+1)
 	for _, p := range l.Projects {
 		delete(p.Servers, name)

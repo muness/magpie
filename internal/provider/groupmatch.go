@@ -21,6 +21,9 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
+
+	"github.com/dlclark/regexp2"
 )
 
 // RegexpPrefix starts a member that is a regular expression over the whole
@@ -28,34 +31,108 @@ import (
 // "(?-i)" in it makes case matter from there on: "re:(?-i)openrouter/.*:FREE".
 const RegexpPrefix = "re:"
 
+// FreePrefix starts a group's member rule that takes, of the models the
+// rest of it matches, only those their catalog marks free (Entry.Free,
+// catalog.Model's: the vendor's or its plugin's own word, as the catalog
+// was last read): "free:workbuddy/*" is WorkBuddy's free models, today's
+// and those its next list marks so (#5903). The flag alone decides: a
+// model listed at $0, at a rate of 0, on an account named Free or with
+// "free" in its id is not taken for one, and the rule is no promise that
+// a request costs nothing — the flag is the catalog's, not the bill's.
+// The rest is a glob, a "re:" pattern or an id, matched as on its own.
+const FreePrefix = "free:"
+
 // IsPattern reports whether a member as typed is a pattern rather than a
-// model's id: a regular expression ("re:…") or a glob with "*" in it. No
-// vendor's model id has a "*" in it, so a glob can't be taken for one.
+// model's id: a regular expression ("re:…"), a free rule ("free:…") or a
+// glob with "*" in it. No vendor's model id has a "*" in it or starts
+// with either prefix, so none can be taken for one.
 func IsPattern(s string) bool {
 	s = strings.TrimSpace(s)
+	return strings.HasPrefix(s, FreePrefix) || isIDPattern(s)
+}
+
+// isIDPattern is IsPattern for a rule over ids alone, as a provider's
+// AutoInclude takes them: a regular expression or a glob.
+func isIDPattern(s string) bool {
 	return strings.HasPrefix(s, RegexpPrefix) || strings.Contains(s, "*")
+}
+
+// matcher is a compiled pattern.
+type matcher interface{ MatchString(string) bool }
+
+// patternTimeout bounds one backtracking match over one id: a pattern that
+// takes longer matches nothing rather than holding the catalog's read.
+const patternTimeout = 100 * time.Millisecond
+
+// backtracking is a pattern Go's regexp can't read, read by regexp2.
+type backtracking struct{ x *regexp2.Regexp }
+
+func (b backtracking) MatchString(s string) bool {
+	ok, err := b.x.MatchString(s)
+	return err == nil && ok
 }
 
 // compilePattern is a pattern as the regexp it means. A glob's "*" is any
 // run of characters, "/" too, and the rest is the id as spelt, in any case
 // ("openrouter/*:free", "*-free"); a regexp must match the whole id, in any
 // case as a glob does unless it says "(?-i)" (usrname1833 on Discord).
-func compilePattern(p string) (*regexp.Regexp, error) {
+func compilePattern(p string) (matcher, error) {
 	if re, ok := strings.CutPrefix(p, RegexpPrefix); ok {
 		if strings.TrimSpace(re) == "" {
 			return nil, fmt.Errorf("%q has no regular expression after %s", p, RegexpPrefix)
 		}
 		x, err := regexp.Compile("(?i)^(?:" + re + ")$")
-		if err != nil {
+		if err == nil {
+			return x, nil
+		}
+		// What Go's regexp can't read, a lookahead most often (maer8824 on
+		// Discord: "re:(?!.*flash).*glm.*", glm but not flash), is read as
+		// the GUI's preview reads it, with backtracking: a pattern Go reads
+		// is never read this way, so its matches stay what they were.
+		y, err2 := regexp2.Compile("(?i)^(?:"+re+")\\z", regexp2.None)
+		if err2 != nil {
 			return nil, fmt.Errorf("%q is not a regular expression magpie can read: %v", p, err)
 		}
-		return x, nil
+		y.MatchTimeout = patternTimeout
+		return backtracking{y}, nil
 	}
 	parts := strings.Split(p, "*")
 	for i, s := range parts {
 		parts[i] = regexp.QuoteMeta(s)
 	}
-	return regexp.Compile("(?i)^" + strings.Join(parts, ".*") + "$")
+	return regexp.MustCompile("(?i)^" + strings.Join(parts, ".*") + "$"), nil
+}
+
+// rule is a group's pattern compiled: the ids it matches, and with free
+// set only the models among them their catalog marks free (FreePrefix).
+type rule struct {
+	ids  matcher
+	free bool
+}
+
+// takes reports whether the rule puts e in its group.
+func (r rule) takes(e Entry) bool {
+	return (!r.free || e.Free) && r.ids.MatchString(e.ID)
+}
+
+// compileRule is a group's pattern as the rule it means: a "free:" one's
+// scope is compiled as a pattern of its own, and each model it matches
+// must be marked free besides.
+func compileRule(p string) (rule, error) {
+	scope, free := strings.CutPrefix(p, FreePrefix)
+	if !free {
+		x, err := compilePattern(p)
+		return rule{ids: x}, err
+	}
+	scope = strings.TrimSpace(scope)
+	switch {
+	case scope == "":
+		return rule{}, fmt.Errorf("%q names no models after %s: free:workbuddy/* is WorkBuddy's models its catalog marks free", p, FreePrefix)
+	case strings.HasPrefix(scope, FreePrefix):
+		return rule{}, fmt.Errorf("%q says %s twice", p, FreePrefix)
+	}
+	x, err := compilePattern(scope)
+	return rule{ids: x, free: true}, err
 }
 
 // CleanPatterns are a group's patterns as they are kept: trimmed, each
@@ -64,13 +141,16 @@ func CleanPatterns(in []string) ([]string, error) {
 	var out []string
 	for _, p := range in {
 		p = strings.TrimPrefix(strings.TrimSpace(p), "magpie/")
+		if scope, ok := strings.CutPrefix(p, FreePrefix); ok {
+			p = FreePrefix + strings.TrimPrefix(strings.TrimSpace(scope), "magpie/")
+		}
 		if p == "" || slices.Contains(out, p) {
 			continue
 		}
 		if !IsPattern(p) {
-			return nil, fmt.Errorf("%q is a model's id, not a pattern: a pattern has a * in it, or starts with %s", p, RegexpPrefix)
+			return nil, fmt.Errorf("%q is a model's id, not a pattern: a pattern has a * in it, or starts with %s or %s", p, RegexpPrefix, FreePrefix)
 		}
-		if _, err := compilePattern(p); err != nil {
+		if _, err := compileRule(p); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -79,9 +159,11 @@ func CleanPatterns(in []string) ([]string, error) {
 }
 
 // PatternMatches reports whether a pattern matches a "provider/model" id.
+// A free rule's scope is matched (FreePrefix): the flag is the model's,
+// not its id's, and a caller asks this of a model the rule took.
 func PatternMatches(pattern, id string) bool {
-	x, err := compilePattern(pattern)
-	return err == nil && x.MatchString(id)
+	r, err := compileRule(pattern)
+	return err == nil && r.ids.MatchString(id)
 }
 
 // matchesIn are the models g's patterns match among entries — the models
@@ -92,10 +174,10 @@ func matchesIn(entries []Entry, g Group) []string {
 	if len(g.Match) == 0 {
 		return nil
 	}
-	var res []*regexp.Regexp
+	var res []rule
 	for _, p := range g.Match {
-		if x, err := compilePattern(p); err == nil {
-			res = append(res, x)
+		if r, err := compileRule(p); err == nil {
+			res = append(res, r)
 		}
 	}
 	named := map[string]bool{}
@@ -108,7 +190,7 @@ func matchesIn(entries []Entry, g Group) []string {
 		if named[e.ID] || slices.Contains(out, e.ID) {
 			continue
 		}
-		if slices.ContainsFunc(res, func(x *regexp.Regexp) bool { return x.MatchString(e.ID) }) {
+		if slices.ContainsFunc(res, func(r rule) bool { return r.takes(e) }) {
 			out = append(out, e.ID)
 		}
 	}
@@ -249,9 +331,9 @@ func PatternHits(g Group) []PatternHit {
 	out := make([]PatternHit, 0, len(g.Match))
 	for _, p := range g.Match {
 		h := PatternHit{Pattern: p}
-		if x, err := compilePattern(p); err == nil {
+		if r, err := compileRule(p); err == nil {
 			for _, e := range entries {
-				if x.MatchString(e.ID) {
+				if r.takes(e) {
 					h.Models++
 				}
 			}

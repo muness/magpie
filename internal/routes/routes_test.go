@@ -79,6 +79,29 @@ func TestSmart(t *testing.T) {
 	}
 }
 
+// Smart passes over a biggest window that can't be used up before it
+// renews any more (Seat.Unreached) and ranks the seat by the next: an
+// Agent Plan whose month renews in 15 days, its week tomorrow, goes before
+// a week renewing in three days once its month is out of reach (#5639),
+// and after it while the month isn't. An Unreached past Soon is harmless.
+func TestSmartPassesAnUnreachedWindow(t *testing.T) {
+	now := time.Now()
+	week := now.Add(3 * 24 * time.Hour)
+	plan := []time.Time{now.Add(15 * 24 * time.Hour), now.Add(24 * time.Hour), now.Add(5 * time.Hour)}
+	for _, c := range []struct {
+		unreached int
+		want      []string
+	}{{0, []string{"weekly", "plan"}}, {1, []string{"plan", "weekly"}}, {5, []string{"weekly", "plan"}}} {
+		s := []Seat{
+			{Key: "weekly", Used: 10, Soon: []time.Time{week, now.Add(5 * time.Hour)}},
+			{Key: "plan", Used: 8, Soon: plan, Unreached: c.unreached},
+		}
+		if got := keys(s, Apply(Smart, "p", s)); !slices.Equal(got, c.want) {
+			t.Errorf("unreached %d: %v, want %v", c.unreached, got, c.want)
+		}
+	}
+}
+
 func keys(s []Seat, order []int) []string {
 	out := make([]string, len(order))
 	for i, j := range order {
@@ -235,5 +258,56 @@ func TestCreditsFirstOfTheSpent(t *testing.T) {
 		if got := keys(s, Apply(st, "p", s)); !slices.Equal(got, []string{"fine", "low", "credits", "spent"}) {
 			t.Errorf("%s: %v", name, got)
 		}
+	}
+}
+
+// A seat whose provider is set to be used first (Seat.Lead) goes ahead of
+// the others Smart weighs it with: an API key's monthly credit before a
+// subscription with room, which renews soonest (hzh_1119 on Discord). One
+// all but used up goes with the others that are, and with none set to
+// lead, Smart goes as it did.
+func TestSmartLeadFirst(t *testing.T) {
+	now := time.Now()
+	s := []Seat{
+		{Key: "plus", Used: 10, Soon: []time.Time{now.Add(2 * time.Hour)}},
+		{Key: "pro", Used: 40, Soon: []time.Time{now.Add(24 * time.Hour)}},
+		{Key: "api", Lead: true},
+		{Key: "api-spent", Lead: true, Used: 99},
+		{Key: "spent", Used: 98},
+	}
+	got := keys(s, Apply(Smart, "p", s))
+	if want := []string{"api", "plus", "pro", "spent", "api-spent"}; !slices.Equal(got, want) {
+		t.Fatalf("Smart with a lead: %v, want %v", got, want)
+	}
+	for i := range s {
+		s[i].Lead = false
+	}
+	got = keys(s, Apply(Smart, "p", s))
+	if want := []string{"plus", "pro", "api", "spent", "api-spent"}; !slices.Equal(got, want) {
+		t.Fatalf("Smart with none set: %v, want %v", got, want)
+	}
+}
+
+// Credits that lapse soon unspent cost nothing to spend: an account whose
+// pool is half used but whose check-in credits end tomorrow goes before a
+// fresher one, the soonest lapse first (kudi3699 on X). A trifle doesn't
+// unbalance the pool, and one running low is not helped by it.
+func TestLeastUsedSpendsLapsingFirst(t *testing.T) {
+	now := time.Now()
+	s := []Seat{{Key: "fresh", Known: true, Used: 20}, {Key: "half", Known: true, Used: 50, Lapsing: 5, Lapse: now.Add(24 * time.Hour)}}
+	if got := keys(s, Apply(LeastUsed, "p", s)); !slices.Equal(got, []string{"half", "fresh"}) {
+		t.Fatalf("lapsing credits not spent first: %v", got)
+	}
+	s = []Seat{{Key: "fresh", Known: true, Used: 20}, {Key: "half", Known: true, Used: 50, Lapsing: 0.05, Lapse: now.Add(24 * time.Hour)}}
+	if got := keys(s, Apply(LeastUsed, "p", s)); !slices.Equal(got, []string{"fresh", "half"}) {
+		t.Fatalf("a trifle unbalanced the pool: %v", got)
+	}
+	s = []Seat{{Key: "a", Known: true, Used: 30, Lapsing: 1, Lapse: now.Add(60 * time.Hour)}, {Key: "b", Known: true, Used: 60, Lapsing: 1, Lapse: now.Add(30 * time.Hour)}}
+	if got := keys(s, Apply(LeastUsed, "p", s)); !slices.Equal(got, []string{"b", "a"}) {
+		t.Fatalf("soonest lapse not first: %v", got)
+	}
+	s = []Seat{{Key: "a", Known: true, Used: 91}, {Key: "b", Known: true, Used: 95, Lapsing: 9, Lapse: now.Add(time.Hour)}}
+	if got := keys(s, Apply(LeastUsed, "p", s)); !slices.Equal(got, []string{"a", "b"}) {
+		t.Fatalf("a low account went first for its lapse: %v", got)
 	}
 }

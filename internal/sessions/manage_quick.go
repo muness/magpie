@@ -57,7 +57,7 @@ func readsWhole(f file, old *state) bool {
 		return true
 	}
 	if f.agent == "codex" && old.Codex == nil {
-		return true
+		return !codexWindowKept(f, old)
 	}
 	return p.claude && old.Claude == nil
 }
@@ -214,9 +214,10 @@ func glance(f file) *state {
 	if isBuddy(f.agent) && s.Cwd == "" {
 		workbuddyMeta(s, f.path)
 	}
-	g := &state{Size: f.size, Mod: f.mod.UnixNano(), ID: s.ID, Cwd: s.Cwd, Title: s.Title, Named: s.Named,
-		Custom: s.Custom, First: s.First, Start: s.Start, Last: f.mod, CodexIdentity: s.CodexIdentity,
-		CodexNickname: s.CodexNickname, Provider: s.Provider}
+	g := &state{Size: f.size, Mod: f.mod.UnixNano(), ID: s.ID, Cwd: s.Cwd, Title: s.Title,
+		Start: s.Start, Last: f.mod.Time(), CodexIdentity: s.CodexIdentity, Provider: s.Provider,
+		StateMore: moreOf(StateMore{Named: s.more().Named, Custom: s.more().Custom, First: s.more().First,
+			CodexNickname: s.more().CodexNickname})}
 	if g.Start.IsZero() || g.Start.After(g.Last) {
 		g.Start = g.Last
 	}
@@ -239,7 +240,8 @@ const tailBytes = 64 << 10
 
 // claudeTail reads the titles at the end of a Claude Code file into s: the
 // one Claude Code gives a session, and one the user gave it, are lines it
-// adds as the session goes on, the last of each the one that stands.
+// adds as the session goes on, the last of each the one that stands. So is
+// /cd's relocated line, naming the folder the session was moved to.
 func claudeTail(s *state, f file) {
 	from := max(f.size-tailBytes, 0)
 	p := parserFor(f.agent)
@@ -247,7 +249,7 @@ func claudeTail(s *state, f file) {
 		if start == from && from > 0 {
 			return true // the end of a line begun before
 		}
-		if bytes.Contains(b, ccTitle) || bytes.Contains(b, ccCustom) {
+		if bytes.Contains(b, ccTitle) || bytes.Contains(b, ccCustom) || bytes.Contains(b, ccRelocatedCwd) {
 			p.line(s, b, true)
 		}
 		return true

@@ -750,6 +750,79 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
   });
 }
 
+// sufeng1894 on X: "怎么codex不能手工调整压缩阈值了？" Codex's own
+// model_auto_compact_token_limit (and its background threshold) in
+// config.toml locked the card, and nothing on it said what to do. A lock
+// magpie can take over now has one action, Let magpie set it: the click
+// asks /api/tune/takeover, and the card then adjusts the limit with Use and
+// Undo. A lock with nothing to take (take unset) offers nothing. In both
+// engines, every language, a phone's width and a desk's.
+const takeLabel = { en: "Let magpie set it", zh: "交给 magpie 设置", "zh-TW": "交給 magpie 設定", ja: "magpie に任せる", de: "magpie festlegen lassen" };
+const takeTune = (taken, take) => ({
+  days: 7,
+  agents: [{ agent: "codex", calls: 2808, advice: [
+    { knob: "compact", setting: taken ? { value: "140000", source: "long", ours: true } : { value: "140000", source: "config", locked: "model_auto_compact_token_limit", ...(take ? { take: true } : {}) },
+      compact: { model: "gpt-5.5", current: 140000, window: 400000, best: 85000, cost: 1.4e9, low: 1.02e9, curve: curve(70000, 400000, 85000), facts },
+      async: { percent: 30, value: 120000, window: 400000, setting: taken ? { value: "80", source: "async", ours: true } : { source: "async", locked: "features.async_compaction.model_async_compact_threshold_percent", ...(take ? { take: true } : {}) } } },
+  ] }],
+});
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  test(`${engine}: Codex's own limit in config.toml is handed to magpie on a click`, async (t) => {
+    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+    const errors = [];
+    t.after(() => browser.close());
+    for (const lang of Object.keys(heading)) for (const [width, height] of [[360, 760], [1100, 760]]) {
+      await t.test(`${lang}, ${width}x${height}`, async () => {
+        const ctx = await browser.newContext({ viewport: { width, height }, reducedMotion: "reduce" });
+        await ctx.addInitScript(() => { try { localStorage.setItem("magpie.usageTab", "context"); } catch {} });
+        const page = await ctx.newPage();
+        page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
+        page.on("pageerror", (e) => errors.push(e.message));
+        const posts = [];
+        let taken = false, take = false;
+        const base = serve(lang, []);
+        await page.route("**/*", (r) => {
+          const p = new URL(r.request().url()).pathname;
+          if (p === "/api/tune") return r.fulfill({ json: takeTune(taken, take) });
+          if (p.startsWith("/api/tune/")) {
+            posts.push({ path: p, ...JSON.parse(r.request().postData()) });
+            if (p === "/api/tune/takeover") taken = true;
+            return r.fulfill({ json: {} });
+          }
+          return base(r);
+        });
+        await page.goto("http://magpie.test/?view=usage");
+        const row = page.locator(".ctx-tune-row").nth(0);
+        const btn = row.locator(".ctx-tune-foot button.ctx-tune-take");
+        // nothing magpie can take: no action
+        await row.locator(".ctx-tune-caveat").first().waitFor();
+        assert.equal(await btn.count(), 0);
+        assert.equal(await row.locator(".ctx-tune-foot button.primary").count(), 0);
+        take = true;
+        await page.evaluate(() => window.loadContext());
+        await btn.waitFor();
+        // one action for both locks
+        assert.equal(await btn.count(), 1);
+        assert.equal(await btn.innerText(), takeLabel[lang]);
+        const over = await page.evaluate(() => {
+          const view = document.querySelector("#view-usage");
+          return view.scrollWidth > view.clientWidth + 1 ? view.scrollWidth + ">" + view.clientWidth : "";
+        });
+        assert.equal(over, "");
+        assert.deepEqual(posts, []);
+        await btn.click();
+        await btn.waitFor({ state: "detached" });
+        assert.deepEqual(posts, [{ path: "/api/tune/takeover", agent: "codex", knob: "compact", model: "", value: "" }]);
+        assert.equal(await btn.count(), 0);
+        assert.equal(await row.locator(".ctx-tune-caveat.ctx-tune-async").count(), 0);
+        await ctx.close();
+      });
+    }
+    assert.deepEqual(errors, []);
+  });
+}
+
 // hoobnn on Discord (11-01): over 7 or 30 days, Use on Codex's window did
 // nothing. Those ranges held a model with a Compact at of its own (430K),
 // which "Now" was read from, so a Use moved Codex's other models and the
@@ -895,6 +968,132 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await go.waitFor();
         assert.equal(await go.innerText(), use170[lang]);
         assert.deepEqual(posts.map((b) => [b.path, b.agent, b.knob, b.value]), [["/api/tune/apply", "codex", "compact", "170000"], ["/api/tune/undo", "codex", "compact", ""]]);
+        await ctx.close();
+      });
+    }
+    assert.deepEqual(errors, []);
+  });
+}
+
+// a setting tune put in stays on the card with its Undo when the range has
+// too few calls to advise on, or none (linkaww on Discord: Claude Code's
+// cache put at 1 hour, and Today showed no way back to 5 minutes)
+const few = { en: "Not enough calls in this range to tune on", zh: "这段时间的调用太少，还算不出建议", "zh-TW": "這段時間的呼叫太少，還算不出建議", ja: "この期間は呼び出しが少なく、まだ調整できません", de: "Zu wenige Aufrufe in diesem Zeitraum zum Abstimmen" };
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  test(`${engine}: a setting put in keeps its Undo with too few calls`, async (t) => {
+    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+    const errors = [];
+    t.after(async () => {
+      if (errors.length) console.log(errors);
+      await browser.close();
+    });
+    for (const lang of Object.keys(few)) for (const [width, height] of [[360, 760], [1100, 760]]) {
+      await t.test(`${lang}, ${width}x${height}`, async () => {
+        const ctx = await browser.newContext({ viewport: { width, height }, reducedMotion: "reduce" });
+        await ctx.addInitScript(() => { try { localStorage.setItem("magpie.usageTab", "context"); } catch {} });
+        const page = await ctx.newPage();
+        page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
+        page.on("pageerror", (e) => errors.push(e.message));
+        const posts = [];
+        const base = serve(lang, posts);
+        let put = true;
+        await page.route("**/*", async (r) => {
+          const p = new URL(r.request().url()).pathname;
+          if (p === "/api/tune/undo") put = false;
+          if (p !== "/api/tune") return base(r);
+          const advice = put ? [
+            { knob: "cache_ttl", setting: { value: "1h", source: "settings", ours: true }, few: true },
+            { knob: "compact", model: "claude-opus-5-5", setting: { value: "300000", source: "model", ours: true }, few: true },
+          ] : [];
+          return r.fulfill({ json: { days: 1, agents: put ? [{ agent: "claude", calls: 3, advice }] : [] } });
+        });
+        await page.goto("http://magpie.test/?view=usage");
+        const rows = page.locator(".ctx-tune-row");
+        await rows.first().waitFor();
+        assert.equal(await rows.count(), 2);
+        for (const i of [0, 1]) {
+          assert.equal(await rows.nth(i).locator(".ctx-tune-why").innerText(), few[lang]);
+          assert.equal(await rows.nth(i).locator("button").count(), 1, `row ${i}: Undo only`);
+          assert.equal(await rows.nth(i).locator(".ctx-tune-chart svg").count(), 0, `row ${i}: no curve`);
+          assert.doesNotMatch(await rows.nth(i).innerText(), /NaN|undefined/);
+        }
+        assert.match(await rows.nth(0).innerText(), { en: /1 hour/i, zh: /1 小时/, "zh-TW": /1 小時/, ja: /1 時間/, de: /1 Stunde/ }[lang]);
+        const over = await page.evaluate(() => {
+          const view = document.querySelector("#view-usage");
+          return view.scrollWidth > view.clientWidth + 1 ? view.scrollWidth + ">" + view.clientWidth : "";
+        });
+        assert.equal(over, "");
+        await rows.nth(0).locator("button").evaluate((b) => b.click());
+        await page.waitForFunction(() => document.querySelectorAll(".ctx-tune-row").length == 0);
+        assert.deepEqual(posts.map((p) => [p.path, p.knob]), [["/api/tune/undo", "cache_ttl"]]);
+        await ctx.close();
+      });
+    }
+    assert.deepEqual(errors, []);
+  });
+}
+
+// Claude Code's cache as this computer has it is on the card with no calls
+// read here, whoever set it (linkaww on Discord: through a Remote magpie,
+// "这里什么都没有"): the user's own 1 hour has Use 5 min, which puts in 5m;
+// nothing set reads Default, with nothing to press and no verdict
+const def = { en: "Default", zh: "默认", "zh-TW": "預設", ja: "デフォルト", de: "Standard" };
+const five = { en: /5 min/, zh: /5 分钟/, "zh-TW": /5 分鐘/, ja: /5 分/, de: /5 Min/ };
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  test(`${engine}: the cache here is told with no calls, and a 1 hour of the user's goes back to 5 min`, async (t) => {
+    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+    const errors = [];
+    t.after(async () => {
+      if (errors.length) console.log(errors);
+      await browser.close();
+    });
+    for (const lang of Object.keys(def)) for (const [width, height] of [[360, 760], [1100, 760]]) {
+      await t.test(`${lang}, ${width}x${height}`, async () => {
+        const ctx = await browser.newContext({ viewport: { width, height }, reducedMotion: "reduce" });
+        await ctx.addInitScript(() => { try { localStorage.setItem("magpie.usageTab", "context"); } catch {} });
+        const page = await ctx.newPage();
+        page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
+        page.on("pageerror", (e) => errors.push(e.message));
+        const posts = [];
+        const base = serve(lang, posts);
+        let main = { value: "1h", source: "settings" };
+        await page.route("**/*", async (r) => {
+          const p = new URL(r.request().url()).pathname;
+          if (p === "/api/tune/apply") main = { value: "5m", source: "settings", ours: true };
+          if (p !== "/api/tune") return base(r);
+          return r.fulfill({ json: { days: 1, agents: [{ agent: "claude", calls: 0, advice: [
+            { knob: "cache_ttl", setting: main, few: true },
+            { knob: "subagent_cache_ttl", setting: {}, few: true },
+          ] }] } });
+        });
+        await page.goto("http://magpie.test/?view=usage");
+        const rows = page.locator(".ctx-tune-row");
+        await rows.first().waitFor();
+        assert.equal(await rows.count(), 2);
+        // nothing set: Default, nothing to press, no verdict
+        const sub = rows.nth(1);
+        assert.equal(await sub.locator(".ctx-tune-val.now b").innerText(), def[lang]);
+        assert.equal(await sub.locator("button").count(), 0);
+        assert.equal(await sub.locator(".ctx-chip:visible").count(), 0);
+        assert.equal(await sub.locator(".ctx-tune-why").innerText(), few[lang]);
+        // the user's own hour: Use 5 min, no verdict
+        const one = rows.nth(0);
+        assert.match(await one.locator(".ctx-tune-val.now b").innerText(), { en: /1 hour/i, zh: /1 小时/, "zh-TW": /1 小時/, ja: /1 時間/, de: /1 Stunde/ }[lang]);
+        assert.equal(await one.locator(".ctx-chip:visible").count(), 0);
+        const go = one.locator("button");
+        assert.equal(await go.count(), 1);
+        assert.match(await go.innerText(), five[lang]);
+        for (const r of [one, sub]) assert.doesNotMatch(await r.innerText(), /NaN|undefined|—/);
+        const over = await page.evaluate(() => {
+          const view = document.querySelector("#view-usage");
+          return view.scrollWidth > view.clientWidth + 1 ? view.scrollWidth + ">" + view.clientWidth : "";
+        });
+        assert.equal(over, "");
+        await go.evaluate((b) => b.click());
+        await page.waitForFunction(() => /undo|撤销|復原|取り消す|Rückgängig/i.test(document.querySelector(".ctx-tune-row button")?.textContent || ""));
+        assert.deepEqual(posts.map((p) => [p.path, p.knob, p.value]), [["/api/tune/apply", "cache_ttl", "5m"]]);
         await ctx.close();
       });
     }

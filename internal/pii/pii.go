@@ -2,7 +2,7 @@
 // masking rules can't (internal/redact's Model): a name or an address in
 // free text, a password with nothing around it to say so.
 //
-// It runs one of two models, the user's pick (Choose, Models):
+// Its built-in models are:
 // AstrLink Guard (astrlink.go), a 39 MB int8 token classifier for Chinese
 // and English, run in this process by internal/pii/guard, the default for
 // a user who never had the other; or Privacy Filter, below, which masks
@@ -15,15 +15,21 @@
 // the sha256 pinned here, and the setting (settings.RedactModel) is saved
 // only once both are. pf-serve is started on the first request that needs
 // it, on the GPU where there is one (Metal, Vulkan) and else the CPU, and
-// is ended after a while with none, which lets its memory go.
+// is ended after a while with none (idleAfter), which lets its memory go.
+// On the CPU it maps the model's file rather than reading it in
+// (native/privacy-filter/patches/weights-paged.patch): the weights are
+// the file's pages, which the system can drop under pressure, and what
+// pf-serve holds of its own is ~200-300 MB, not 1.8 GB (#853 in
+// magpie-community/plugins).
 //
 // A process of its own, not linked in: 1.7 GB the gateway would otherwise
 // hold for good, and a GPU driver's crash that would end the gateway with
-// it. One that dies is started again; one that dies on the GPU, doesn't
-// load there in gpuLoadTimeout, or hangs there twice in a row, is started
-// on the CPU until the GPU is tried again (gpuRetryAfter), with no restart
-// of magpie. One that keeps failing holds requests back at once, not
-// after a load each, until it is tried again (retryAfter).
+// it. One that dies is started again, on the GPU too: a driver that reset
+// the GPU (device lost) is got past by a load there. One that dies or hangs
+// on the GPU twice in a row, or doesn't load there in gpuLoadTimeout, is
+// started on the CPU until the GPU is tried again (gpuRetryAfter), with
+// no restart of magpie. One that keeps failing holds requests back at
+// once, not after a load each, until it is tried again (retryAfter).
 package pii
 
 import (
@@ -32,9 +38,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/pii/guard"
 	"github.com/yetone/magpie/internal/redact"
 )
@@ -52,15 +58,15 @@ var (
 // oldTags are the tags pinned before, newest first: one of theirs on disk
 // is run until serveTag's is downloaded (upgrade).
 var (
-	serveTag  = "pf-v3"
-	oldTags   = []string{"pf-v2", "pf-v1"}
+	serveTag  = "pf-v4"
+	oldTags   = []string{"pf-v3", "pf-v2", "pf-v1"}
 	serveBase = "https://github.com/yetone/magpie/releases/download/"
 	serveSHA  = map[string]string{
-		"darwin-amd64":  "5d9277d6852b7e3dcc30d102f43c21bf54a5c3199e0f9f998d965ec7a30ea6d7",
-		"darwin-arm64":  "b45951751bb26633a5ca3827fbf3718f10dfd5c313da6b4f6ba786755353cb4b",
-		"linux-amd64":   "b2b231209d8806648ec8dfe2d7b1a06c4cc273d1de4d50325e7a1638e63c7cc4",
-		"linux-arm64":   "9812356fcb311c351c094aa9a587da3d54166382699b59e9f1c92ab08abae792",
-		"windows-amd64": "8fd8f7295743197311d13ed34aa9fb7be891f4e2586dfda6c4a3335e6cef52f3",
+		"darwin-amd64":  "dc287579abeafe0be0add35305bde05f9cb06405f6b98dda5d71c9bf2c53c2a0",
+		"darwin-arm64":  "da4c89248937221a880996964e76a3dec18a9f8f80f2ee39e1cf26ef0933ac69",
+		"linux-amd64":   "8a7e61e6deebde68b13fc17009c84aef9da2230ea9e696c9e62b32e79c30db00",
+		"linux-arm64":   "0c29b9fdd1452f75414ee5fc623cfec70f4180af5046a9e669a289db7bf3da08",
+		"windows-amd64": "4457116e76d5861b28f26fa15613a943a434d35174f30aa3b8488e76bccc6545",
 	}
 )
 
@@ -70,10 +76,11 @@ func Supported() bool { return serveSHA[target()] != "" }
 // Size is how much turning the model on downloads.
 func Size() int64 { return modelSize }
 
-// dir is where the model and pf-serve are kept: magpie's cache, since
-// either can be downloaded again, and never the settings' folder, which a
-// sync carries to the user's other computers.
-var dir = func() string { return filepath.Join(appdir.Cache(), "privacy-filter") }
+// dir is where the model and pf-serve are kept: in Root, magpie's cache
+// unless the user picked a folder (folder.go), since either can be
+// downloaded again, and never the settings' folder, which a sync carries to
+// the user's other computers.
+var dir = func() string { return filepath.Join(Root(), pfFolder) }
 
 func modelPath() string { return filepath.Join(dir(), modelName()) }
 
@@ -131,14 +138,16 @@ func Installed() bool {
 
 // ErrNotInstalled is what a request gets when the model is on in the
 // settings and isn't on disk (magpie's cache was cleared).
-var ErrNotInstalled = errors.New("the local masking model isn't downloaded; download it again in Settings → Privacy, or turn it off")
+var ErrNotInstalled = errors.New("the local masking model isn't downloaded; download it again in Settings › Privacy, or turn it off")
 
 // Status is what Settings → Privacy shows of the model.
 type Status struct {
-	Model     string `json:"model"`
-	Supported bool   `json:"supported"`
-	Installed bool   `json:"installed"`
-	Size      int64  `json:"size"`
+	Model          string `json:"model"`
+	Name           string `json:"name,omitempty"`
+	ManagedWeights bool   `json:"managedWeights"`
+	Supported      bool   `json:"supported"`
+	Installed      bool   `json:"installed"`
+	Size           int64  `json:"size"`
 	// a download under way, or the last one's error
 	Downloading bool   `json:"downloading,omitempty"`
 	Done        int64  `json:"done,omitempty"`
@@ -155,6 +164,11 @@ type Status struct {
 	GPU      bool   `json:"gpu,omitempty"`
 	LoadMS   int    `json:"loadMs,omitempty"`
 	GPUError string `json:"gpuError,omitempty"`
+	// GPUReset says the GPU was lost to its driver resetting it
+	// (Vulkan's device lost), not to a fault of the model's; GPUAgain
+	// is when the GPU is tried again (Unix ms), while that is ahead
+	GPUReset bool  `json:"gpuReset,omitempty"`
+	GPUAgain int64 `json:"gpuAgain,omitempty"`
 	// why the last request got no answer
 	Failed string `json:"failed,omitempty"`
 	// pf-serve is loading the model, and how many requests wait for it
@@ -165,11 +179,14 @@ type Status struct {
 	// in Go and translated, several times slower than in Apple silicon's
 	// build, which has CoreML too
 	Rosetta bool `json:"rosetta,omitempty"`
+	// Emulated: AstrLink Guard runs in an x64 magpie under Windows on
+	// Arm's emulation, translated as under Rosetta
+	Emulated bool `json:"emulated,omitempty"`
 }
 
 // Now is the model's status.
 func Now() Status {
-	s := Status{Model: PrivacyFilter, Supported: Supported(), Installed: Installed(), Size: modelSize}
+	s := Status{Model: PrivacyFilter, ManagedWeights: true, Supported: Supported(), Installed: Installed(), Size: modelSize}
 	dl.fill(&s)
 	srv.mu.Lock()
 	if srv.h != nil {
@@ -179,13 +196,20 @@ func Now() Status {
 	if s.GPUError == "" {
 		s.GPUError = srv.gpuLost
 	}
+	if srv.cpu && time.Now().Before(srv.gpuAgain) {
+		s.GPUAgain = srv.gpuAgain.UnixMilli()
+	}
 	srv.mu.Unlock()
+	s.GPUReset = deviceLost.MatchString(s.GPUError)
 	s.Waiting = int(waiting.Load())
 	return s
 }
 
 // Remove ends pf-serve and deletes the model and pf-serve.
 func Remove() error {
+	if moving() {
+		return errMoving
+	}
 	Cancel()
 	Stop()
 	dl.mu.Lock()
@@ -206,6 +230,10 @@ type Model interface {
 	ID() string
 	Supported() bool
 	Installed() bool
+	// ManagesWeights reports whether Magpie downloads and can delete the weights.
+	ManagesWeights() bool
+	// Generation distinguishes revisions of a model that share a selection ID.
+	Generation() string
 	// Size is how much turning it on downloads.
 	Size() int64
 	// MinScore is its default threshold: masking drops what it is less
@@ -219,13 +247,31 @@ type Model interface {
 	Cancel()
 	// Warm loads it in the background, where it is on disk.
 	Warm()
-	// Stop lets it go; Remove stops it and deletes it.
+	// Stop lets it go; Remove also deletes weights managed by Magpie.
 	Stop()
 	Remove() error
 }
 
 // Models are the local models, Privacy Filter first.
-func Models() []Model { return []Model{pfModel{}, guardModel{}} }
+func Models() []Model {
+	models := builtInModels()
+	for _, m := range registeredPluginModels() {
+		models = append(models, refreshWeights(m))
+	}
+	return models
+}
+
+func builtInModels() []Model { return []Model{pfModel{}, guardModel{}} }
+
+// ManagedModelInstalled tells whether Magpie previously downloaded a model.
+func ManagedModelInstalled() bool {
+	for _, m := range builtInModels() {
+		if m.Installed() {
+			return true
+		}
+	}
+	return false
+}
 
 // Floor is the lowest threshold a user can set (settings.RedactModelScore):
 // what either model sends is at least this sure. pf-serve's default
@@ -244,8 +290,19 @@ func Threshold(set map[string]float64, m Model) float64 {
 
 // Of is the model id names; AstrLink Guard's for an id there's none of.
 func Of(id string) Model {
-	if id == PrivacyFilter {
+	switch id {
+	case PrivacyFilter:
 		return pfModel{}
+	case AstrLinkGuard:
+		return guardModel{}
+	}
+	if strings.HasPrefix(id, externalPrefix) {
+		for _, model := range registeredPluginModels() {
+			if model.ID() == id {
+				return refreshWeights(model)
+			}
+		}
+		return &externalModel{id: id}
 	}
 	return guardModel{}
 }
@@ -258,6 +315,9 @@ func Of(id string) Model {
 // before there was a choice isn't held back while AstrLink Guard
 // downloads (masking.picked starts that download).
 func Choose(name string, on bool) string {
+	if strings.HasPrefix(name, externalPrefix) {
+		return name
+	}
 	switch name {
 	case PrivacyFilter, AstrLinkGuard:
 		return name
@@ -272,6 +332,8 @@ func Choose(name string, on bool) string {
 type pfModel struct{}
 
 func (pfModel) ID() string                 { return PrivacyFilter }
+func (pfModel) ManagesWeights() bool       { return true }
+func (pfModel) Generation() string         { return "" }
 func (pfModel) Supported() bool            { return Supported() }
 func (pfModel) Installed() bool            { return Installed() }
 func (pfModel) Size() int64                { return Size() }

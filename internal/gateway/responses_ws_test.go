@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -177,6 +178,112 @@ func create(prev, input string, extra ...string) string {
 		f += "," + e
 	}
 	return f + "}"
+}
+
+// A response.create streams whatever it says of stream (#5291):
+// OpenAI's WebSocket mode doesn't use the HTTP field, so a client leaves
+// it out, and the turn went to the provider unstreamed, its reply coming
+// back whole at the end. The provider here holds its reply open after
+// the first delta, which must reach the client before it finishes.
+func TestResponsesSocketStreamsWithoutStreamField(t *testing.T) {
+	fresh(t)
+	for _, path := range []string{"/v1/responses", "/responses"} {
+		for _, stream := range []string{"", `"stream":false,`} {
+			name := path + " " + cmp.Or(stream, "no stream")
+			finish := make(chan struct{}, 1)
+			u := &respUp{}
+			u.reply = func(w http.ResponseWriter, r *http.Request, n int) {
+				item := `{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]}`
+				response := `{"id":"resp_up1","object":"response","status":"completed","output":[` + item + `],"usage":{"input_tokens":300,"output_tokens":50,"total_tokens":350}}`
+				if !gjson.GetBytes(u.body(n-1), "stream").Bool() {
+					w.Header().Set("Content-Type", "application/json")
+					io.WriteString(w, response)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				io.WriteString(w, sse(
+					`data: {"type":"response.created","response":{"id":"resp_up1","object":"response","status":"in_progress","output":[]}}`,
+					`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","status":"in_progress","content":[]}}`,
+					`data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"hello"}`))
+				w.(http.Flusher).Flush()
+				select {
+				case <-finish:
+				case <-r.Context().Done():
+					return
+				}
+				io.WriteString(w, sse(
+					`data: {"type":"response.output_item.done","output_index":0,"item":`+item+`}`,
+					`data: {"type":"response.completed","response":`+response+`}`))
+			}
+			sockUp(t, u)
+			_, ts := sockServer(t)
+			c, _, err := dialSock(t, ts, path, nil)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			c.send(`{"type":"response.create","model":"fake/m1",` + stream + `"store":false,"input":[` + userHi + `]}`)
+			got, err := c.until("response.output_text.delta", "response.completed", "response.failed", "error")
+			if err != nil {
+				close(finish)
+				t.Fatalf("%s: waiting for a text delta: %v after %v", name, err, got)
+			}
+			if delta := last(got); delta.Get("type").String() != "response.output_text.delta" || delta.Get("delta").String() != "hello" {
+				close(finish)
+				t.Fatalf("%s: no text delta before the upstream completed: %v", name, got)
+			}
+			finish <- struct{}{}
+			got, err = c.until("response.completed", "response.failed", "error")
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			end := last(got)
+			if end.Get("type").String() != "response.completed" || end.Get("response.output.0.content.0.text").String() != "hello" || end.Get("response.usage.total_tokens").Int() != 350 {
+				t.Fatalf("%s: completed reply: %v", name, got)
+			}
+			if !gjson.GetBytes(u.body(0), "stream").Bool() {
+				t.Errorf("%s: upstream body %s", name, u.body(0))
+			}
+		}
+	}
+}
+
+// The same on Codex's own route (#5291): a frame without stream reaches
+// the ChatGPT backend as a streamed turn.
+func TestCodexSocketStreamsWithoutStreamField(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	bodies := make(chan []byte, 1)
+	chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		select {
+		case bodies <- b:
+		default:
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		item := `{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}`
+		io.WriteString(w, sse(
+			`data: {"type":"response.created","response":{"id":"resp_c1"}}`,
+			`data: {"type":"response.output_item.done","output_index":0,"item":`+item+`}`,
+			`data: {"type":"response.completed","response":{"id":"resp_c1","usage":{"input_tokens":9,"output_tokens":2}}}`))
+	})
+	_, ts := sockServer(t)
+	h := http.Header{"Authorization": {"Bearer chatgpt-token"}, "Chatgpt-Account-Id": {"acct-1"},
+		"Openai-Beta": {"responses_websockets=2026-02-06"}, "User-Agent": {"codex_cli_rs/0.166.0"}}
+	c, _, err := dialSock(t, ts, CodexPath+"/responses", h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.turn(`{"type":"response.create","model":"gpt-5.5","store":false,"input":[` + userHi + `]}`)
+	if last(got).Get("type").String() != "response.completed" {
+		t.Fatalf("%v", got)
+	}
+	select {
+	case b := <-bodies:
+		if !gjson.GetBytes(b, "stream").Bool() {
+			t.Errorf("sent to ChatGPT unstreamed: %s", b)
+		}
+	default:
+		t.Fatal("nothing reached ChatGPT")
+	}
 }
 
 // Codex's socket is served (#4058): the upgrade is taken on each
@@ -563,6 +670,65 @@ func TestResponsesSocketDrains(t *testing.T) {
 	}
 }
 
+// Codex continues a turn on its socket by previous_response_id and sends
+// no turn state, the socket being the turn's routing; magpie sends each
+// request on whole, so the state the turn's last reply said goes with it,
+// as Codex sends it over HTTP. A new turn starts without it.
+func TestCodexSocketKeepsTurnState(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	var mu sync.Mutex
+	var heads []http.Header
+	n := 0
+	chatgpt(t, func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		mu.Lock()
+		heads = append(heads, r.Header.Clone())
+		n++
+		id := fmt.Sprintf("resp_k%d", n)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("X-Codex-Turn-State", "ts-"+id)
+		item := `{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}`
+		io.WriteString(w, sse(
+			`data: {"type":"response.created","response":{"id":"`+id+`"}}`,
+			`data: {"type":"response.output_item.done","output_index":0,"item":`+item+`}`,
+			`data: {"type":"response.completed","response":{"id":"`+id+`","usage":{"input_tokens":9,"output_tokens":2}}}`))
+	})
+	_, ts := sockServer(t)
+	h := http.Header{"Authorization": {"Bearer chatgpt-token"}, "Chatgpt-Account-Id": {"acct-1"},
+		"Openai-Beta": {"responses_websockets=2026-02-06"}, "User-Agent": {"codex_cli_rs/0.165.0"}}
+	c, _, err := dialSock(t, ts, CodexPath+"/responses", h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := func(prev, turn, input string) string {
+		f := `{"type":"response.create","model":"gpt-5.5","stream":true,"store":false,"input":[` + input + `],` +
+			`"client_metadata":{"turn_id":"` + turn + `"}`
+		if prev != "" {
+			f += `,"previous_response_id":"` + prev + `"`
+		}
+		return f + "}"
+	}
+	prev := ""
+	for _, turn := range []string{"t1", "t1", "t2"} {
+		got := c.turn(frame(prev, turn, userHi))
+		if last(got).Get("type").String() != "response.completed" {
+			t.Fatalf("%v", got)
+		}
+		prev = last(got).Get("response.id").String()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(heads) != 3 {
+		t.Fatalf("%d calls", len(heads))
+	}
+	for i, want := range []string{"", "ts-resp_k1", ""} {
+		if got := heads[i].Get("X-Codex-Turn-State"); got != want {
+			t.Errorf("request %d: turn state %q, want %q", i+1, got, want)
+		}
+	}
+}
+
 // Codex's own route serves its socket too: each turn goes to the ChatGPT
 // backend as Codex's HTTP turn would, the sign-in, the turn state and the
 // whole conversation with it, and the reply's headers come back as the
@@ -600,7 +766,7 @@ func TestCodexSocketServed(t *testing.T) {
 	})
 	_, ts := sockServer(t)
 	h := http.Header{"Authorization": {"Bearer chatgpt-token"}, "Chatgpt-Account-Id": {"acct-1"},
-		"Openai-Beta": {"responses_websockets=2026-02-06"}}
+		"Openai-Beta": {"responses_websockets=2026-02-06"}, "User-Agent": {"codex_cli_rs/0.166.0"}}
 	c, resp, err := dialSock(t, ts, CodexPath+"/responses", h)
 	if err != nil {
 		code := 0
@@ -658,6 +824,11 @@ func TestCodexSocketServed(t *testing.T) {
 		hd.Get("X-Codex-Turn-State") != "ts-prev" || strings.Contains(hd.Get("Openai-Beta"), "responses_websockets") {
 		t.Errorf("headers %v", hd)
 	}
+	// the state in the header alone, which goes on to its account only
+	if gjson.GetBytes(bodies[1], "client_metadata.x-codex-turn-state").Exists() ||
+		gjson.GetBytes(bodies[1], "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite").String() != "true" {
+		t.Errorf("client_metadata: %s", gjson.GetBytes(bodies[1], "client_metadata").Raw)
+	}
 }
 
 // Only Codex's Responses route takes a socket; another of its paths is
@@ -696,5 +867,57 @@ func TestHeldTurnOwnsItsInput(t *testing.T) {
 	items, ok := rs.held("resp_1")
 	if got, _ := json.Marshal(items); !ok || string(got) != want {
 		t.Fatalf("held after the frame was written over: %s", got)
+	}
+}
+
+// A Chat upstream that has said its reply over ([DONE]) and holds the
+// connection open: the turn is completed on the socket all the same, its
+// usage with it, and the socket stays open for the next turn (#5936 — a
+// Codex conversation stuck in progress on a Chat-only provider, the turn
+// canceled by the client after the reply was whole on its side).
+func TestResponsesSocketChatDoneTurn(t *testing.T) {
+	fresh(t)
+	f := &doneHold{held: make(chan struct{})}
+	up := doneHoldUp(t, f)
+	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: "k", Chat: up.URL + "/v1", Models: []string{"m1"}}); err != nil {
+		t.Fatal(err)
+	}
+	_, ts := sockServer(t)
+	c, _, err := dialSock(t, ts, "/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := func(frame string) []gjson.Result {
+		t.Helper()
+		c.send(frame)
+		got, err := c.until("response.completed", "response.failed", "response.incomplete", "error")
+		if err != nil {
+			t.Fatalf("%v after %v", err, got)
+		}
+		return got
+	}
+	got := turn(create("", userHi))
+	if last(got).Get("type").String() != "response.completed" {
+		t.Fatalf("turn 1: %v", got)
+	}
+	var text string
+	for _, fr := range got {
+		if fr.Get("type").String() == "response.output_text.delta" {
+			text += fr.Get("delta").String()
+		}
+	}
+	if text != "hello" {
+		t.Errorf("turn 1 text = %q, want hello", text)
+	}
+	if in, out := last(got).Get("response.usage.input_tokens").Int(), last(got).Get("response.usage.output_tokens").Int(); in != 9 || out != 4 {
+		t.Errorf("turn 1 usage = %d in, %d out, want 9 in and 4 out", in, out)
+	}
+	id := last(got).Get("response.id").String()
+	got = turn(create(id, userMore))
+	if last(got).Get("type").String() != "response.completed" {
+		t.Fatalf("turn 2: %v", got)
+	}
+	if f.calls() != 2 {
+		t.Errorf("%d upstream calls, want 2", f.calls())
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/codexcat"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -47,8 +48,15 @@ func UltraPicks(agent string) []string {
 // Ultrafast: a ChatGPT model that one of Codex's accounts lists the tier
 // on (Account.Tiers), or a plugin's model, with fast mode, that the plugin
 // says its vendor serves at ultrafast (serviceTiers, #2514), or another
-// magpie's model its list offers ultrafast on (#1234). A list that
-// doesn't say tiers offers none.
+// magpie's model its list offers ultrafast on (#1234), or a model OpenAI's
+// API serves at ultrafast on that API (OpenAIUltra), or a GPT model on a
+// provider the user added by its address (OwnFast) that OpenAI offers
+// Ultrafast on: its API serves it so (OpenAIUltra), one of Codex's accounts
+// lists the tier on the model, or Codex's own entry for it does, which
+// Codex is offered on that provider as well (codexcat.OwnOffers; KoiLx0 on
+// X, a relay that serves it). Like
+// its Fast, that is asked for, and a provider that turns the field away is
+// asked again without it. A list that doesn't say tiers offers none.
 func CanUltra(p Provider, model string) bool {
 	return UltraOn(p, model, UltraModels())
 }
@@ -67,7 +75,17 @@ func UltraOn(p Provider, model string, ultra map[string]bool) bool {
 		// another magpie's model it offers Ultrafast on, beside Fast
 		return CanFast(p, model) && slices.Contains(RemoteTiers(p, model), "ultrafast")
 	}
-	return p.Account != nil && p.Account.Agent == "codex" && CanFast(p, model) && ultra[model]
+	if OwnFast(p, model) {
+		slug := modelSlug(model)
+		return ultra[slug] || codexcat.OwnOffers(slug, "ultrafast") || OpenAIUltra(slug)
+	}
+	if p.Account == nil {
+		// OpenAI's own API, on its Responses, for the models its Ultrafast
+		// mode names (OpenAIUltra); a magpie in Docker has no Codex CLI
+		// whose list could say so (OoopsHh on X)
+		return HostOf(p.Responses) == "api.openai.com" && CanFast(p, model) && OpenAIUltra(model)
+	}
+	return p.Account.Agent == "codex" && CanFast(p, model) && ultra[model]
 }
 
 // UltraModels are the models one of Codex's accounts offers Ultrafast on.

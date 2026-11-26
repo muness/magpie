@@ -19,6 +19,7 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/wslrun"
 )
 
 // A WSL distro in NAT networking (WSL's default) reaches Windows at the
@@ -36,34 +37,11 @@ import (
 // of Docker Desktop's, which shares that network, has no key.
 
 // WSLNets are the networks Windows has an address on that WSL distros reach
-// it through: the IPv4 addresses of the vEthernet (WSL) adapters (named
-// "vEthernet (WSL)" or, with the Hyper-V firewall, "vEthernet (WSL (Hyper-V
-// firewall))"), there while WSL's VM runs. None off Windows. A var for the
-// tests.
+// it through (wslrun.Nets): the vEthernet (WSL…) adapters', NAT's and a
+// bridged switch's. None off Windows. A var for the tests.
 var WSLNets = wslNets
 
-func wslNets() []*net.IPNet {
-	if runtime.GOOS != "windows" {
-		return nil
-	}
-	ifs, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-	var out []*net.IPNet
-	for _, i := range ifs {
-		if i.Flags&net.FlagUp == 0 || !strings.Contains(i.Name, "(WSL") {
-			continue
-		}
-		addrs, _ := i.Addrs()
-		for _, a := range addrs {
-			if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil && !n.IP.IsLinkLocalUnicast() {
-				out = append(out, n)
-			}
-		}
-	}
-	return out
-}
+func wslNets() []*net.IPNet { return wslrun.Nets() }
 
 // OnWSLNet says base (an agent's gateway URL) names an address Windows has
 // on a WSL network: where a distro under NAT reaches the gateway.
@@ -82,7 +60,99 @@ func OnWSLNet(base string) bool {
 	if ip == nil {
 		return false
 	}
-	return slices.ContainsFunc(WSLNets(), func(n *net.IPNet) bool { return n.IP.Equal(ip) })
+	return slices.ContainsFunc(WSLNets(), func(n *net.IPNet) bool { return n.IP.Equal(ip) }) || slices.ContainsFunc(WSLVia(), ip.Equal)
+}
+
+// A firewall that keeps WSL off vEthernet (WSL) and can't be opened (a
+// company's 火绒企业版, H1_B1_K1 on X: "我wsl只能通过vEthernet(172开头)访问
+// 主机，而防火墙不允许"), lets the distro reach Windows at its own address on
+// the LAN all the same. A distro under NAT whose way to the gateway on the
+// WSL network is found shut is pointed at such an address of Windows'
+// (agent.wslFindVia), which the gateway, on loopback, then listens at too:
+// the WSL vias, kept in magpie's folder (wsl-via), one address a line.
+// Under NAT a distro's connection to that address comes from the address
+// itself (Windows NATs it, tried on Windows 11 with WSL 2), and nothing
+// else is let in there: a connection from anywhere else (the LAN) is
+// closed as soon as it is taken (viaListener). A request that comes there
+// from Windows' own address or a WSL network, with the WSL key, is this
+// computer's, as on the WSL network (fromWSL).
+
+// WSLVia are the WSL vias (wslrun.Via), and wslTrying those being tried.
+// None off Windows unless the tests serve WSL there. Vars for the tests.
+var WSLVia = func() []net.IP {
+	if runtime.GOOS != "windows" && !wslServeEverywhere {
+		return nil
+	}
+	v, _ := wslrun.Via()
+	return v
+}
+
+var wslTrying = func() []net.IP {
+	if runtime.GOOS != "windows" && !wslServeEverywhere {
+		return nil
+	}
+	_, t := wslrun.Via()
+	return t
+}
+
+// wslViaAll are the vias and those being tried: where the gateway listens.
+func wslViaAll() []net.IP { return append(slices.Clone(WSLVia()), wslTrying()...) }
+
+// SetWSLVia makes via the WSL vias and trying those tried
+// (wslrun.SetVia); the gateway listens at them within wslWatch, at once in
+// this process.
+func SetWSLVia(via, trying []string) error {
+	if err := wslrun.SetVia(via, trying); err != nil {
+		return err
+	}
+	select {
+	case wslLook <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// wslLook asks serveWSL to look again now.
+var wslLook = make(chan struct{}, 1)
+
+// viaListener lets in only connections from Windows' own address it
+// listens at (a NATed distro's), or from a WSL network.
+type viaListener struct{ net.Listener }
+
+func (l viaListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if viaPeer(c.RemoteAddr(), c.LocalAddr()) {
+			return c, nil
+		}
+		c.Close()
+	}
+}
+
+// viaPeer: a connection from peer to local, a WSL via, is let in.
+func viaPeer(peer, local net.Addr) bool {
+	p, ok1 := peer.(*net.TCPAddr)
+	l, ok2 := local.(*net.TCPAddr)
+	if !ok1 || !ok2 {
+		return false
+	}
+	return p.IP.Equal(l.IP) || slices.ContainsFunc(WSLNets(), func(n *net.IPNet) bool { return n.Contains(p.IP) })
+}
+
+// ownIP: this computer has ip on one of its interfaces now. A var for the
+// tests.
+var ownIP = func(ip net.IP) bool {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	return slices.ContainsFunc(addrs, func(a net.Addr) bool {
+		n, ok := a.(*net.IPNet)
+		return ok && n.IP.Equal(ip)
+	})
 }
 
 // wslKeyPrefix starts the WSL key. Neither sk-magpie- (a named gateway
@@ -192,11 +262,49 @@ func fromWSL(r *http.Request) bool {
 	if ip == nil || ip.IsLoopback() || !ok || tcp.IP.IsLoopback() || tcp.IP.IsUnspecified() {
 		return false
 	}
-	if !slices.ContainsFunc(WSLNets(), func(n *net.IPNet) bool { return n.IP.Equal(tcp.IP) && n.Contains(ip) }) {
+	if !slices.ContainsFunc(WSLNets(), func(n *net.IPNet) bool { return n.IP.Equal(tcp.IP) && n.Contains(ip) }) &&
+		!(slices.ContainsFunc(wslViaAll(), tcp.IP.Equal) && viaPeer(&net.TCPAddr{IP: ip}, tcp)) {
 		return false
 	}
 	k := wslKeyHeld()
-	return k != "" && slices.ContainsFunc(callerKeys(r), func(v string) bool { return wslToken(v, k) != "" })
+	if k == "" {
+		return false
+	}
+	if v, _ := r.Context().Value(wslPathKeyCtx{}).(string); wslToken(v, k) != "" {
+		return true
+	}
+	return slices.ContainsFunc(callerKeys(r), func(v string) bool { return wslToken(v, k) != "" })
+}
+
+// wslPathKeyCtx holds the WSL key a request's path began with
+// (takeWSLPathKey).
+type wslPathKeyCtx struct{}
+
+// takeWSLPathKey is r without the WSL key its path begins with, which is
+// kept for fromWSL: /wsl-…/v1/messages is /v1/messages. A client that
+// can't send the key as its own is given it in the address: Claude Science
+// takes only ANTHROPIC_BASE_URL, with no key of magpie's (it sends its
+// Claude sign-in as its bearer), and http there only to a loopback
+// address, so in a distro under NAT it is given the relay magpie runs
+// there (agent/claudescience_wsl.go), http://127.0.0.1:<port>/wsl-…, to
+// this address on the WSL network. A path whose first segment isn't the
+// key is left as it is.
+func takeWSLPathKey(r *http.Request) *http.Request {
+	seg, rest, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
+	if !strings.HasPrefix(seg, wslKeyPrefix) {
+		return r
+	}
+	if wslToken(seg, wslKeyHeld()) == "" {
+		return r
+	}
+	r2 := r.Clone(context.WithValue(r.Context(), wslPathKeyCtx{}, seg))
+	r2.URL.Path = "/" + rest
+	if raw := r2.URL.RawPath; raw != "" {
+		_, rawRest, _ := strings.Cut(strings.TrimPrefix(raw, "/"), "/")
+		r2.URL.RawPath = "/" + rawRest
+	}
+	r2.RequestURI = r2.URL.RequestURI()
+	return r2
 }
 
 // asFromLoopback is r as a request from this computer: from loopback, its
@@ -245,9 +353,15 @@ func (s *Server) serveWSL(ctx context.Context, srv *http.Server) {
 	}()
 	look := func() {
 		want := map[string]bool{}
+		via := map[string]bool{}
 		if s.onLoopback() {
 			for _, n := range WSLNets() {
 				want[net.JoinHostPort(n.IP.String(), Port())] = true
+			}
+			for _, ip := range wslViaAll() {
+				if a := net.JoinHostPort(ip.String(), Port()); !want[a] && ownIP(ip) {
+					want[a], via[a] = true, true
+				}
 			}
 		}
 		for a, ln := range lns {
@@ -265,6 +379,9 @@ func (s *Server) serveWSL(ctx context.Context, srv *http.Server) {
 				log.Printf("gateway: can't listen for WSL at %s: %v", a, err)
 				continue
 			}
+			if via[a] {
+				ln = viaListener{ln}
+			}
 			lns[a] = ln
 			go srv.Serve(ln)
 		}
@@ -277,6 +394,8 @@ func (s *Server) serveWSL(ctx context.Context, srv *http.Server) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			look()
+		case <-wslLook:
 			look()
 		}
 	}

@@ -15,7 +15,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -24,9 +23,11 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/ghtoken"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/libc"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/source"
+	"github.com/yetone/magpie/internal/stall"
 )
 
 // BunVersion is the Bun magpie downloads to run plugins with the first
@@ -122,7 +123,7 @@ func bunExe() string {
 // missingLibRe finds what a musl Linux's loader says when a program needs
 // a library the system lacks: "Error loading shared library
 // libstdc++.so.6: No such file or directory (needed by …)".
-var missingLibRe = regexp.MustCompile(`Error loading shared library ([^:\s]+)`)
+var missingLibRe = lazyre.New(`Error loading shared library ([^:\s]+)`)
 
 // missingLibs says which libraries a bun that started couldn't be linked
 // with lacks, from what it printed, "" when that isn't why it failed. Bun's
@@ -241,22 +242,27 @@ func wontLoad(bun string, err error) *BunUnstartableError {
 
 // Bun is the bun to run plugins with: $MAGPIE_BUN when set, else the one
 // magpie downloaded and keeps up to date, downloading it now when there
-// is none yet.
+// is none yet (tried again when a download failed before), for as long as
+// ctx lets it wait. The download goes on in the background when ctx ends
+// first (bunready.go); the plugin host asks hostBun, which waits less.
 func Bun(ctx context.Context) (string, error) {
 	if b := os.Getenv("MAGPIE_BUN"); b != "" {
 		return b, nil
 	}
-	bunMu.Lock()
-	defer bunMu.Unlock()
-	v := inUseLocked()
-	exe := bunExeOf(v)
-	if haveBun(v) {
+	v, exe, ok := bunAtHand()
+	if ok {
 		return exe, nil
 	}
-	if err := downloadBun(ctx, v, exe); err != nil {
-		return "", fmt.Errorf("downloading Bun %s to run plugins: %w", v, err)
+	f := fetchBun(v, exe, true)
+	select {
+	case <-f.done:
+		if f.err != nil {
+			return "", fmt.Errorf("downloading Bun %s to run plugins: %w", v, f.err)
+		}
+		return f.got, nil
+	case <-ctx.Done():
+		return "", f.notReady(ctx.Err())
 	}
-	return exe, nil
 }
 
 // HasBun is whether a Bun is at hand without a download.
@@ -342,7 +348,28 @@ func getURLOfficial(ctx context.Context, url string, limit int64) ([]byte, error
 	return getURLFrom(ctx, url, limit, false)
 }
 
+// getURLFrom reads url, once more over HTTP/1.1 when the connection broke
+// off (netproxy.AgainOverHTTP1): Bun's zip is tens of MB, which a proxy
+// that cuts HTTP/2 streams part way breaks on each try over HTTP/2.
 func getURLFrom(ctx context.Context, url string, limit int64, mirror bool) ([]byte, error) {
+	ctx = netproxy.Downloads(ctx)
+	var b []byte
+	err := netproxy.AgainOverHTTP1(ctx, func(ctx context.Context) (err error) {
+		b, err = getURLOnce(ctx, url, limit, mirror)
+		return err
+	})
+	return b, err
+}
+
+// downloadStall is how long a download from Bun's release waits for its
+// next byte; there is no bound on the whole, so a slow link still moving
+// finishes (#5572). A var for tests.
+var downloadStall = 60 * time.Second
+
+func getURLOnce(ctx context.Context, url string, limit int64, mirror bool) (b []byte, err error) {
+	ctx, w := stall.Start(ctx, downloadStall)
+	defer w.Stop()
+	defer func() { err = w.Err(err) }()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -362,7 +389,7 @@ func getURLFrom(ctx context.Context, url string, limit int64, mirror bool) ([]by
 	if res.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%s: %s", url, res.Status)
 	}
-	b, err := io.ReadAll(io.LimitReader(res.Body, limit+1))
+	b, err = io.ReadAll(io.LimitReader(w.Reader(res.Body), limit+1))
 	if err != nil {
 		return nil, err
 	}
@@ -381,7 +408,14 @@ func getURLFrom(ctx context.Context, url string, limit int64, mirror bool) ([]by
 var bunCommand = func(ctx context.Context, bun, dir string, args ...string) *exec.Cmd {
 	cmd := command(ctx, bun, args...)
 	cmd.Dir = dir
-	cmd.Env = append(netproxy.EnvForBun(env()), "BUN_INSTALL_CACHE_DIR="+installCacheDir())
+	// bun run is the host, whose requests are the plugins' own to their
+	// vendors: magpie's proxy. Every other command downloads plugins, and
+	// takes plugin downloads' proxy (dlEnv).
+	e := dlEnv()
+	if len(args) > 0 && args[0] == "run" {
+		e = env()
+	}
+	cmd.Env = append(netproxy.EnvForBun(e), "BUN_INSTALL_CACHE_DIR="+installCacheDir())
 	cmd.Env = append(cmd.Env, caEnv(cmd.Env, dir)...)
 	cmd.Env = append(cmd.Env, registryEnv(cmd.Env)...)
 	return cmd

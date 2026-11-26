@@ -21,20 +21,36 @@ import (
 // bare id that is a catalog id already, or that the gateway would take to
 // a model the list doesn't show (a gateway key held to other models, an
 // id like anthropic/claude-x that names a provider of the user's), isn't
-// listed by it.
+// listed by it. A routing group the user made is listed by its own id as
+// well (fast for group/fast, glm-5.2 for group/glm-5.2), where a
+// request for that id reaches the group.
 
 // BareModelIDs says whether /v1/models lists models by their bare ids too.
-func BareModelIDs() bool { return settings.Load().BareModelIDs }
+func BareModelIDs() bool { return settings.Shared().BareModelIDs }
 
-// SetBareModelIDs turns settings.BareModelIDs on or off. The list is built
-// for each request, so the next one has the bare ids, or goes without
-// them; no agent's file names a model by one, so none is written again.
-func SetBareModelIDs(on bool) error {
+// BareOnly says whether /v1/models lists a model by its bare id in place
+// of the provider/model ids it stands for (settings.BareModelIDsOnly;
+// qQianye on X), not beside them. See OnlyBare.
+func BareOnly() bool {
+	s := settings.Shared()
+	return s.BareModelIDs && s.BareModelIDsOnly
+}
+
+// SetBareModelIDs turns settings.BareModelIDs on, beside the provider/model
+// ids, or off.
+func SetBareModelIDs(on bool) error { return SetBareIDs(on, false) }
+
+// SetBareIDs sets settings.BareModelIDs to on and BareModelIDsOnly to only
+// (which off clears). The list is built for each request, so the next one
+// has the bare ids, or goes without them; no agent's file names a model by
+// one, so none is written again.
+func SetBareIDs(on, only bool) error {
+	only = on && only
 	s := settings.Load()
-	if s.BareModelIDs == on {
+	if s.BareModelIDs == on && s.BareModelIDsOnly == only {
 		return nil
 	}
-	s.BareModelIDs = on
+	s.BareModelIDs, s.BareModelIDsOnly = on, only
 	return settings.Save(s)
 }
 
@@ -46,7 +62,8 @@ type Bare struct {
 }
 
 // BareEntries are the rows a list of shown adds for the bare ids, in the
-// order the models first appear in shown, each once.
+// order the models first appear in shown, each once, then the routing
+// groups the user made, by their own ids (groupBare).
 func BareEntries(shown []Entry) []Bare {
 	defer Hold()()
 	ids := make(map[string]bool, len(shown))
@@ -57,6 +74,7 @@ func BareEntries(shown []Entry) []Bare {
 	all := groupsIn(entries)
 	var out []Bare
 	seen := map[string]bool{}
+	reached := map[int]bool{}
 	for _, e := range shown {
 		m := e.Model
 		if e.Group != "" || m == "" || seen[m] || ids[m] {
@@ -65,9 +83,47 @@ func BareEntries(shown []Entry) []Bare {
 		seen[m] = true
 		if i := bareTarget(shown, all, entries, m); i >= 0 {
 			out = append(out, Bare{ID: m, Of: i})
+			reached[i] = true
+		}
+	}
+	// then each routing group the user made that no model's bare id
+	// reaches, by its own id
+	for j, e := range shown {
+		if e.Group == "" || reached[j] {
+			continue
+		}
+		if b, ok := groupBare(shown, all, entries, ids, seen, j); ok {
+			seen[b.ID] = true
+			out = append(out, b)
 		}
 	}
 	return out
+}
+
+// groupBare is the Bare for the routing group the user made at shown[j]
+// (小八 on Discord: group/fast is long to type into a client), by the id
+// a request for it reaches it by: its own id, fast. Only where that is
+// unambiguous: not for a group magpie found (listed under its model's
+// bare id already, or by its auto/<model>), nor by an id listed already
+// or given to another row, or one GroupFor takes elsewhere.
+//
+// A group named for a model a provider serves (glm-5.2) is listed so
+// too: a request for glm-5.2 reaches the group, GroupFor before Resolve,
+// whether or not the provider's glm-5.2 row is shown. When it is, that
+// row's bare id reaches the group first (BareEntries' reached); when it
+// isn't (the group lists its members alone, Group.Unlists; a provider
+// kept for routing groups; the agent's hidden models), the group's own
+// row carries the id, or Only left group/glm-5.2 (小八 on Discord).
+func groupBare(shown []Entry, all []Group, entries []Entry, ids, seen map[string]bool, j int) (Bare, bool) {
+	e := shown[j]
+	id := e.Group
+	if !e.Named || id == "" || e.ID != GroupPrefix+id || strings.Contains(id, "/") || ids[id] || seen[id] {
+		return Bare{}, false
+	}
+	if i := bareTarget(shown, all, entries, id); i < 0 || shown[i].Group != id {
+		return Bare{}, false
+	}
+	return Bare{ID: id, Of: j}, true
 }
 
 // bareTarget is the index in shown of the entry a request for the bare id
@@ -107,4 +163,42 @@ func BareEntry(shown []Entry, id string) (Entry, bool) {
 		}
 	}
 	return Entry{}, false
+}
+
+// OnlyBare is the list of shown with bare ids alone (BareOnly): each Bare
+// of bares in the place of the first row it stands for, and the other
+// rows it stands for left out. A Bare stands for the row a request for it
+// reaches (a routing group found for the model, auto/glm-5.3, is that
+// model's under another prefix), and for a provider's row of the same
+// model when the request reaches that model: by that group, or by the
+// provider first in the Providers order serving it by that id. A row it
+// doesn't reach (a vendor/model id that names another provider of the
+// user's, so a request for it goes there) and any other group's row stay,
+// by their ids, so no model is lost from the list. Each row is its index
+// in shown, and the bare id it is listed by, or "".
+func OnlyBare(shown []Entry, bares []Bare) (rows []int, ids []string) {
+	by := make(map[string]int, len(bares))
+	reached := make(map[int]int, len(bares))
+	for i, b := range bares {
+		by[b.ID] = i
+		reached[b.Of] = i
+	}
+	placed := make([]bool, len(bares))
+	for j, e := range shown {
+		i, ok := reached[j]
+		if !ok && e.Group == "" {
+			if i, ok = by[e.Model]; ok {
+				to := shown[bares[i].Of]
+				ok = to.Group != "" || to.Model == e.Model
+			}
+		}
+		switch {
+		case !ok:
+			rows, ids = append(rows, j), append(ids, "")
+		case !placed[i]:
+			placed[i] = true
+			rows, ids = append(rows, bares[i].Of), append(ids, bares[i].ID)
+		}
+	}
+	return rows, ids
 }

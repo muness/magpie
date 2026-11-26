@@ -7,14 +7,10 @@
 // from that frame only, and the window answers only what the page may:
 // the theme, its own options, and the reads its package declared
 // (magpie.permissions), which /api/plugin-pages/read checks again.
-// A page that throws, or never says hello, shows the kernel's "This
-// page stopped working" with its Try again.
 //
 // Panels (magpie.panels, P5) are framed the same way in a page's
-// .plugin-slot, as tall as they draw, and one that breaks says so in its
-// place. A page may take a built-in one's place (magpie.page.replaces),
-// and its actions (magpie.actions, P6) are row menu items that open it:
-// plugin-runtime.md says the rest.
+// .plugin-slot, as tall as they draw. plugin-runtime.md says the rest:
+// a page broken, in a built-in one's place, opened by an action, shared.
 (() => {
   if (mode !== "window") return;
   // how long a page has to say hello before it is taken as broken
@@ -87,7 +83,7 @@
     f.setAttribute("referrerpolicy", "no-referrer");
     f.setAttribute("allow", "");
     f.title = titled(p.entry);
-    f.src = p.entry.url;
+    f.src = framed(p.entry.url);
     p.frame = f;
     p.hello = false;
     p.shown = true;
@@ -145,6 +141,14 @@
         if (!e.reads.includes(name)) throw new Error(t("{name} doesn't ask to read {what}", { name: titled(e), what: name }));
         return api("plugin-pages/read", { spec: e.spec, read: name, params: m.params?.params || {} });
       }
+      case "asset":
+        return import("./pageshare.js").then(() => pageAsset(e.url, m.params?.url));
+      // pluginlink.js says when a page may
+      case "plugin.open":
+        return import("./pluginlink.js").then((x) => x.fromPage(p, m));
+      case "image.copy":
+      case "image.save":
+        return import("./pageshare.js").then(() => pageShare(e.spec, m.method === "image.save", m.params));
     }
     throw new Error(t("No such call: {what}", { what: String(m.method) }));
   }
@@ -189,12 +193,16 @@
     b.dataset.view = e.key;
     b.dataset.pluginPage = "";
     if (e.icon) {
-      const img = document.createElement("img");
-      img.className = "nav-ic";
+      // a mark in one near-black or near-white tone, as a currentColor
+      // SVG is in an <img> (black), is drawn in the tab's own ink, as the
+      // built-in pages' marks are (shannnnnks on X: Day card's was black
+      // on the dark sidebar); a coloured picture is drawn as it is
+      const box = el("i", "nav-ic nav-pic"), img = el("img");
       img.src = e.icon;
       img.alt = "";
-      img.width = img.height = 16;
-      b.append(img);
+      box.append(img);
+      b.append(box);
+      toneCheck(img);
     } else {
       const s = svg(PUZZLE, 16, 1.5);
       s.classList.add("nav-ic");
@@ -202,8 +210,24 @@
       b.append(s);
     }
     b.append(el("span", "", titled(e)));
-    b.onclick = () => { show(e.key); b.blur(); };
+    b.onclick = () => { if (b.dataset.dragged) return; show(e.key); b.blur(); };
+    b.addEventListener("pointerdown", (ev) => hold(b, ev));
     return b;
+  }
+
+  // a tab is taken up as it is pressed and moved, as its grip says (the
+  // owner: a press held 400ms first was a drag that never started); a press
+  // let go where it was is a click (dragRows)
+  function hold(b, ev) {
+    if (!document.body.classList.contains("side-nav")) return;
+    const nav = $("#nav");
+    const rows = [...nav.querySelectorAll("button[data-plugin-page]")].filter((x) => !pages.get(x.dataset.view)?.entry.replaces);
+    dragRows(ev, b, b, nav, rows, (to) => {
+      const rest = rows.filter((x) => x !== b);
+      rest.splice(to, 0, b);
+      rows[to][to > rows.indexOf(b) ? "after" : "before"](b);
+      api("plugin-pages/arrange", { order: rest.map((x) => x.dataset.view) }).catch((err) => { statusErr(err); load(); });
+    });
   }
 
   async function load() {
@@ -327,6 +351,14 @@
     console.error(`[magpie] ${p.entry.name}: panel ${p.entry.key}: ${why}`);
   }
 
+  // The address a frame loads: a browser's page names its own origin in
+  // it (the frame sends no Referer), as the server's policy for the frame
+  // can't know the address a reverse proxy that keeps no Host serves it
+  // at. The desktop window's scheme is the server's own to name.
+  function framed(url) {
+    return /^https?:$/.test(location.protocol) ? url + (url.includes("?") ? "&" : "?") + "_o=" + encodeURIComponent(location.origin) : url;
+  }
+
   // a panel's frame in body, told context once it says hello
   function panelFrame(e, context, body) {
     const f = document.createElement("iframe");
@@ -335,7 +367,7 @@
     f.setAttribute("referrerpolicy", "no-referrer");
     f.setAttribute("allow", "");
     f.title = titled(e);
-    f.src = e.url;
+    f.src = framed(e.url);
     const p = { entry: e, frame: f, context, body, hello: false, broken: false };
     p.timer = setTimeout(() => { if (!p.hello) panelBroke(p, t("{name}'s page didn't answer", { name: titled(e) })); }, HELLO_MS);
     panels.set(f, p);
@@ -346,11 +378,13 @@
   // changed, so a panel already open goes on as it is
   function fill(box) {
     const name = box.dataset.slot;
-    const list = panelList.filter((e) => e.slot === name);
+    const context = box.pluginContext || {};
+    // a provider panel of a plugin that gives providers is in their
+    // editors only
+    const list = panelList.filter((e) => e.slot === name && (e.providers?.includes(context.provider?.id) ?? 1));
     const sig = list.map((e) => e.key + " " + e.url + " " + titled(e)).join("|");
     if (box.dataset.sig === sig && box.childElementCount === list.length) return;
     box.dataset.sig = sig;
-    const context = box.pluginContext || {};
     const parts = list.map((e) => {
       const sec = el("section", "plugin-panel");
       sec.dataset.panel = e.key;

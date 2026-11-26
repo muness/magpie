@@ -26,7 +26,7 @@ var notAnAgent = map[string]string{
 	"USER":                  "the process' own",
 	"XDG_CONFIG_HOME":       "magpie's own folder's, which appdir decides",
 	"XDG_DATA_HOME":         "the same",
-	"XDG_DATA_DIRS":         "the system's own data folders, where a .deb puts Lody's desktop entry; a test that reaches agent.OpenLody sets it to its own",
+	"XDG_DATA_DIRS":         "the system's own data folders, where a .deb puts Lody's desktop entry; a test that reaches agent.OpenLody sets it to its own, and DeepSeek Harness Desktop's entries are read there through proc.SystemDirs",
 	"XDG_CACHE_HOME":        "Go's build cache's too, which a sandbox keeps shared; Air's ACP OpenCode under it is found by path in a test's own home (#2423)",
 	"MAGPIE_ADDR":           "magpie's own",
 	"MAGPIE_DEBUG":          "magpie's own debug flag",
@@ -40,6 +40,7 @@ var notAnAgent = map[string]string{
 	"GIT_SSH_COMMAND":     "the same, as a command",
 	"XDG_CURRENT_DESKTOP": "the desktop the user runs, which says whether xdg-mime's answer about an app's links is the whole one (agent.OpenAppLink), not a folder",
 	"TZ":                  "the machine's time zone, which a routing rule's hours fall back to (c888ef272), not a folder",
+	"LAZYCAT_APP_DOMAIN":  "the domain LazyCat serves magpie at, which sharing offers (ac4af5823), not a folder",
 }
 
 // TestFolderVarsAreListed says every variable the packages that find an

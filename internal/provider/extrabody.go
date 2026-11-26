@@ -189,6 +189,28 @@ func (p Provider) WithExtraBody(body []byte, c Conversation) []byte {
 	return bytes.TrimSuffix(out.Bytes(), []byte("\n"))
 }
 
+// ExtraTier is the service_tier the provider's extra body asks for, and
+// whether it is forced ("!service_tier"); "" when it names none, or not as
+// a string. A group's member, or an agent's pick, sent fast on the
+// provider is sent at it when it is Ultrafast: fast is never sent slower
+// than the user asked of the provider (the gateway's member tries).
+func (p Provider) ExtraTier() (tier string, forced bool) {
+	if _, takes := p.extraBodyTakes(); !takes {
+		return "", false
+	}
+	for k, raw := range p.ExtraBody {
+		n, f := extraName(k)
+		if n != "service_tier" {
+			continue
+		}
+		var v string
+		if json.Unmarshal(raw, &v) == nil {
+			return strings.TrimSpace(v), f
+		}
+	}
+	return "", false
+}
+
 // withSession is v with ${sessionId}, ${threadId} and ${subagentId} in its
 // strings, at any depth, as c's ids.
 func withSession(v any, c Conversation) any {
@@ -211,8 +233,13 @@ func withSession(v any, c Conversation) any {
 // out: the extra fields, on a session of the test's own, then what the
 // backend adjusts; ctx carries the same session, for the headers Sign
 // puts on it. The conversation names no subagent, so ${subagentId} in an
-// extra body value goes out filled with "".
-func (p Provider) tested(ctx context.Context, body string) (context.Context, []byte) {
+// extra body value goes out filled with "". A body for an embeddings or
+// rerank url (tinyRetrieval) goes as it is, as the gateway sends one.
+func (p Provider) tested(ctx context.Context, url, body string) (context.Context, []byte) {
 	c := OwnConversation("magpie-test-")
-	return WithConversation(ctx, c), p.Prepare(p.WithExtraBody([]byte(body), c))
+	ctx = WithConversation(ctx, c)
+	if strings.HasSuffix(url, "/embeddings") || strings.HasSuffix(url, "/rerank") {
+		return ctx, []byte(body)
+	}
+	return ctx, p.Prepare(p.WithExtraBody([]byte(body), c))
 }

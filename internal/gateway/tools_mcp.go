@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/gwtool"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/plugin"
 )
 
@@ -45,7 +45,7 @@ var (
 )
 
 // errToolsOff is what a call is answered while plugins/tools is off.
-const errToolsOff = "magpie's Plugin tools plugin is off, so no plugin's tool runs; turn it on in magpie's Settings → Plugins"
+const errToolsOff = "magpie's Plugin tools built-in is off, so no plugin's tool runs; turn it on in magpie's Plugins › Built-in"
 
 func (s *Server) toolsMCP(w http.ResponseWriter, r *http.Request) {
 	serveMCP(w, r, "magpie's plugin tools", "magpie-tools", toolsMCPBody, s.toolsMCPCall)
@@ -58,7 +58,7 @@ type mcpTool struct {
 	name string // <plugin>_<tool>
 }
 
-var unsafeToolChars = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
+var unsafeToolChars = lazyre.New(`[^A-Za-z0-9_-]+`)
 
 // toolPrefix is the plugin's part of its tools' names: its short name
 // (opencode-weather-tools → weather-tools), in the characters MCP clients
@@ -223,9 +223,9 @@ func RunPluginToolOf(ctx context.Context, name, tool string, args json.RawMessag
 func (s *Server) toolsMCPServe(r *http.Request, m mcpMessage, one string, servedTools func(context.Context) ([]mcpTool, error)) (any, map[string]any) {
 	switch m.Method {
 	case "initialize":
-		say := "The tools the plugins added to magpie give, each named <plugin>_<tool>. Add or switch plugins in magpie's Settings → Plugins."
+		say := "The tools the plugins added to magpie give, each named <plugin>_<tool>. Add or switch plugins on magpie's Plugins page."
 		if one != "" {
-			say = "The tools magpie's plugin " + one + " gives. Add or switch plugins in magpie's Settings → Plugins."
+			say = "The tools magpie's plugin " + one + " gives. Add or switch plugins on magpie's Plugins page."
 		}
 		return map[string]any{
 			"protocolVersion": mcpVersion(m),

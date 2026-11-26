@@ -25,6 +25,17 @@
 //   langs      the app languages it is listed in (["zh"]); none is all
 //   from, until  RFC 3339 times bounding when it is listed (the paid term)
 //
+// A partner whose product is a plugin, not a model endpoint, is listed at
+// the top of the Plugins page's Discover instead of in the add sheet:
+//
+//   plugin     its npm package's name ("@acme/magpie-notes"), with no
+//              version; it has no chat, responses, anthropic, regions or
+//              keysUrl. id, name, iconUrl, notes, langs, website, from and
+//              until are as above.
+//
+// At most 12 of each kind are listed. An app from before plugin partners
+// leaves them out, as entries with no endpoint.
+//
 // Every URL is https. An entry that breaks a rule is left out by the app.
 //
 // The app gets keysUrl and website (a region's too) as usemagpie.ai/go/…
@@ -48,10 +59,10 @@ export const PARTNERS = [
     website: "https://www.kimi.com/code?aff=magpie",
     iconUrl: "https://usemagpie.ai/img/partner-kimi.png",
     notes: {
-      en: "One subscription, one K3 quota shared by every agent",
+      en: "One plan, one K3 quota for every agent",
       zh: "一份订阅，所有 agent 共享 K3 额度",
       "zh-TW": "一份訂閱，所有 agent 共享 K3 額度",
-      ja: "1つのサブスクリプションで、すべての agent が K3 の枠を共有",
+      ja: "1つのプランで、全 agent が K3 枠を共有",
       de: "Ein Abo, ein K3-Kontingent für alle Agents",
     },
     from: "2026-10-23T00:00:00+08:00",
@@ -70,13 +81,13 @@ export const PARTNERS = [
     website: "https://apikey.fan/?aff=magpie",
     iconUrl: "https://usemagpie.ai/img/partner-apikeyfan.png",
     notes: {
-      en: "Enterprise-grade AI API gateway to the world's leading models",
-      zh: "企业级 AI 中转站，连接全球主流大模型",
-      "zh-TW": "企業級 AI 中轉站，連接全球主流大模型",
+      en: "Enterprise AI relay to the top models",
+      zh: "企业级 AI 中转，直连全球主流模型",
+      "zh-TW": "企業級 AI 中轉，直連全球主流模型",
     },
     langs: ["zh", "en"],
     from: "2026-10-24T00:00:00+08:00",
-    until: "2026-11-24T00:00:00+08:00",
+    until: "2026-12-24T00:00:00+08:00",
   },
   {
     id: "wandapi",
@@ -88,12 +99,12 @@ export const PARTNERS = [
     website: "https://wandapi.ai",
     iconUrl: "https://usemagpie.ai/img/partner-wandapi.png",
     notes: {
-      en: "Enterprise-grade AI gateway, seamless access to global AI models",
-      zh: "企业级 AI 网关，畅连全球 AI 大模型",
-      "zh-TW": "企業級 AI 閘道，暢連全球 AI 大模型",
+      en: "Enterprise AI gateway to global models",
+      zh: "企业级 AI 网关，畅连全球大模型",
+      "zh-TW": "企業級 AI 閘道，暢連全球大模型",
     },
     from: "2026-10-25T00:00:00+08:00",
-    until: "2026-11-25T00:00:00+08:00",
+    until: "2026-12-25T00:00:00+08:00",
   },
   {
     id: "corecode",
@@ -102,34 +113,35 @@ export const PARTNERS = [
     responses: "https://corecode.live/v1",
     anthropic: "https://corecode.live",
     keysUrl: "https://corecode.live/keys?ref=magpie",
-    website: "https://corecode.live/sign-in?ref=magpie",
+    website: "https://corecode.live/?ref=magpie",
     iconUrl: "https://usemagpie.ai/img/partner-corecode.png",
+    searches: true,
     notes: {
-      en: "Full-strength Claude. Low prices. Enterprise-grade caching. Invoices available. Sign up for magpie and get $3 free.",
-      zh: "满血 Claude，超低折扣，企业级缓存优化，可开票。magpie 用户注册送 $3。",
-      "zh-TW": "滿血 Claude，超低折扣，企業級快取優化，可開票。magpie 用戶註冊送 $3。",
+      en: "High caching full-strength Claude. Get $3 free",
+      zh: "高缓存满血 Claude，可开票，注册送 $3",
+      "zh-TW": "高緩存滿血 Claude，可開票，註冊送 $3",
     },
     from: "2026-10-26T00:00:00+08:00",
-    until: "2026-11-26T00:00:00+08:00",
+    until: "2026-12-26T00:00:00+08:00",
   },
   {
     id: "sidrune",
     name: "Sidrune AI",
     regions: [
-      { id: "cn", name: "China", chat: "https://sidrune.ai/v1", responses: "https://sidrune.ai/v1", anthropic: "https://sidrune.ai", keysUrl: "https://sidrune.ai/register?promo=MAGPIE3", website: "https://sidrune.ai/" },
-      { id: "global", name: "Global", chat: "https://global.sidrune.ai/v1", responses: "https://global.sidrune.ai/v1", anthropic: "https://global.sidrune.ai", keysUrl: "https://global.sidrune.ai/register?promo=MAGPIE3", website: "https://global.sidrune.ai/" },
+      { id: "cn", name: "China", chat: "https://cn.sidrune.ai/v1", responses: "https://cn.sidrune.ai/v1", anthropic: "https://cn.sidrune.ai", keysUrl: "https://cn.sidrune.ai/register?promo=MAGPIE3", website: "https://cn.sidrune.ai/?promo=MAGPIE3" },
+      { id: "global", name: "Global", chat: "https://global.sidrune.ai/v1", responses: "https://global.sidrune.ai/v1", anthropic: "https://global.sidrune.ai", keysUrl: "https://global.sidrune.ai/register", website: "https://global.sidrune.ai/" },
     ],
-    keysUrl: "https://sidrune.ai/register?promo=MAGPIE3",
-    website: "https://sidrune.ai/",
+    keysUrl: "https://cn.sidrune.ai/register?promo=MAGPIE3",
+    website: "https://cn.sidrune.ai/?promo=MAGPIE3",
     iconUrl: "https://usemagpie.ai/img/partner-sidrune.png",
     notes: {
-      en: "Stable Claude API Access with 85% off; $3 free credit upon registration",
-      zh: "低至1.5折，稳定使用满血Claude；注册送$3，可开发票。",
-      "zh-TW": "低至1.5折，穩定使用滿血Claude；註冊送$3，可開發票。",
+      en: "Claude at 85% off",
+      zh: "满血 Claude 低至 1.5 折，中国区注册送 $3",
+      "zh-TW": "滿血 Claude 低至 1.5 折，中國區註冊送 $3",
     },
     langs: ["zh", "en"],
     from: "2026-10-26T00:00:00+08:00",
-    until: "2026-11-26T00:00:00+08:00",
+    until: "2026-12-26T00:00:00+08:00",
   },
   {
     id: "fastai",
@@ -141,9 +153,9 @@ export const PARTNERS = [
     website: "https://www.fastaitoken.com/register?aff=MAGPIE&utm=soft",
     iconUrl: "https://usemagpie.ai/img/partner-fastai.png",
     notes: {
-      en: "One-stop access to Claude, GPT and DeepSeek, from 6% of list price",
-      zh: "Claude / GPT / Deepseek 一站式接入方案，最低0.6折，支持对公",
-      "zh-TW": "Claude / GPT / Deepseek 一站式接入方案，最低0.6折，支援對公",
+      en: "Claude, GPT, DeepSeek from 6% of list",
+      zh: "低至 0.6 折，Claude/GPT/DeepSeek 全有",
+      "zh-TW": "低至 0.6 折，Claude/GPT/DeepSeek 全有",
     },
     from: "2026-10-26T00:00:00+08:00",
     until: "2026-11-26T00:00:00+08:00",

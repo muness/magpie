@@ -55,7 +55,7 @@ func TestSameModelVendorSpellings(t *testing.T) {
 			t.Errorf("%s and %s merged as %s", pair[0], pair[1], sameModel(pair[0]))
 		}
 	}
-	e := func(p, m string) Entry { return Entry{ID: p + "/" + m, Model: m, Name: m, Provider: Provider{ID: p}} }
+	e := func(p, m string) Entry { return Entry{ID: p + "/" + m, Model: m, Name: m, Provider: &Provider{ID: p}} }
 	gs := autoGroups([]Entry{e("volcengine", "deepseek-v4-1-flash-260910"), e("ali-tp", "deepseek-v4.1-flash")}, nil)
 	if len(gs) != 1 || gs[0].ID != "auto-deepseek-v4-1-flash" || !slices.Equal(gs[0].Members, []string{"volcengine/deepseek-v4-1-flash-260910", "ali-tp/deepseek-v4.1-flash"}) {
 		t.Fatalf("groups: %+v", gs)
@@ -63,7 +63,7 @@ func TestSameModelVendorSpellings(t *testing.T) {
 }
 
 // A model whose id no rule matches up with another vendor's is merged
-// with it once the user says, in the provider's Names, prices & levels, which
+// with it once the user says, in the provider's Model settings, which
 // model it is the same as (#583): saved with the provider's Save, kept in
 // settings' ModelSameAs, and taken by the groups magpie finds.
 func TestModelSameAsMergesFoundGroup(t *testing.T) {

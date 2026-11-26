@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -156,5 +157,93 @@ func TestArkHeaderScopedToArk(t *testing.T) {
 	}
 	if ms := mixed.DecisionModels(); len(ms) != 1 || ms[0].ID != ArkDecision {
 		t.Fatalf("decision models: %+v", ms)
+	}
+}
+
+// A user on Discord found no System One endpoint for Volcengine Ark, its
+// preset's or a custom one (OpenAI Responses), and none of its models in
+// a routing group's classifier picker. Ark's pay as you go answers System
+// One on the same key at …/api/v1: a provider asked there, of either
+// protocol, offers Ark's decision model with no URL typed, its chat models
+// picked or not. The Coding and Agent Plans answer it nothing, and a URL
+// the user gave is kept.
+func TestArkPayAsYouGoDecides(t *testing.T) {
+	arkHome(t)
+	const v3, v1 = "https://ark.cn-beijing.volces.com/api/v3", "https://ark.cn-beijing.volces.com/api/v1"
+	for _, p := range []Provider{
+		{ID: "ark-responses", Name: "Ark Responses", Responses: v3 + "/", Key: "ark-1", Models: []string{"doubao-seed-2-1-pro-260628"}},
+		{ID: "ark-chat", Name: "Ark Chat", Chat: v3, Key: "ark-1"},
+		{ID: "ark-preset", Name: "Volcengine Ark", Preset: "volcengine", Chat: v3, Responses: v3, Key: "ark-1", Models: []string{"glm-4-7-251222"}},
+		{ID: "ark-coding", Name: "Ark Coding", Preset: "volcengine", Chat: "https://ark.cn-beijing.volces.com/api/coding/v3", Responses: "https://ark.cn-beijing.volces.com/api/coding/v3", Key: "ark-1", Models: []string{"glm-4-7-251222"}},
+		{ID: "ark-agent", Name: "Ark Agent", Chat: "https://ark.cn-beijing.volces.com/api/plan/v3", Key: "ark-1"},
+		{ID: "ark-own", Name: "Ark Own", Chat: v3, Decide: "https://ark.ap-southeast.volces.com/api/v3", Key: "ark-1"},
+		{ID: "other", Name: "Other", Responses: "https://api.example.com/api/v3", Key: "k"},
+	} {
+		if err := Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := map[string]string{"ark-responses": v1, "ark-chat": v1, "ark-preset": v1, "ark-coding": "", "ark-agent": "", "ark-own": "https://ark.ap-southeast.volces.com/api/v3", "other": ""}
+	for id, d := range want {
+		p, err := Find(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Decide != d {
+			t.Errorf("%s: System One at %q, want %q", id, p.Decide, d)
+		}
+	}
+	var got []string
+	for _, e := range OfferedDeciders(nil) {
+		got = append(got, e.ID)
+	}
+	slices.Sort(got)
+	if w := []string{"ark-chat/" + ArkDecision, "ark-own/" + ArkDecision, "ark-preset/" + ArkDecision, "ark-responses/" + ArkDecision}; !slices.Equal(got, w) {
+		t.Fatalf("classifiers offered: %q, want %q", got, w)
+	}
+}
+
+// solider1394 on X: doubao-seed-2-1-lite-260915, added to an Ark pay as
+// you go provider and asked by Immersive Translate and FluentRead, was
+// "not found", while another gateway served it on the same id. Ark
+// answers it on chat completions as well as System One, so the provider
+// whose System One magpie set (arkSystemOne) serves it to agents too, by
+// its bare id and as provider/model, and offers it as a classifier still.
+// Bailian's decision model, which answers nothing else, stays apart.
+func TestArkDecisionModelChatsToo(t *testing.T) {
+	arkHome(t)
+	const v3 = "https://ark.cn-beijing.volces.com/api/v3"
+	if err := Save(Provider{ID: "ark", Name: "Volcengine Ark", Preset: "volcengine", Chat: v3, Responses: v3, Key: "ark-1",
+		Models: []string{ArkDecision, "glm-4-7-251222"}}); err != nil {
+		t.Fatal(err)
+	}
+	p, err := Find("ark")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.DecidesModel(ArkDecision) || !p.ChatsToo(ArkDecision) || p.OnlyDecides(ArkDecision) || p.ChatsToo("glm-4-7-251222") {
+		t.Fatalf("Ark's decision model: decides %v, chats %v", p.DecidesModel(ArkDecision), p.ChatsToo(ArkDecision))
+	}
+	for _, id := range []string{ArkDecision, "ark/" + ArkDecision} {
+		if got, m, ok := Resolve(id); !ok || got.ID != "ark" || m != ArkDecision {
+			t.Errorf("%s resolved to %q %q %v", id, got.ID, m, ok)
+		}
+	}
+	if !slices.ContainsFunc(providerEntries(), func(e Entry) bool { return e.ID == "ark/"+ArkDecision }) {
+		t.Error("agents aren't offered ark/" + ArkDecision)
+	}
+	if !slices.ContainsFunc(OfferedDeciders(nil), func(e Entry) bool { return e.ID == "ark/"+ArkDecision }) {
+		t.Error("no longer offered as a classifier")
+	}
+	// a chat group can hold it beside other chat models
+	if err := cleanDecisionGroup(&Group{Name: "g", Members: []string{"ark/" + ArkDecision, "ark/glm-4-7-251222"}}, nil); err != nil {
+		t.Errorf("chat group: %v", err)
+	}
+	// System One alone: the decision-only preset, Bailian's, and one the
+	// user set to be asked there
+	only := Provider{ID: "d", Decide: "https://ark.cn-beijing.volces.com/api/v1"}
+	bailian := Provider{ID: "b", Chat: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", Decide: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"}
+	if only.ChatsToo(ArkDecision) || !only.OnlyDecides(ArkDecision) || !bailian.OnlyDecides(BailianDecision) {
+		t.Error("a decision model that answers nothing else taken as a chat model")
 	}
 }

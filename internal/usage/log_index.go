@@ -8,9 +8,11 @@ import (
 	"crypto/sha256"
 	"encoding"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"slices"
@@ -53,7 +55,7 @@ type logSnapshot struct {
 	// probes are the requests magpie sent on its own (SourceProbe), kept
 	// out of blocks: every reader of those counts what it reads, and the
 	// request log alone lists these (queryPage)
-	probes []probeRow
+	probes []*rowChunk
 	// hosts are the providers by the host their calls went to, as the log
 	// recorded them: "" for a host two providers were on. A probe made
 	// while a provider was being added, under its host, is that
@@ -110,6 +112,12 @@ func readLogSnapshot() *logSnapshot {
 	info, err := statLogFile(path)
 	settled := settledLogStamp(info, start)
 	old := logIndex.snapshot
+	if err != nil && !errors.Is(err, fs.ErrNotExist) && old != nil && old.path == path {
+		// A stat that failed but for the log's absence (a busy disk, a share
+		// that blinked) says nothing of the log: the last good read stays, or
+		// every page reads an empty ledger until the next good stat.
+		return old
+	}
 	unchanged := old != nil && old.path == path && (err != nil && old.info == nil || err == nil && sameLogInfo(old.info, info))
 	if unchanged && info != nil {
 		if !old.settled && !settled && old.hash != "" && logChangeStamp(info) != "" {
@@ -154,7 +162,7 @@ func readLogSnapshot() *logSnapshot {
 		next.off, next.first, next.firstOwn = old.off, old.first, old.firstOwn
 		next.blocks = slices.Clone(old.blocks)
 		next.keyProviders = maps.Clone(old.keyProviders)
-		next.probes = slices.Clip(old.probes) // appended to, never written in
+		next.probes = slices.Clone(old.probes) // the last reopened as a copy (probeRows.add)
 		next.hosts = maps.Clone(old.hosts)
 		next.full = old.full
 	} else if old == nil {
@@ -164,22 +172,31 @@ func readLogSnapshot() *logSnapshot {
 			next.off, next.first, next.firstOwn = d.full.off, d.full.first, d.full.firstOwn
 			next.blocks, next.probes = d.blocks, d.probes
 			next.keyProviders, next.hosts = maps.Clone(d.full.keyProviders), maps.Clone(d.full.hosts)
-			logDiskKept(path, d.full.n)
+			logDiskKept(path, d.full.off)
 			if logDiskLoaded != nil {
-				logDiskLoaded(d.full.n)
+				logDiskLoaded(d.full.n + d.full.probes)
 			}
 		}
 	}
 	logIndex.reads++
-	f, err := os.Open(path)
-	if err != nil {
-		return next
-	} // never publish an incomplete read as current
-	defer f.Close()
-	if _, err = f.Seek(next.off, 0); err != nil {
+	// never publish an incomplete read as current, nor hand one to a reader
+	// while there is a good one: what stands is kept
+	kept := func() *logSnapshot {
+		if old != nil && old.path == path {
+			return old
+		}
 		return next
 	}
+	f, err := os.Open(path)
+	if err != nil {
+		return kept()
+	}
+	defer f.Close()
+	if _, err = f.Seek(next.off, 0); err != nil {
+		return kept()
+	}
 	var tail *rowChunk
+	probes := probeRows{blocks: next.probes}
 	routes := routeRows{}
 	if n := len(next.blocks); n > 0 && next.blocks[n-1].Count < logBlockRows {
 		tail = next.blocks[n-1].writable()
@@ -187,6 +204,17 @@ func readLogSnapshot() *logSnapshot {
 		for i := range tail.Rows {
 			routes.seen(tail, i)
 		}
+	}
+	// full marks where the full blocks end: every gateway row up to here
+	// is in a full block, and every probe in a full probe block or in the
+	// probe tail after them
+	full := func() {
+		n := 0
+		for n < len(probes.blocks) && probes.blocks[n].Count == logBlockRows {
+			n++
+		}
+		next.full = logFull{n: len(next.blocks), probes: n, off: next.off, hash: fmt.Sprintf("%x", sum.Sum(nil)), digest: marshalLogHash(sum),
+			first: next.first, firstOwn: next.firstOwn, keyProviders: maps.Clone(next.keyProviders), hosts: maps.Clone(next.hosts)}
 	}
 	rd := bufio.NewReaderSize(io.LimitReader(f, info.Size()-next.off), 64<<10)
 	for next.off < info.Size() {
@@ -203,7 +231,10 @@ func readLogSnapshot() *logSnapshot {
 		next.sawHost(r)
 		if r.IsProbe() {
 			if !quietProbe(r) { // a model list answered is no row (ferock)
-				next.probes = append(next.probes, probeRow{r, next.off})
+				probes.add(r, next.off)
+				if probes.tail == nil && tail == nil {
+					full() // a probe block filled, with no gateway row after the full blocks
+				}
 			}
 			continue
 		}
@@ -226,13 +257,13 @@ func readLogSnapshot() *logSnapshot {
 			next.blocks = append(next.blocks, tail.freeze())
 			tail = nil
 			clear(routes)
-			next.full = logFull{n: len(next.blocks), off: next.off, hash: fmt.Sprintf("%x", sum.Sum(nil)), digest: marshalLogHash(sum),
-				first: next.first, firstOwn: next.firstOwn, keyProviders: maps.Clone(next.keyProviders), hosts: maps.Clone(next.hosts)}
+			full()
 		}
 	}
 	if tail != nil {
 		next.blocks = append(next.blocks, tail.freeze())
 	}
+	next.probes = probes.done()
 	next.hash, next.digest = fmt.Sprintf("%x", sum.Sum(nil)), marshalLogHash(sum)
 	// A rewrite during the read must not give old blocks the new content's
 	// hash. A read inside the stamp's tick is checked when it settles

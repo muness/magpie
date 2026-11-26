@@ -158,7 +158,7 @@ func buildVia(agent, prefix string) []Option {
 		}
 		note := e.Provider.Name + " · via magpie"
 		if a := e.Provider.Account; a != nil {
-			note = firstUser(e.Provider) + " · via magpie"
+			note = firstUser(*e.Provider) + " · via magpie"
 		}
 		o := Option{Value: prefix + e.ID, Label: e.Name, Note: note,
 			Icon: e.Provider.Icon, Group: e.Provider.Name, Ref: e.ID, Free: e.Free, Rate: e.Rate, RateWas: e.RateWas, Context: e.Context, own: own[e.Provider.ID],
@@ -167,13 +167,13 @@ func buildVia(agent, prefix string) []Option {
 			o.Zero = e.Provider.PricedFree(set, e.Model)
 		}
 		// a model with a fast mode is switched fast in the picker (#954)
-		if provider.CanFast(e.Provider, e.Model) {
+		if provider.CanFast(*e.Provider, e.Model) {
 			o.FastFor, o.Fast = agent, slices.Contains(fast, e.ID)
-			o.OwnFast = provider.OwnFast(e.Provider, e.Model)
+			o.OwnFast = provider.OwnFast(*e.Provider, e.Model)
 			if tiered == nil {
 				tiered = provider.UltraModels()
 			}
-			if provider.UltraOn(e.Provider, e.Model, tiered) {
+			if provider.UltraOn(*e.Provider, e.Model, tiered) {
 				o.UltraOK, o.Ultra = true, o.Fast && slices.Contains(ultra, e.ID)
 			}
 		}
@@ -187,7 +187,7 @@ func buildVia(agent, prefix string) []Option {
 // setting, where an Option's Label is the name alone for magpie's picker.
 func listLabels(agent string) map[string]string {
 	shown, _ := provider.CatalogFor(agent)
-	labels := provider.Labels(shown)
+	labels := provider.LabelsFor(agent, shown)
 	out := make(map[string]string, len(shown))
 	for i, e := range shown {
 		out[e.ID] = labels[i]
@@ -291,6 +291,31 @@ var builtModels stampedLists[catalog.Model]
 type stampedLists[T any] struct {
 	sync.Mutex
 	m map[string]stampedList[T]
+	// sweeping says a sweep is armed. A list past magpieModelsFor is
+	// built again on the next ask, so it is let go then: Pi's alone was
+	// ~11 MB of an idle heap with real accounts, kept for the life of the
+	// process after one window poll.
+	sweeping bool
+}
+
+// sweep lets go of the lists past magpieModelsFor, and looks again when
+// the next of the rest will be.
+func (s *stampedLists[T]) sweep() {
+	s.Lock()
+	defer s.Unlock()
+	next := magpieModelsFor
+	for k, b := range s.m {
+		if left := magpieModelsFor - time.Since(b.at); left <= 0 {
+			delete(s.m, k)
+		} else if left < next {
+			next = left
+		}
+	}
+	if len(s.m) == 0 {
+		s.m, s.sweeping = nil, false
+		return
+	}
+	time.AfterFunc(next, s.sweep)
 }
 
 type stampedList[T any] struct {
@@ -318,6 +343,10 @@ func (s *stampedLists[T]) shared(key string, build func() []T) []T {
 			s.m = map[string]stampedList[T]{}
 		}
 		s.m[key] = b
+		if !s.sweeping {
+			s.sweeping = true
+			time.AfterFunc(magpieModelsFor, s.sweep)
+		}
 		s.Unlock()
 	}
 	return slices.Clip(b.list)
@@ -338,16 +367,18 @@ func buildModels(agent string) []catalog.Model {
 	defer provider.Hold()()
 	var out []catalog.Model
 	shown, _ := provider.CatalogFor(agent)
-	labels := provider.Labels(shown)
+	labels := provider.LabelsFor(agent, shown)
 	// a model magpie describes images to takes them (provider.Described)
 	seen := describedNow()
 	// the agent's own Long conversations, if it has one (ForAgent)
-	st, find := settings.Load().ForAgent(agent), provider.GroupFinder()
+	st, find := settings.Load().ForAgent(agent), provider.FoundOnce(provider.GroupFinder())
 	priceOf := provider.AgentPricer(st, find)
 	members := func(id string) []provider.Member {
 		_, ms, _ := find(id)
 		return ms
 	}
+	// the models Codex's accounts offer Ultrafast on, read once a list
+	ultra := sync.OnceValue(provider.UltraModels)
 	for i, e := range shown {
 		efforts := e.Efforts
 		if agent == "codex" {
@@ -355,7 +386,10 @@ func buildModels(agent string) []catalog.Model {
 			// word on included (provider.CodexEfforts)
 			efforts = provider.CodexEfforts(e)
 		}
-		m := catalog.Model{ID: e.ID, Name: labels[i], Provider: firstOf(e.Provider.Catalogs()), Efforts: efforts, Images: e.Images || seen, ImageInput: e.ImageInput, Context: e.Context, Output: e.Output, OutputSet: e.OutputSet, AgentsV2: e.AgentsV2, Reasoning: e.Thinks(),
+		// the kinds the model's source listed (a video, say), which an
+		// agent that can send them is told of (zcodeInputs, #5098)
+		inputs, outputs := e.Modalities()
+		m := catalog.Model{ID: e.ID, Name: labels[i], Provider: firstOf(e.Provider.Catalogs()), Efforts: efforts, Images: e.Images || seen, ImageInput: e.ImageInput, InputModalities: inputs, OutputModalities: outputs, Context: e.Context, Output: e.Output, OutputSet: e.OutputSet, AgentsV2: e.AgentsV2, Reasoning: e.Thinks(),
 			AlwaysThinks: e.AlwaysThinks, DynamicTools: e.DynamicTools, DefaultEffort: e.DefaultEffort}
 		// where Codex and Claude Code compact it (#876): a threshold the
 		// user set on the model or on its provider, else a window they
@@ -371,32 +405,29 @@ func buildModels(agent string) []catalog.Model {
 			m.ImageInput = &yes
 		}
 		// APIs is the preferred client protocol, preserving the vendor's
-		// own content where possible. A group's members may differ, so a group has
-		// one only when every member is served best on Responses (#1594,
+		// own content where possible. A group's members may differ, so a
+		// group has Responses when one member is best there and every
+		// other takes it as it is too (provider.GroupAPI; #1594,
 		// ObsidianArch02): Pi, omp, droid and dsh then ask it there, and a
 		// GPT group's tool-call arguments stream as the member sends them
 		// instead of being held for a Chat answer
 		if e.Group == "" {
-			if n := e.Provider.Native(e.Model); n != "" {
-				m.APIs = []string{string(n)}
-			} else {
-				// Gemini clients also reach Code Assist and Google plugins
-				// through the gateway's Gemini API, with translation as needed.
-				apis := e.Provider.APIs(e.Model)
-				for _, pr := range e.Provider.Speaks() {
-					if (pr == provider.Gemini || pr == provider.CodeAssist) && (apis == nil || slices.Contains(apis, pr)) {
-						m.APIs = []string{string(provider.Gemini)}
-						break
-					}
-				}
-			}
-		} else if allResponses(members(e.ID)) {
-			m.APIs = []string{string(provider.Responses)}
+			m.APIs = modelAPIs(e.Provider, e.Model)
+		} else if api := provider.GroupAPI(members(e.ID)); api != "" {
+			m.APIs = []string{string(api)}
+		} else if agent == "dsh" || agent == dsbotID {
+			// dsh has a route per API, so a group every member of which
+			// is best on Messages or Gemini's goes on that route, as
+			// each member alone would (01huadalang on Discord)
+			m.APIs, m.AsksAdaptively = dshGroupAPIs(members(e.ID))
 		}
 		// the service tiers Codex is offered on it, as the gateway's own
 		// lists offer them: Fast in the Codex CLI magpie writes
 		// magpie-models.json for (#1530)
-		provider.CodexTiers(&m, e, members)
+		provider.CodexTiersWith(&m, e, members, ultra)
+		if agent == "codex" {
+			provider.CodexSeals(&m, e, members)
+		}
 		if agent == "codex" {
 			// the entry its vendor lists the model under in Codex's own
 			// shape, handed on as it is (codexcat)
@@ -405,17 +436,54 @@ func buildModels(agent string) []catalog.Model {
 		// the gateway paths it goes on untranslated, as /v1/models says
 		// them: what an agent plugin's connect is told (cleary5779)
 		m.Endpoints = provider.NativeEndpoints(e)
+		if e.Group != "" {
+			// a group's, the APIs every member relays as it is
+			// (provider.GroupEndpoints), which /v1/models leaves out: a
+			// remote magpie sends a group's request on in the client's
+			// API, for the other side to pick per member
+			m.Endpoints = provider.GroupEndpoints(members(e.ID))
+		}
 		// Codex's /fast on a ChatGPT account's own GPT model, which
 		// OpenCode has no command for and takes as variants (#2379); a
 		// group is sent fast as the group says, as a fast pick is
 		if a := e.Provider.Account; e.Group == "" && a != nil && a.Agent == "codex" {
-			m.CodexFast = provider.CanFast(e.Provider, e.Model)
+			m.CodexFast = provider.CanFast(*e.Provider, e.Model)
 		}
 		m.Efforts, m.Keys, m.APIs, m.Endpoints = slices.Clip(m.Efforts), slices.Clip(m.Keys), slices.Clip(m.APIs), slices.Clip(m.Endpoints)
 		m.InputModalities, m.OutputModalities, m.Tiers, m.Codex = slices.Clip(m.InputModalities), slices.Clip(m.OutputModalities), slices.Clip(m.Tiers), slices.Clip(m.Codex)
 		out = append(out, m)
 	}
 	return out
+}
+
+// modelAPIs are a model's APIs in an agent's list (catalog.Model.APIs):
+// the one its provider serves it on best (Provider.Native), after
+// Gemini's where that is served too; none when every request to it is
+// translated anyway.
+func modelAPIs(p *provider.Provider, model string) []string {
+	if p.AgentGemini(model) {
+		// a Gemini model its provider serves on Gemini's API: there for
+		// omp and OmO, which take it first, not translated from
+		// Anthropic's (provider.AgentGemini); an agent with no Gemini API
+		// of its own (Pi, droid, dsh) keeps the one Native names
+		apis := []string{string(provider.Gemini)}
+		if n := p.Native(model); n != "" {
+			apis = append(apis, string(n))
+		}
+		return apis
+	}
+	if n := p.Native(model); n != "" {
+		return []string{string(n)}
+	}
+	// Gemini clients also reach Code Assist and Google plugins through the
+	// gateway's Gemini API, with translation as needed.
+	apis := p.APIs(model)
+	for _, pr := range p.Speaks() {
+		if (pr == provider.Gemini || pr == provider.CodeAssist) && (apis == nil || slices.Contains(apis, pr)) {
+			return []string{string(provider.Gemini)}
+		}
+	}
+	return nil
 }
 
 // describedNow is provider.Described, asked once for every agent's list
@@ -430,20 +498,6 @@ func describedNow() bool {
 }
 
 var builtSeen stampedLists[bool]
-
-// allResponses reports whether a group's members are all served best on
-// Responses, so the gateway relays a Responses request to whichever it
-// picks. A group with none, or one member on another API, is false: a
-// Messages-only group stays on Chat too, as the thinking a Claude member
-// takes is known by its own model, not by the group's id.
-func allResponses(ms []provider.Member) bool {
-	for _, m := range ms {
-		if m.Provider.Native(m.Model) != provider.Responses {
-			return false
-		}
-	}
-	return len(ms) > 0
-}
 
 // maxTokens is the output limit an agent is handed for m, kept within the
 // context window it is handed with it: models.dev lists some models' output
@@ -472,3 +526,9 @@ func group(name string, opts []Option) []Option {
 }
 
 func gatewayV1() string { return gateway.URL() + "/v1" }
+
+// unknownWindow is the window an agent is told of a model whose own magpie
+// doesn't know: the agent's default n, held to the longest context the user
+// set for every model (settings.ContextCap) like every window that is known
+// (ul3140773077392 on X, #6259).
+func unknownWindow(n int) int { return settings.Shared().Capped(n) }

@@ -3,18 +3,20 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
-	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/yetone/magpie/internal/agentenv"
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/provider"
 )
@@ -139,6 +141,16 @@ func DisconnectPreview(a *Agent, exe string) ([]FileChange, error) {
 	// its folders (plugins) only read, so linked
 	if err := copyTop(cfg, filepath.Join(tmp, cfgRel), nil, true); err != nil {
 		return nil, err
+	}
+	// the stash's keys that name a file by its whole path (a plugin's
+	// agent's, AtomCode's, Droid's…) name it under the copy's home, where
+	// the dry run finds the file: with home's own they were never found
+	// there, and the preview showed nothing put back (Purfeather,
+	// plugins#799)
+	if r, ok := rel(stashPath()); ok {
+		if err := moveStashKeys(filepath.Join(tmp, r), home, tmp); err != nil {
+			return nil, err
+		}
 	}
 	// magpie's providers as this magpie has them: some come from another
 	// agent's sign-in (Codex's auth.json) the copy doesn't hold, and a
@@ -293,6 +305,54 @@ func copyTop(from, to string, before map[string][]byte, link bool) error {
 	return nil
 }
 
+// moveStashKeys rewrites the stash copied to path so a key naming a file
+// under home names the same file under to. A stash that isn't there or
+// doesn't parse is left as it is: the dry run reads it as the real one does.
+func moveStashKeys(path, home, to string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var m map[string]string
+	if json.Unmarshal(b, &m) != nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[movedKey(k, home, to)] = v
+	}
+	b, err = json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
+}
+
+// movedKey is k with each path in it under home put under to: home where a
+// separator follows it, matched as the system matches names (Windows's
+// without case: %APPDATA% may spell the home folder otherwise).
+func movedKey(k, home, to string) string {
+	home = strings.TrimRight(home, `/\`)
+	if home == "" {
+		return k
+	}
+	same := func(a, b string) bool { return a == b }
+	if runtime.GOOS == "windows" {
+		same = strings.EqualFold
+	}
+	var out strings.Builder
+	for i := 0; i < len(k); {
+		if j := i + len(home); j < len(k) && same(k[i:j], home) && (k[j] == '/' || k[j] == filepath.Separator) {
+			out.WriteString(to)
+			i = j
+			continue
+		}
+		out.WriteByte(k[i])
+		i++
+	}
+	return out.String()
+}
+
 // notConfig is a file no agent keeps its settings in: a database, a log, a
 // history, which can be large and which Disconnect never writes.
 func notConfig(name string) bool {
@@ -330,7 +390,14 @@ func previewEnv(home, tmp string) []string {
 	// The test binary recognizes this marker and keeps the fixture HOME
 	// instead of creating a second isolated home. Production binaries ignore
 	// the variable.
-	return append(out, "HOME="+tmp, "USERPROFILE="+tmp, "TMPDIR="+tmp, "MAGPIE_TEST_SANDBOX="+tmp)
+	//
+	// No sign-in is read: building the providers there would read the
+	// Claude sign-in from the keychain, found through HOME on a Mac, and
+	// the copy's home has none, so macOS asked the user "Keychain Not
+	// Found" at each preview (jasonz3g on X). It would run agents' CLIs
+	// under the copy's home too. The files the dry run changes are the
+	// agent's, and no account changes them.
+	return append(out, "HOME="+tmp, "USERPROFILE="+tmp, "TMPDIR="+tmp, "MAGPIE_TEST_SANDBOX="+tmp, "MAGPIE_NO_ACCOUNTS=1")
 }
 
 // diffLines is the lines that differ between two texts, in the order of the
@@ -500,7 +567,7 @@ func splitLines(s string) []string {
 
 // lineKey is what a line sets: TOML's and .env's key before =, JSON's and
 // YAML's before :, "" for a line that sets nothing.
-var keyRe = regexp.MustCompile(`^\s*(?:export\s+)?"?([A-Za-z0-9_.\-]+)"?\s*[:=]`)
+var keyRe = lazyre.New(`^\s*(?:export\s+)?"?([A-Za-z0-9_.\-]+)"?\s*[:=]`)
 
 func lineKey(l string) string {
 	if m := keyRe.FindStringSubmatch(l); m != nil {
@@ -514,7 +581,7 @@ func lineKey(l string) string {
 
 func indent(l string) string { return l[:len(l)-len(strings.TrimLeft(l, " \t"))] }
 
-var secretKey = regexp.MustCompile(`(?i)(key|token|secret|password|auth)`)
+var secretKey = lazyre.New(`(?i)(key|token|secret|password|auth)`)
 
 // mask hides the value of a line whose key reads as a secret's; magpie's
 // own token, which is no secret, stays.

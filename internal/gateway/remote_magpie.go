@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,30 @@ const (
 	// round and round, masked again on each pass: one passed on through
 	// catalog.MaxVia magpies is answered 508 Loop Detected instead.
 	HopsHeader = "X-Magpie-Hops"
+	// ClientUAHeader is the User-Agent the agent sent, on a request
+	// passed on to a remote magpie as magpie's own: that magpie sends its
+	// key+URL providers the agent's, as this one would have (nb5p on
+	// Discord). Taken, like AgentHeader, only from a magpie's request.
+	ClientUAHeader = "X-Magpie-User-Agent"
+	// ClaudeCacheTTLHeader is how long the prompt cache of a Claude Code
+	// request is to be kept, as the user of the computer Claude Code runs
+	// on picked it: "5m", "1h", or "default" for no pick. Claude Code
+	// marks a five-minute cache with no ttl, picked or not, so the other
+	// magpie's Claude relay can't tell a pick from its marks
+	// (claudeTTLOf, runTTLFor; linkaww). Taken only from a magpie's
+	// request.
+	ClaudeCacheTTLHeader = "X-Magpie-Claude-Cache-TTL"
+	// MaskedAsHeader says the magpie that passed a request on masked it
+	// already, by the settings masking.Fingerprint names: this one masks
+	// it again only when its own differ (maskedBefore). Taken only from a
+	// magpie's request.
+	MaskedAsHeader = "X-Magpie-Masked-As"
+	// ViaChainHeader is the computers a request came through before it
+	// reached this one, comma-separated: the agent's first (ViaHeader's),
+	// then each magpie that passed it on. A plugin is told them
+	// (tellCaller). A magpie that sends only ViaHeader is taken as a chain
+	// of that one. Taken only from a magpie's request.
+	ViaChainHeader = "X-Magpie-Via-Chain"
 )
 
 // caller is who a request is recorded as: its agent, and the computer it
@@ -51,14 +76,28 @@ type caller struct {
 	// session so the other magpie records the call as one (#2505)
 	compact string
 	// ua is the User-Agent the request came with, as it came: the one a
-	// provider that passes the agent's on is sent (userAgentFor)
-	ua string
+	// provider that passes the agent's on is sent (userAgentFor). From
+	// another magpie, the agent's it named (ClientUAHeader), relayed true.
+	ua      string
+	relayed bool
 	// keepTurn: another magpie asked that its Responses turn be kept
 	// though it says store false (KeepTurnHeader, remote_delta.go)
 	keepTurn bool
 	// hops: the magpies the request was passed on through before this
 	// one (HopsHeader)
 	hops int
+	// cacheTTL is the Claude Code cache lifetime another magpie named
+	// (ClaudeCacheTTLHeader); claudeHere, that the request is Claude
+	// Code's on this computer, whose user's pick is read here
+	// (claudeTTLOf)
+	cacheTTL   string
+	claudeHere bool
+	// maskedAs: the magpie that passed it on masked it by the settings
+	// this fingerprint names (MaskedAsHeader)
+	maskedAs string
+	// chain: the computers the request came through before this one, via
+	// first (ViaChainHeader); none for this computer's own
+	chain []string
 }
 
 type callerCtx struct{}
@@ -82,6 +121,10 @@ func withCaller(next http.Handler) http.Handler {
 		r.Header.Del(SearchingHeader)
 		r.Header.Del(KeepTurnHeader)
 		r.Header.Del(HopsHeader)
+		r.Header.Del(ClientUAHeader)
+		r.Header.Del(ClaudeCacheTTLHeader)
+		r.Header.Del(MaskedAsHeader)
+		r.Header.Del(ViaChainHeader)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -108,15 +151,79 @@ func callerFrom(r *http.Request) caller {
 		if n, err := strconv.Atoi(strings.TrimSpace(r.Header.Get(HopsHeader))); err == nil && n > 0 {
 			c.hops = min(n, 1<<20)
 		}
+		if v := r.Header.Get(ClientUAHeader); v != "" && len(v) <= 1024 && !magpiesOwn(v) {
+			c.ua, c.relayed = v, true
+		}
+		switch v := r.Header.Get(ClaudeCacheTTLHeader); v {
+		case "5m", "1h", "default":
+			c.cacheTTL = v
+		}
+		if v := strings.TrimSpace(r.Header.Get(MaskedAsHeader)); len(v) <= 128 {
+			c.maskedAs = v
+		}
 		if a := label(r.Header.Get(AgentHeader)); a != "" {
 			c.agent = usage.AgentOf(a)
 			c.via = label(r.Header.Get(ViaHeader))
 			if c.via == "" {
 				c.via, _, _ = net.SplitHostPort(r.RemoteAddr)
 			}
+			c.chain = chainOf(r.Header.Get(ViaChainHeader), c.via)
 		}
+	} else {
+		// Claude Code, known by its token or its User-Agent; Claude
+		// Desktop's keeps a settings.json of its own
+		c.claudeHere = (c.agent == "claude" || fromClaudeCode(r.Header)) && c.agent != "claude-desktop" && local(r)
 	}
 	return c
+}
+
+// chainOf is the computers a ViaChainHeader names, when it is a fit one
+// beginning at via (the agent's computer); else via alone, as an older
+// magpie says no more.
+func chainOf(v, via string) []string {
+	if via == "" {
+		return nil
+	}
+	var chain []string
+	for p := range strings.SplitSeq(v, ",") {
+		if p = label(p); p == "" || len(chain) == catalog.MaxVia {
+			chain = nil
+			break
+		}
+		chain = append(chain, p)
+	}
+	if len(chain) == 0 || chain[0] != via {
+		return []string{via}
+	}
+	return chain
+}
+
+// claudeTTLOf is how long the prompt cache of c's request is to be kept,
+// as the user of the computer its Claude Code runs on picked it: "5m",
+// "1h", "default" for no pick, "" when unknown (not Claude Code's, from
+// a magpie that didn't say, or Claude Code's settings.json unreadable).
+// Claude Code on this computer: this computer's pick, as claudeRunTTL
+// reads it.
+func claudeTTLOf(c caller) string {
+	if c.cacheTTL == "" && c.agent == "claude-desktop" {
+		// Claude Desktop reaches magpie with a gateway key, which Claude
+		// Code takes for an API key and marks five minutes with no ttl
+		// (its docs: automatic is 1 hour on a subscription, 5 minutes on an
+		// API key), though magpie's run is on a subscription. Its marks
+		// can't say a pick, so none is read from them: the run keeps
+		// Claude Code's own default (DIYgod on X)
+		return "default"
+	}
+	if c.cacheTTL != "" || !c.claudeHere {
+		return c.cacheTTL
+	}
+	if !claudeSettingsKnown() {
+		return ""
+	}
+	if ttl := claudePickedTTL(os.Environ()); ttl != "" {
+		return ttl
+	}
+	return "default"
 }
 
 // callerOf is who the request is recorded as.
@@ -163,6 +270,12 @@ func passOnCaller(ctx context.Context, req *http.Request) {
 	}
 	c, ok := ctx.Value(callerCtx{}).(caller)
 	req.Header.Set(HopsHeader, strconv.Itoa(c.hops+1))
+	req.Header.Del(MaskedAsHeader)
+	if fp := maskedAsOf(ctx); fp != "" {
+		// masked here already: the other magpie, masking by the same
+		// settings, doesn't again
+		req.Header.Set(MaskedAsHeader, fp)
+	}
 	if !ok {
 		return
 	}
@@ -175,15 +288,26 @@ func passOnCaller(ctx context.Context, req *http.Request) {
 	if c.compact != "" {
 		req.Header.Set(dshCompactHeader, c.compact)
 	}
+	if v := claudeTTLOf(c); v != "" {
+		req.Header.Set(ClaudeCacheTTLHeader, v)
+	}
+
 	if c.agent == "" {
 		return
 	}
 	req.Header.Set(AgentHeader, c.agent)
-	if c.via == "" {
-		c.via = hostName()
+	chain := c.chain
+	if h := hostName(); h != "" {
+		chain = append(slices.Clip(chain), h)
+	}
+	if c.via == "" && len(chain) > 0 {
+		c.via = chain[0]
 	}
 	if c.via != "" {
 		req.Header.Set(ViaHeader, c.via)
+	}
+	if len(chain) > 0 {
+		req.Header.Set(ViaChainHeader, strings.Join(chain, ","))
 	}
 }
 

@@ -124,10 +124,15 @@ func renewLogins(ctx context.Context, every time.Duration, atOnce int) []Renewal
 	}
 	ls := readLogins()
 	loginsMu.Unlock()
+	if _, ok := active["claude"]; !ok && claudeSignInUnsure() {
+		// Claude Code's own still, its sign-in read mid-write
+		active["claude"] = claudeHeldUser(ls)
+	}
 	out := []Renewal{}
 	tried := 0
 	for _, l := range ls {
-		if l.Agent != "codex" && !claudeKeptAlive(l) || strings.EqualFold(active[l.Agent], l.User) || leftAlone(l.Agent) {
+		// nor one kept access token only, whose sign-in magpie never renews
+		if l.Agent != "codex" && !claudeKeptAlive(l) || l.AccessOnly || strings.EqualFold(active[l.Agent], l.User) || leftAlone(l.Agent) {
 			continue
 		}
 		r := Renewal{Agent: l.Agent, User: l.User}

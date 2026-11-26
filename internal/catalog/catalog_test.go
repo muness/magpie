@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -476,5 +477,69 @@ func TestProviderAllocsGrowWithModels(t *testing.T) {
 	writeCatalog(t, `{"openai": {"models": {"m-new": {"id":"m-new"}}}}`)
 	if ms := Provider("openai"); len(ms) != 1 || ms[0].ID != "m-new" {
 		t.Errorf("after Reset, Provider(openai) = %v, want the new load's m-new", ms)
+	}
+}
+
+func TestNoChannel(t *testing.T) {
+	for _, c := range []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{503, `{"type":"error","error":{"type":"new_api_error","message":"No available channel for model gpt-6.1-sol under group default (request id: 2026)"}}`, true},
+		{503, `{"error":{"message":"当前分组 default 下对于模型 gpt-6.1-sol 无可用渠道 (request id: 2026)","type":"new_api_error","code":"model_not_found"}}`, true},
+		{503, `{"error":{"message":"upstream overloaded"}}`, false},
+		{429, `No available channel for model x`, false},
+		// a fork answering 404 where New API answers 503 (equinox0253 on X,
+		// WandAPI): New API's model_not_found code, the message naming
+		// the group or channel; shapes built from New API's message
+		// templates, not a captured WandAPI body
+		{404, `{"error":{"message":"No available channel for model gpt-6.1-sol under group default","type":"new_api_error","code":"model_not_found"}}`, true},
+		{404, `{"error":{"message":"分组 default 下模型 gpt-6.1-sol 暂无渠道","type":"invalid_request_error","code":"model_not_found"}}`, true},
+		{404, `{"type":"error","error":{"type":"model_not_found","message":"model gpt-6.1-sol has no channel in group vip"}}`, true},
+		// a real 404 stays one: a wrong base URL, a model that does not
+		// exist, Anthropic's own not_found_error
+		{404, `404 page not found`, false},
+		{404, `<html><body>Not Found</body></html>`, false},
+		{404, `{"error":{"message":"The model gpt-9 does not exist or you do not have access to it.","type":"invalid_request_error","code":"model_not_found"}}`, false},
+		{404, `{"type":"error","error":{"type":"not_found_error","message":"model: gpt-6.1-sol"}}`, false},
+		{404, `{"error":{"message":"Invalid URL (POST /v1/messages)","type":"invalid_request_error","code":null}}`, false},
+	} {
+		if got := NoChannel(c.status, []byte(c.body)); got != c.want {
+			t.Errorf("NoChannel(%d, %s) = %v", c.status, c.body, got)
+		}
+	}
+}
+
+// Mistral's models page says its DeepSeek V4.1 Flash takes images while
+// models.dev lists it text-only (regain4125 on X): the Mistral entry sees,
+// and the same model at another vendor, or another Mistral model, keeps
+// the row models.dev gives it.
+func TestMistralDeepSeekFlashSeesImages(t *testing.T) {
+	writeCatalog(t, `{
+	  "mistral": {"models": {
+	    "deepseek-v4-1-flash-1017": {"id":"deepseek-v4-1-flash-1017","name":"DeepSeek V4.1 Flash 1017","modalities":{"input":["text"],"output":["text"]}},
+	    "devstral-latest": {"id":"devstral-latest","name":"Devstral","modalities":{"input":["text"],"output":["text"]}}
+	  }},
+	  "chutes": {"models": {
+	    "deepseek-v4-1-flash-1017": {"id":"deepseek-v4-1-flash-1017","name":"DeepSeek V4.1 Flash 1017","modalities":{"input":["text"],"output":["text"]}}
+	  }}
+	}`)
+	by := func(p string) map[string]Model {
+		out := map[string]Model{}
+		for _, m := range Provider(p) {
+			out[m.ID] = m
+		}
+		return out
+	}
+	m := by("mistral")["deepseek-v4-1-flash-1017"]
+	if !m.Images || m.ImageInput == nil || !*m.ImageInput || !slices.Contains(m.InputModalities, "image") {
+		t.Errorf("mistral's deepseek flash: %+v", m)
+	}
+	if d := by("mistral")["devstral-latest"]; d.Images || d.ImageInput == nil || *d.ImageInput {
+		t.Errorf("devstral changed: %+v", d)
+	}
+	if c := by("chutes")["deepseek-v4-1-flash-1017"]; c.Images || c.ImageInput == nil || *c.ImageInput {
+		t.Errorf("chutes changed: %+v", c)
 	}
 }

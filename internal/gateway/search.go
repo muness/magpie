@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -101,7 +100,7 @@ func searchFor(ctx context.Context) *CallFor {
 // can search for it. Never for magpie's own searcher request, which is
 // the provider's search.
 func magpieSearches(ctx context.Context, p provider.Provider) bool {
-	return !searching(ctx) && settings.Load().SearchAll && canSearchFor(p)
+	return !searching(ctx) && settings.Shared().SearchAll && canSearchFor(p)
 }
 
 // searchesItself says whether the provider searches the web by itself when
@@ -111,7 +110,7 @@ func searchesItself(p provider.Provider, proto provider.Protocol) bool {
 	// its upstream does (#2027), on an API it has an address for: one with
 	// only a Chat address would be sent no search tool at all. Another
 	// sign-in's Searches is never read.
-	saidTo := p.Searches && (proto == provider.Anthropic || proto == provider.Responses) && p.Base(proto) != ""
+	saidTo := saidToSearch(p) && (proto == provider.Anthropic || proto == provider.Responses) && p.Base(proto) != ""
 	if p.Account != nil {
 		// Grok by its id: moved to its plugin, its account is the plugin's;
 		// its plugin beside the built-in (grok-plugin) by the plugin's id.
@@ -130,6 +129,15 @@ func searchesItself(p provider.Provider, proto provider.Protocol) bool {
 	return slices.Contains(searchHosts[proto], provider.HostOf(p.Base(proto)))
 }
 
+// saidToSearch is a provider said to search the web by itself: by the
+// user (Searches, #359), or by the partner it was added from
+// (provider.PresetSearches: CoreCode runs both web_search tools, and Joe
+// asked for it to be on with nothing set). A plugin's Searches is its
+// config hook's.
+func saidToSearch(p provider.Provider) bool {
+	return p.Searches || provider.PresetSearches(p)
+}
+
 // googleAccount is a Google sign-in, Gemini CLI's or Antigravity's, which
 // asks Code Assist; a plugin's is left to the plugin.
 func googleAccount(p provider.Provider) bool {
@@ -144,7 +152,23 @@ func googleAccount(p provider.Provider) bool {
 // only a request that declares none (searchesFor). One that does is given
 // magpie's search, which the account answers itself (ownSearcher, #757).
 func codeAssistSearches(p provider.Provider, proto provider.Protocol, model string) bool {
-	return proto == provider.CodeAssist && googleAccount(p) && searchModel(model)
+	return proto == provider.CodeAssist && (googleAccount(p) || googlePlugin(p)) && searchModel(model)
+}
+
+// googlePlugin is a plugin whose models are spoken to on Code Assist
+// (its npm @ai-sdk/google) at Google's own host: the Antigravity plugin's
+// account asks daily-cloudcode-pa.googleapis.com, which runs googleSearch
+// for Gemini as a built-in Google sign-in's Code Assist does. Left to
+// magpie's search, a Gemini client's googleSearch never reached it, and
+// the web_search function magpie offered in its place kept the client's
+// URL context out too (daoche_wuzui on X). A plugin at another host is
+// not known to.
+func googlePlugin(p provider.Provider) bool {
+	if !p.IsPlugin() || p.Base(provider.CodeAssist) == "" {
+		return false
+	}
+	h := strings.ToLower(provider.HostOf(p.PluginAPI()))
+	return h == "googleapis.com" || strings.HasSuffix(h, ".googleapis.com")
 }
 
 // geminiKeySearches is a provider asked with a key at Google AI Studio's
@@ -285,7 +309,7 @@ var searchHosts = map[provider.Protocol][]string{
 func searchAsked(proto provider.Protocol, body []byte) bool {
 	// bytes, not string(body): each conversion copied the whole body, three
 	// times a request (a 200KB body: 640KB and 3ms)
-	if !bytes.Contains(body, []byte("web_search")) && !bytes.Contains(body, []byte("oogle_search")) && !bytes.Contains(body, []byte("googleSearch")) {
+	if !bodyHas(body, "web_search") && !bodyHas(body, "oogle_search") && !bodyHas(body, "googleSearch") {
 		return false
 	}
 	req, err := parse(proto, body)
@@ -306,7 +330,7 @@ func searchedForIt(ctx context.Context, p provider.Provider, from provider.Proto
 // themselves, with a small model of theirs, as searching needs no more.
 // An explicit "off" leaves only the search APIs.
 func searcher() (provider.Provider, string, bool) {
-	if settings.Load().Searcher == "off" {
+	if settings.Shared().Searcher == "off" {
 		return provider.Provider{}, "", false
 	}
 	if p, m, why := chosenSearcher(); why == "" && p != nil {
@@ -321,9 +345,14 @@ func searcher() (provider.Provider, string, bool) {
 // serves only Claude Code refuses magpie's own request, which has no
 // metadata.user_id (#359).
 func searchRank(p provider.Provider) int {
+	if !p.Searches && provider.PresetSearches(p) {
+		// a partner's word, as a relay's: its quota is not magpie's to
+		// spend on other models' searches unless Settings names it
+		return -1
+	}
 	p.Searches = false
 	switch {
-	case p.Account != nil && p.Account.Agent == "claude":
+	case claudeAccount(p):
 		return 0
 	case p.Account != nil && p.Account.Agent == "codex":
 		return 1
@@ -364,7 +393,7 @@ func namedSearcherRank(p provider.Provider) (int, bool) {
 	if provider.KimiCodeSearch(p) != "" {
 		return manualRelayRank, true
 	}
-	if p.Searches && (searchesItself(p, provider.Anthropic) || searchesItself(p, provider.Responses)) {
+	if saidToSearch(p) && (searchesItself(p, provider.Anthropic) || searchesItself(p, provider.Responses)) {
 		return manualRelayRank, true
 	}
 	return -1, false
@@ -385,23 +414,39 @@ func autoSearcher() (provider.Provider, string, bool) {
 func autoSearcherReady() (provider.Provider, string, bool, bool) {
 	var best provider.Provider
 	var model string
-	top, bestReady := -1, false
+	top, bestReady, have := 0, false, false
+	// the provider the pick is held to goes before every other of its
+	// readiness (heldPick, auto_picks.go): one added later, a Claude
+	// account's first of all, doesn't take the searches over
+	held, heldServes := heldPick(slotSearcher), false
 	for _, p := range provider.All() {
 		r := searchRank(p)
-		if r < 0 || !p.On() || (bestReady && r >= top) {
+		if r < 0 || !p.On() {
+			continue
+		}
+		if held != "" && p.ID == held {
+			r = -1
+		}
+		if have && bestReady && r >= top {
 			continue
 		}
 		m, ready := searcherReady(p)
-		if m == "" || top >= 0 && (bestReady && !ready || ready == bestReady && r >= top) {
+		if m != "" && r == -1 {
+			heldServes = true
+		}
+		if m == "" || have && (bestReady && !ready || ready == bestReady && r >= top) {
 			continue
 		}
 		if codexSearches(p) {
 			// by the backend's search, which spends no model's tokens
 			m = codexSearchModel
 		}
-		best, model, top, bestReady = p, m, r, ready
+		best, model, top, bestReady, have = p, m, r, ready, true
 	}
-	return best, model, bestReady, top >= 0
+	if have {
+		settlePick(slotSearcher, held, heldServes, best.ID)
+	}
+	return best, model, bestReady, have
 }
 
 // Why the searcher Settings names isn't used, and magpie picks one itself.
@@ -418,7 +463,7 @@ const (
 // its small model, as when none is named. Nil when none is named or
 // provider search is explicitly off.
 func chosenSearcher() (*provider.Provider, string, string) {
-	return namedSearcher(settings.Load().Searcher)
+	return namedSearcher(settings.Shared().Searcher)
 }
 
 // namedSearcher is chosenSearcher of v, a searcher as Settings writes it.
@@ -531,7 +576,7 @@ type SearcherChoice struct {
 func RelaysSaidToSearch() []provider.Provider {
 	var out []provider.Provider
 	for _, p := range provider.All() {
-		if p.Searches && p.On() && searchRank(p) < 0 {
+		if saidToSearch(p) && p.On() && searchRank(p) < 0 {
 			out = append(out, p)
 		}
 	}
@@ -554,7 +599,8 @@ func smallModel(p provider.Provider, keep func(catalog.Model) bool) string {
 // ready true; else smallModel of them all, and ready false. A model out
 // of its allowance is only picked when every other is (#1801: Image
 // recognition kept describing with an account out of its allowance, each
-// image refused 429).
+// image refused 429), and so is one whose every account has to be signed
+// in again (provider.SignInNeeded).
 func smallReady(p provider.Provider, keep func(catalog.Model) bool, from provider.Protocol) (string, bool) {
 	c, ready := smallReadyOf(p, smallCands(p, keep), from)
 	return c.id, ready
@@ -572,7 +618,10 @@ func smallReadyOf(p provider.Provider, cs []smallCand, from provider.Protocol) (
 	now := time.Now()
 	for _, c := range cs {
 		if _, spent := spentModel(p, c.id, from, now); !spent {
-			return c, true
+			// every account of p signed out, none is asked: a Claude
+			// sign-in Anthropic refused stayed Image recognition's first
+			// pick, and each image failed on it (@freefcw on X)
+			return c, !p.SignInNeeded()
 		}
 	}
 	return cs[0], false
@@ -754,17 +803,18 @@ func (s *Server) webSearch(ctx context.Context, query string) (string, []Hit, er
 	// is set to (#1522: Codex asked while a "direct" provider served the
 	// turn dialed chatgpt.com directly)
 	ctx = netproxy.With(ctx, "")
+	ctx, query = searchScoped(ctx, query)
 	if !searchServed() {
 		return "", nil, errSearchOff
 	}
-	if settings.Load().Searcher == "off" {
+	if settings.Shared().Searcher == "off" {
 		if len(provider.SearchAPIs()) == 0 {
 			return "", nil, errNoSearcher
 		}
 		return s.apiSearch(ctx, query)
 	}
 	var errs []error
-	apiFirst := settings.Load().SearchFirst == settings.SearchFirstAPI && len(provider.SearchAPIs()) > 0
+	apiFirst := settings.Shared().SearchFirst == settings.SearchFirstAPI && len(provider.SearchAPIs()) > 0
 	if apiFirst {
 		said, hits, err := s.apiSearch(ctx, query)
 		if err == nil {
@@ -801,7 +851,7 @@ func (s *Server) webSearch(ctx context.Context, query string) (string, []Hit, er
 var errNoSearcher = errors.New("no provider that can search the web, nor a search API, is set up in magpie")
 
 // errSearchOff is a search asked of magpie while plugins/search is off.
-var errSearchOff = errors.New("magpie's web search is off: turn the Web search plugin on in magpie's Settings → Plugins")
+var errSearchOff = errors.New("magpie's web search is off: turn Web search on in magpie's Plugins › Built-in")
 
 // searchServed is whether plugins/search serves magpie's web search here
 // (the gateway's tool point, gwtool): off, magpie neither offers its
@@ -900,9 +950,9 @@ func (s *Server) modelSearch(ctx context.Context, query string) (string, []Hit, 
 			case errors.Is(first, errCantServe):
 				return "", nil, fmt.Errorf("%w (no other provider could search in its place)", err)
 			case len(settings.Load().SearcherThen) > 0:
-				return "", nil, fmt.Errorf("%w (the searchers picked in Settings › Web search, in their order: no other provider searches in their place)", err)
+				return "", nil, fmt.Errorf("%w (the searchers picked in Settings › Models › Web search, in their order: no other provider searches in their place)", err)
 			}
-			return "", nil, fmt.Errorf("%w (the searcher picked in Settings › Web search: no other provider searches in its place)", err)
+			return "", nil, fmt.Errorf("%w (the searcher picked in Settings › Models › Web search: no other provider searches in its place)", err)
 		}
 		return said, hits, nil
 	}
@@ -1281,16 +1331,24 @@ func textCallRound(tools []Tool, ask round) round {
 }
 
 // searchReply answers req through ask, running the searches its model
-// asks for and asking it again with what they found; the client sees one
-// reply. The first round's failure is a status, as another provider may
-// take over.
-func (s *Server) searchReply(w http.ResponseWriter, r *http.Request, from provider.Protocol, name string, req *Request, usage *Usage, ask round) (int, string) {
+// asks for (when search) and the advisor calls (req.Advisor,
+// advisor_serve.go), and asking it again with what they gave; the client
+// sees one reply. The first round's failure is a status, as another
+// provider may take over.
+func (s *Server) searchReply(w http.ResponseWriter, r *http.Request, from provider.Protocol, name string, req *Request, usage *Usage, ask round, search bool) (int, string) {
 	ctx, cancel := context.WithCancel(withWebAccess(context.WithValue(r.Context(), searchForKey{}, &CallFor{Agent: callerOf(r).agent, Model: unprefixed(req.Model)}), req.WebAccess))
 	defer cancel()
 	q := *req
-	q.WebSearch = false
-	tool := searchTool(q.Tools)
-	q.Tools = append(slices.Clone(q.Tools), tool)
+	q.Tools = slices.Clone(q.Tools)
+	var tool Tool
+	if search {
+		q.WebSearch = false
+		tool = searchTool(q.Tools)
+		q.Tools = append(q.Tools, tool)
+	}
+	if q.Advisor != "" {
+		q.Tools = append(q.Tools, advisorToolDef())
+	}
 	q.Messages = slices.Clone(q.Messages)
 	ask = textCallRound(q.Tools, ask)
 	first, status, msg := ask(ctx, &q)
@@ -1316,6 +1374,10 @@ func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, in <
 	}
 	var before, this Usage
 	started, said := false, false
+	ours := func(name string) bool {
+		return name != "" && name == tool || q.Advisor != "" && name == advisorTool
+	}
+	advised := 0 // the advisor's calls so far
 	for n := 1; ; n++ {
 		var col collector
 		mine, theirs, gap := false, false, said
@@ -1331,8 +1393,11 @@ func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, in <
 			col.add(ev)
 			switch ev.Kind {
 			case KStart:
+				// a round's prompt is told, the rounds before billed as
+				// the reply's Deferred (after)
 				this = ev.Usage
-				ev.Usage = ev.Usage.plus(before, false)
+				ev.Usage = ev.Usage.after(before, false)
+				ev.Usage.restart = started
 				if started {
 					ev = Event{Kind: KUsage, Usage: ev.Usage}
 				}
@@ -1349,7 +1414,7 @@ func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, in <
 				}
 				said = said || ev.Text != ""
 			case KToolStart:
-				mine = ev.Name == tool
+				mine = ours(ev.Name)
 				theirs = theirs || !mine
 				if mine {
 					continue
@@ -1371,12 +1436,18 @@ func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, in <
 		}
 		res := col.finish()
 		var calls []Part
+		var at []int // where in the reply each call is
 		for i, p := range res.Parts {
-			if p.Kind == ToolCall && p.Name == tool {
+			if p.Kind == ToolCall && ours(p.Name) {
 				if p.ID == "" {
-					res.Parts[i].ID = fmt.Sprintf("call_search_%d_%d", n, i)
+					kind := "search"
+					if p.Name == advisorTool && p.Name != tool {
+						kind = advisorTool
+					}
+					res.Parts[i].ID = fmt.Sprintf("call_%s_%d_%d", kind, n, i)
 				}
 				calls = append(calls, res.Parts[i])
+				at = append(at, i)
 			}
 		}
 		// a reply that calls the client's tools goes to the client: it
@@ -1392,6 +1463,13 @@ func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, in <
 		searches := make([]Event, len(calls))
 		var wg sync.WaitGroup
 		for i, c := range calls {
+			if c.Name == advisorTool && c.Name != tool {
+				// the advisor, in order, each seeing what the model
+				// said before it
+				advised++
+				results[i], searches[i] = s.adviceRound(ctx, q, res.Parts[:at[i]], c, advised)
+				continue
+			}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -1423,7 +1501,7 @@ func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, in <
 		}
 		// the client hears of the searches as its provider's own
 		for _, ev := range searches {
-			if ev.Kind == KSearch && !send(ev) {
+			if (ev.Kind == KSearch || ev.Kind == KAdvice) && !send(ev) {
 				return
 			}
 		}
@@ -1465,6 +1543,9 @@ func (s *Server) askTranslated(p provider.Provider, to provider.Protocol, model 
 			return nil, 502, p.Name + " " + didNotStream + ": " + provider.APIError(b, "unexpected reply")
 		}
 		events := make(chan Event, 16)
+		// read here, on the request's goroutine: the reader below can
+		// outlive the request (#5973)
+		every, gap := keepaliveEvery, keepaliveGap
 		go func() {
 			defer close(events)
 			defer res.Body.Close()
@@ -1483,8 +1564,8 @@ func (s *Server) askTranslated(p provider.Provider, to provider.Protocol, model 
 			// provider says nothing at all, as streamTranslated's client
 			// does (keepThroughSilence)
 			var mu sync.Mutex
-			heard, stopKeep := keepThroughSilence(&mu, func() {
-				if failed == nil && time.Since(told) >= keepaliveEvery/2 {
+			heard, stopKeep := keepThroughSilence(every, &mu, func() {
+				if failed == nil && time.Since(told) >= every/2 {
 					failed = send(Event{Kind: KAlive})
 					told = time.Now()
 				}
@@ -1509,7 +1590,7 @@ func (s *Server) askTranslated(p provider.Provider, to provider.Protocol, model 
 				// a provider still queued or thinking — keepalives,
 				// response.in_progress — is heard from with nothing to
 				// translate: the reader hears that it goes on (#2316)
-				if failed == nil && time.Since(told) >= keepaliveGap {
+				if failed == nil && time.Since(told) >= gap {
 					failed = send(Event{Kind: KAlive})
 					told = time.Now()
 				}

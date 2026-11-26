@@ -47,6 +47,12 @@ func helpFor(args []string) string {
 		}
 		return groupUsage
 	case "library", "lib":
+		if len(args) > 1 && (args[1] == "project" || args[1] == "projects") {
+			return "  " + libraryProjectUsage
+		}
+		if len(args) > 1 && (args[1] == "plugin" || args[1] == "plugins") {
+			return "  " + libraryPluginUsage
+		}
 		return "  " + libraryUsage
 	case "plugin", "plugins":
 		return pluginUsage
@@ -54,6 +60,12 @@ func helpFor(args []string) string {
 		return quotaUsage
 	case "statusline":
 		return statuslineUsage
+	case "status":
+		return statusUsage
+	case "mtls":
+		return mtlsUsage
+	case "https":
+		return httpsUsage
 	case "heap":
 		return heapUsage
 	case "cpu":
@@ -63,9 +75,17 @@ func helpFor(args []string) string {
 	case "log", "logs":
 		return logUsage
 	case "sessions":
+		if len(args) > 1 && args[1] == "search" {
+			return sessionsSearchUsage
+		}
+		if len(args) > 1 && args[1] == "show" {
+			return sessionsShowUsage
+		}
 		return sessionsUsage
 	case "search":
 		return searchUsage
+	case "artifacts", "artifact":
+		return artifactsUsage
 	case "tool", "tools":
 		return toolUsage
 	case "visible":
@@ -131,9 +151,22 @@ func agentHelp(a *agent.Agent) string {
 	fmt.Fprintf(&b, "  magpie %s <field> <value>  set another field\n", id)
 	fmt.Fprintf(&b, "  magpie %s default          take magpie out: back on what it had before\n", id)
 	fmt.Fprintf(&b, "  magpie %s <field> default  that field back to its own default\n", id)
-	if a.ID == "agy" {
-		fmt.Fprintf(&b, "  magpie %s run [args…]      start agy, on magpie while its model is magpie's (what your shell's agy runs)\n", id)
+	if a.Start != nil {
+		bin := a.Start().Bin
+		fmt.Fprintf(&b, "  magpie %s run [args…]      start %s, on magpie while its model is magpie's (what your shell's %s runs)\n", id, bin, bin)
 		fmt.Fprintf(&b, "  magpie %s env              the variables and model it is started with\n", id)
+	}
+	if a.ID == "claude" {
+		fmt.Fprintf(&b, "  magpie %s run [args…]      start Claude Code through magpie, a plain claude left as it is (what claude-magpie runs)\n", id)
+		fmt.Fprintf(&b, "  magpie %s launcher [add|remove]   the claude-magpie command\n", id)
+	}
+	if a.ID == "claude-desktop" {
+		fmt.Fprintf(&b, "  magpie %s launcher [add|remove]   Claude Magpie.app (macOS): Desktop on magpie in a folder of its own, your own Claude Desktop left signed in\n", id)
+	}
+	// the tiers (Claude Code, Claude Desktop) and roles (omp) that take a
+	// model of their own, beside the main one (KoiLx0 on X)
+	if slots := slotKeys(a); len(slots) > 0 {
+		fmt.Fprintf(&b, "  magpie %s %s <model>   give one its own model (%s); default puts it back on the main model\n", id, slots[0], strings.Join(slots, ", "))
 	}
 	var keys []string
 	for _, f := range a.Fields {
@@ -174,4 +207,23 @@ func flagArg(args []string) string {
 		return a
 	}
 	return ""
+}
+
+// ompRoles are the omp fields that run on a model of their own.
+var ompRoles = []string{"subagent", "small", "slow", "plan", "vision", "advisor", "commit", "tiny", "memory"}
+
+// slotKeys are the fields of an agent that each take a model of their own
+// beside its main one: Claude Code's and Claude Desktop's tiers, omp's roles.
+func slotKeys(a *agent.Agent) []string {
+	var out []string
+	for _, f := range a.Fields {
+		switch {
+		case f.Key == "model":
+		case slices.Contains([]string{"opus", "sonnet", "haiku", "fable"}, f.Key):
+			out = append(out, f.Key)
+		case strings.HasPrefix(a.ID, "omp") && slices.Contains(ompRoles, f.Key):
+			out = append(out, f.Key)
+		}
+	}
+	return out
 }

@@ -37,6 +37,34 @@ func keptAs(agent string) string {
 	return ""
 }
 
+// CodexSignInKept reports whether the account Codex is signed in to is the
+// one the user keeps it on (keepsLogin): the account KeepLoginAs names, or,
+// kept on the first with none named, the one it is on, which magpie then
+// never moves it off. The Codex app shows that account as the user's own,
+// so on one of Codex's own models magpie doesn't become Codex's provider
+// while it is held (the agent package's outOn): its takeover answers
+// account/read with no account, and the app showed "magpie" for the
+// account the user picked (davezfr on X, account 1 out of its allowance
+// and its credits). On a model of magpie's it does, kept or not, or the
+// app greys Send for it till the reset. false while it can't be told.
+func CodexSignInKept() bool {
+	for _, p := range storedFile().Providers {
+		if p.ID != "codex" {
+			continue
+		}
+		if !p.keepsLogin() {
+			return false
+		}
+		for _, l := range Logins("codex") {
+			if l.Active {
+				return p.KeepLoginAs == "" || strings.EqualFold(l.User, p.KeepLoginAs)
+			}
+		}
+		return false
+	}
+	return false
+}
+
 // LoginRanks is, for the account Codex or Claude Code is signed in to while
 // it is kept signed in to one of the user's choosing (KeepLoginAs), each of
 // the agent's accounts' place in the order the gateway tries them, the one
@@ -84,6 +112,9 @@ func SetKeepLoginAs(id, user string) error {
 	}
 	if to.Token {
 		return fmt.Errorf(errClaudeTokenSwitch, to.User)
+	}
+	if to.AccessOnly {
+		return fmt.Errorf(errCodexAccessOnlySwitch, to.User)
 	}
 	if !p.KeepLogin || p.KeepLoginAs == "" {
 		// the order the gateway goes by now — the one signed in to
@@ -149,7 +180,7 @@ func rankLogins(agent string, order []string) error {
 // choosing, the one signed in to is the first again.
 func signInToFirst(agent string) error {
 	for _, l := range Logins(agent) {
-		if (l.Active || l.On) && !l.Paused && l.Lapsed == "" && !l.Token {
+		if (l.Active || l.On) && !l.Paused && l.Lapsed == "" && !l.Token && !l.AccessOnly {
 			if l.Active {
 				return nil
 			}

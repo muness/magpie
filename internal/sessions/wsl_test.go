@@ -34,6 +34,11 @@ func wslDistro(t *testing.T) (home string, running *bool) {
 	on := true
 	WSLHomes = func() []WSLHome { return []WSLHome{{Distro: "Ubuntu", Home: home, Running: on}} }
 	t.Cleanup(func() { wslSettle(); WSLHomes = nil; Reset() })
+	// the tests read what the first listing found: on a busy machine the
+	// walk outlasts the 3s a page waits for it, and the count read 0
+	was := wslFirstWait
+	wslFirstWait = time.Minute
+	t.Cleanup(func() { wslFirstWait = was })
 	Reset()
 	return home, &on
 }
@@ -386,5 +391,36 @@ func TestWSLNoneWithoutHomes(t *testing.T) {
 	}
 	if r := ResumeCommand("claude", "abc", ""); r != "claude --resume abc" {
 		t.Fatal(r)
+	}
+}
+
+// shangyuan0818 on X: on a wsl.exe that hangs, the first listing of the
+// distros never ends in time, and each read waited wslFirstWait for it
+// afresh: the Sessions page's list, stats and overview read one after
+// another, ~10s in all. The reads wait wslFirstWait all told.
+func TestWSLFirstWaitIsWaitedOnce(t *testing.T) {
+	wslDistro(t)
+	release := make(chan struct{})
+	homes := WSLHomes
+	WSLHomes = func() []WSLHome { <-release; return homes() } // wsl.exe hangs
+	t.Cleanup(func() { close(release); wslSettle() })
+	was := wslFirstWait
+	wslFirstWait = 500 * time.Millisecond
+	t.Cleanup(func() { wslFirstWait = was })
+
+	start := time.Now()
+	for range 4 {
+		wslFiles("claude", "codex")
+	}
+	// four waits afresh are 2s; once is 0.5s
+	if d := time.Since(start); d > 1500*time.Millisecond {
+		t.Fatalf("four reads took %v on a hung WSL", d)
+	}
+	// once the listing ends, what it found is read
+	close(release)
+	release = make(chan struct{})
+	wslSettle()
+	if len(wslFiles("claude")) == 0 {
+		t.Fatal("the distro's sessions weren't read once listed")
 	}
 }

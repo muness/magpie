@@ -18,6 +18,7 @@ describe and review a change to a subsystem is in the
 | Another app's values come from that app. | When magpie writes another app's file or speaks for it, take each field's type and value from that app's own data, binary, merge code or docs, not only its field names. 84554e57 wrote updatedAt in milliseconds and hung Claude Desktop's skills page (#863). #966 guessed Codex's limit_reached, which #996 undid after reading ChatGPT.app. On 10-13 accc8c090 copied Claude Code's OAuth client names but sent its own redirect_uri (127.0.0.1, where Claude Code sends localhost); e0ecf0161 read the binary and fixed it. |
 | Nothing that can block runs under a lock its reader needs. | Never send on a channel or call anything that can block while holding a lock the receiver takes first. Set shared state before the handoff that lets another goroutine look at it, and a struct copied by value that holds a map is not a copy. A fake server's handler runs on many goroutines: guard what it records with a lock, and count only the calls the test makes, since background reads reach it too. A change that starts a goroutine or timer runs `-race` before it is pushed. 85fd35ab hung macOS -race CI (4fb8e887). 01e66e0f's marshal wrote into a shared map (15afd988). On 10-11 7cba316b9's turn-done timer read fields on its own goroutine and went red under -race (a2afc1828). On 10-13 TestKeptLoginStandsAtItsPlace's fake Codex appended from two goroutines (a75de4c21). |
 | magpie's default never overrides a value the user set. | Before writing a key, list everywhere the agent or magpie reads that setting from, and test with a user-set value present. A migration that rewrites a setting names the users who set it themselves, and leaves their value alone or says in the release why not. CLAUDE_CODE_AUTO_COMPACT_WINDOW overrode the user's own autoCompactWindow for ~150 releases (602d4ec6). On 10-10 four fixes (603dc0c4, 5aca7d09, c65d9fb4, d9bf7c1c) each started without a test holding a user-set value. On 10-17 5a2414acd turned every unmarked Essentials preset into All, including one a user picked with `magpie plugin preset essentials` (#2749). |
+| A size budget is met, not raised. | A change that reaches a budget (app.js, the core scripts) moves something out first: to a plugin page, a lazily loaded file like `updatesource.js`, or code it replaces. A raise names what the owner agreed to, not "nothing left to move". Comments are not what gets cut: the budget counts code. After a rebase, run the budget test again at the pushed head. app.js's budget rose four times in 2.5 days to 1,269,000 (85eef5d87, #2710). On 11-12 coreScriptBudget rose four times in one afternoon, 1,089 bytes, with nothing moved out (d96403141, 05cadcafd, 4519eea71, 09e2eef0d). |
 | Checks cover the edges the change touches. | For numbers, check the boundaries. For paths, check each platform (macOS, Linux, Windows). For concurrency, check races and stale state. Pick checks by risk. |
 
 ## Tests
@@ -30,8 +31,11 @@ describe and review a change to a subsystem is in the
 | Tests check behavior, not implementation. | Assert what the user or caller needs. Formatting changes and internal refactors shouldn't break a test, unless exact bytes are the requirement. |
 | A test that fails on `main` is a bug to fix now. | "Fails the same on origin/main" is not a baseline, and neither is "fails under the full run, passes alone". Fix it at its cause, or open an issue naming the cause, in a commit of its own, before shipping on top of it. From 10-05 to 10-07 dozens of commits shipped past red tests. Some were real bugs: a data race (a45b3e09), test order (bfe8bcaf), and click-scroll red since 5d871723 while dcbae2ef, 76d82528 and b2345078 shipped past it. Run `go test -race -count=20 -run X` before calling a Go test a flake. |
 | A red's issue is read to its last comment, and a patch on it is taken first. | Before filing, commenting on or shipping past a red, search its test's name and read every comment. "Seen again" is not work on it: take it, or say who has it. A patch posted there is reviewed and ported before anyone writes another. #1794 got four "seen again" comments before anyone took it (10-12). #2444 had ump45nose's patch for 22 hours while two sessions commented, until CI went red at f191d6423 (10-17). JoeyWu-tech's #3568 patch, with red-on-old tests, waited three days until 0a7633136's CI went red and 11c427eaa ported it (10-28). |
+| A check that a value is gone looks past text magpie or the test made up. | A substring check strips placeholders and stand-ins first, or looks for a value no port, id, time, hash or random name can spell (letters only, longer than a few characters). 6c099edd's "ops" was in a placeholder's suffix ({{HOSTNAME_mlopsiy3}}, f0453192, 10-10). On 11-10 a port and then a route_id held TestSearchAPIFailureKeepsNoURL's "4410" (17b9b5b03). On 11-15 TestMoreKinds' "ops" was in the made-up user name zpxopsat (#4345, filed 11-12 as "passes on rerun"); a key found to spell it reproduces the red. |
 | Tests stay out of the real machine. | Run them under a temp HOME with Go's caches pinned (see the snippet in [provider-plugins.md](subsystems/provider-plugins.md)). Never touch a real agent's config or `~/.config/magpie`. An agent's variable goes in `agentenv.Vars`, so the sandbox clears it. |
 | Whatever a test starts ends when the test does. | A fake process, a goroutine or an async refresh a test sets going is stopped or waited for before the test returns, or it writes into the next test's folder ("directory not empty") or spins for days. A package that isolates itself in its own `TestMain` instead of `testenv.Run` sets what testenv sets, `testenv.Marker` included. TestClaudeSignInByPaste's fake polled for 2 days (38a0f470). On 10-11 a CLI-identity ask outliving its test broke the next one (#1524): 4ee3a76b fixed it in internal/gateway only, 9c377231 for every package through the marker, which the gateway never set (a349de82). |
+| One full suite runs on a machine at a time. | A full `go test ./...` or GUI suite waits for the one already running on that machine (mote, then mica), and a record from a run beside another suite is not a pass. Its reds are named with an issue each, not "files this change doesn't touch". On 10-16 three suites from one session at load 300 to 400 all timed out (#2557). On 10-17 three `go test ./...` runs and ~35 GUI runners shared one box, and a run's Go cache was trimmed mid-run by another (#2544, #2645). On 11-16 64c426158 ran the whole GUI suite on mica beside another session's full suite and was pushed with 90 reds named only by page (accounts, Details, keys, plugins, providers). |
+| A record is written once its run has ended. | A body names the result of a run that finished: "still running at push" or "N in, M red when this was written" is not a record, and every red in it is named with its issue. ca9b5048e (10-28) recorded 531 ok and 5 red with its run going on, and routing-model-rest, not among the five, went 20 of 20 red (a8098a886). On 11-18 97e0ecdaa recorded 3736 tests in and 127 red, named issues for some files and left the rest to another session's rerun. |
 | A timing test leaves room on both sides. | Never bound a test by wall-clock time a loaded runner can exceed, and keep a threshold classifier's fixture far from every threshold it has. Reproduce a timing failure by injecting the delay (a held write, a late first arrival), not by rerunning until it fails, and list every timing assumption in the test when fixing one. 319b72c7 fixed one of two loops sharing a 2000-line bound and the other went red 9h later (229ce19a). On 10-11 TestMaxRPM's flake was a real gap: a first request that reached the vendor late let the vendor see one too many in its minute (ce1ecaa4), and the queued-stream tests timed the client's clock under CPU starvation (3f4287e6). |
 
 ## Acceptance criteria
@@ -71,6 +75,19 @@ listed as not run, never left out.
    test that pinned the old text. On 10-13 four commits ran chosen
    packages and turned main red this way: 6fa3109ea (494609866),
    43d8a5633 (24146c031), 5617281f5 and cdb7b5ff7 (c6de0d2a5).
+   A guard that keeps being missed gets a twin in the package the change
+   runs: internal/gui's TestEveryRouteIsNamedForTheCLI for a new route,
+   internal/agent's TestEveryAgentNamedForTheLibrary for a new agent
+   (red on main four times before it, last at 00b2c11a6, 11-17), and
+   its TestEveryFieldLabelHasTUIZh for a new field's label (618bfc1a9).
+   A change under `site/public/docs` ends with `node search-index.mjs`
+   in site/ (it writes llms-full.txt, search/*.json and
+   docs-index.sums), then `node --test site/*.test.mjs` from the repo
+   root: those files are built from the pages and committed, and a Go
+   change that adds a docs row left them stale on main five times from
+   11-13 to 11-17 (459d668b3, 256910f17, 9dcec6751, dbbb2f26b,
+   00b2c11a6). Every package using testenv now fails its run while a
+   page differs from docs-index.sums.
 4. **GUI tests in both engines.** A change to `internal/gui/assets` runs the
    Playwright tests it touches in Chromium and WebKit (`make test-ui`, or
    `BROWSER=webkit node --test …`). The suite must also pass in Chinese,
@@ -123,14 +140,14 @@ A release counts only when all of these hold:
 - A CI Test run on the tagged commit, or a later one containing it, finished
   green. A run cancelled by the next push is not a pass.
 - The tag `vX.Y.Z` is on `main`, an ancestor of `origin/main`.
-- The release in `yetone/magpie-releases` has all 16 assets.
+- The release in `yetone/magpie-releases` has all 17 assets.
 - That release is marked Latest, the highest version.
 
 Check `git tag` for the next free version first, because releases can be
 made from more than one place. `git fetch --tags` and check the commit
 isn't tagged already: on 10-12 two sessions tagged 396a6a3d4 a minute
 apart, and the lower v0.1.1192 became Latest. A tag is not a release:
-check the release exists with its 16 assets before naming the version to
+check the release exists with its 17 assets before naming the version to
 anyone, and file a release whose build failed instead of letting the next
 tag cover it. v0.1.1213 (hdiutil "Resource busy") and v0.1.1218 (notarising
 lost the network) were never published, and nobody noticed the first for
@@ -198,6 +215,7 @@ applies:
 - Use no native `<select>`. Dropdowns use the app's own menu (`openProtoMenu`).
 - A click never scrolls the page (`scrollOnPurpose`).
 - Don't use colored left-border stripes. Mark state with a dot or a swatch.
+- A glyph drawn beside words has its ink centred in its own box: the path is drawn so its stroked bounds' middle is the viewBox's middle, within 0.1 of 16 units. Then the row's `align-items: center` lines it up with the text, the same for every glyph. Don't nudge one spot with `translateY` or a margin; shift the path itself (every absolute y). `icon-text-align.test.cjs` measures every glyph beside words on five pages, in both engines and en, zh and ja, and names the offenders; a glyph drawn off its middle on purpose goes in its `ALLOW` with why. About 33 commits since 09-01 fixed one icon's alignment at a time before this rule (the owner, 11-23).
 
 ## Commits
 
@@ -236,3 +254,14 @@ fix, taken from a shared index. On 10-12 3e88fc09d carried the auto-mode
 subject but held the Get started card (#1825). On 10-17 another session
 checked out origin/main in 7660399a1's worktree mid-run, and another
 deleted part of 17557132c's GUI log.
+
+A commit's tree is origin/main plus its own change. A file in its `--stat`
+that the change never meant to touch, or a test file going out, is a stale
+tree taking out someone else's work: stop, rebase or cherry-pick onto
+origin/main, and never commit files copied from an older checkout. A
+review checks `git diff <commit>^ <commit> --stat` against the subject.
+On 11-11 85e6ec540 took out the six commits before it (b52c71114). On
+11-12 76ceff87c, under a usage subject, dropped 7c37424fc and d6b5f24db
+with their GUI tests (8097860ab). On 11-13 8c7328f3a (remote quotas)
+wrote 21 files back to their state before 35aaaa4b9 and took out the
+Codex client setting, 2fa79aef3 (#6289) and 797a23cad (926b1e7df).

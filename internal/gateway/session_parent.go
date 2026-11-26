@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -9,6 +8,13 @@ import (
 
 func isTitleKind(kind string) bool {
 	return kind == "thread_title" || kind == "thread_title_reconsideration" || kind == "title_generation"
+}
+
+// isCommitKind: the Codex app's commit message, pull request text and
+// both at once (commit_message, pull_request_message,
+// commit_pull_request_message), each asked for in a schema of its own
+func isCommitKind(kind string) bool {
+	return kind == "commit_message" || kind == "pull_request_message" || kind == "commit_pull_request_message"
 }
 
 func isDescriptionKind(kind string) bool {
@@ -47,7 +53,7 @@ func requestSessionMetadata(h http.Header, body []byte) sessionMetadata {
 	// (#3394). A long body is checked and split once (topMember), so it is
 	// asked straight away: Codex sends client_metadata last, after the
 	// conversation, and looking for the word walked all of it each time.
-	if (len(body) >= validMemoMin || bytes.Contains(body, []byte("client_metadata"))) && metadataOf(body, &metadata) {
+	if (len(body) >= validMemoMin || bodyHas(body, "client_metadata")) && metadataOf(body, &metadata) {
 		if raw := metadata["x-codex-turn-metadata"]; len(raw) > 0 {
 			var text string
 			if json.Unmarshal(raw, &text) == nil {

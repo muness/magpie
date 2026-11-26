@@ -54,9 +54,23 @@ type KeyInfo struct {
 	// Rest is why the gateway passes it over now, after a failure, and
 	// until when; nil while it takes requests.
 	Rest *KeyRest `json:"rest,omitempty"`
+	// Rests are its models' own rests and notices (key/model), soonest
+	// back first: where a refusal rests the model alone (OpenCode Go's
+	// paid models with its windows used up), the key still serves the
+	// others, so the row says which are out without dimming the key
+	// (xzhih on X, #7773).
+	Rests []KeyRest `json:"rests,omitempty"`
 	// Spend is the spend cap set on it and what it has spent in its
 	// period; nil with none.
 	Spend *KeySpend `json:"spend,omitempty"`
+	// UsageCap: its own usage windows are read, so it can be capped at a
+	// share of them; CapHeld is how the cap holds it now (key_allowance.go,
+	// account_caps.go), nil while it takes requests
+	UsageCap bool         `json:"usageCap,omitempty"`
+	CapHeld  *KeyCapState `json:"capHeld,omitempty"`
+	// Balance is the balance the user typed for it and what is left of
+	// it by magpie's count (key_balance_own.go); nil with none.
+	Balance *BalanceEstimate `json:"balance,omitempty"`
 }
 
 // KeySpend is a key's spend cap as its row tells it: the cap, what magpie
@@ -67,6 +81,18 @@ type KeySpend struct {
 	Spent float64    `json:"spent"`
 	Reset *time.Time `json:"reset,omitempty"`
 	Held  bool       `json:"held,omitempty"`
+}
+
+// KeyCapState is a key held at its usage cap: the share used of the fullest
+// window at its cap, that cap and when the last such window renews (zero
+// when one doesn't say). Free are the models on its list the cap holds
+// none of (KeyCapLeaves): OpenCode Go's free models, which no window
+// counts, still go to the key (xzhih on X, #7773).
+type KeyCapState struct {
+	Used float64   `json:"used"`
+	Cap  int       `json:"cap"`
+	Back time.Time `json:"back,omitzero"`
+	Free []string  `json:"free,omitempty"`
 }
 
 // KeyRest is a key's rest as the gateway keeps it: failQuota, failRate…,
@@ -87,6 +113,14 @@ type KeyRest struct {
 	Model string `json:"model,omitempty"`
 	// Error: what the vendor said
 	Error string `json:"error,omitempty"`
+	// Rate: the vendor called it a rate limit and named when it lifts
+	// (gateway.Rest.Rate): the page says rate limited, not quota used up
+	Rate bool `json:"rate,omitempty"`
+	// Notice: it rests no more, but the vendor's limit is still shown
+	// (gateway.LimitNotice): Until is when the vendor said it lifts, zero
+	// when it named no time, and At when it was refused
+	Notice bool      `json:"notice,omitempty"`
+	At     time.Time `json:"at,omitzero"`
 }
 
 // RestKey is what the gateway rests the key k of a provider by: the
@@ -246,6 +280,36 @@ func SplitKeys(text string) []string {
 		}
 	}
 	return out
+}
+
+// AllKeys is every key a provider holds, on or off, in the order its
+// list shows them, each once: what Copy all keys and `magpie provider
+// keys <id>` give, one a line, for another magpie's Paste several or
+// `magpie provider keys <id> add` to take (@emilochen on X: one
+// provider's keys from this computer to a magpie in the cloud). Only
+// the keys go: their names, protocols and plans are this magpie's.
+// A signed-in account has none to give.
+func AllKeys(id string) ([]string, error) {
+	p, err := Find(id)
+	if err != nil {
+		return nil, err
+	}
+	if p.Account != nil {
+		return nil, errors.New("a signed-in account has no keys")
+	}
+	var out []string
+	seen := map[string]bool{}
+	add := func(k string) {
+		if k = strings.TrimSpace(k); k != "" && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	add(p.Key)
+	for _, k := range p.Keys {
+		add(k.Key)
+	}
+	return out, nil
 }
 
 // AddKeys saves several keys at once, on, after the ones the provider has,
@@ -663,6 +727,12 @@ func ReplaceKey(id, keyRef, key string) (was, now string, err error) {
 	moveKeyed(p.AccountProxies, keyRef, now)
 	moveKeyed(p.AccountConcurrency, keyRef, now)
 	moveKeyed(p.KeySpendCaps, keyRef, now)
+	moveKeyed(p.AccountCaps, keyRef, now)
+	moveKeyed(p.AccountWindowCaps, keyRef, now)
+	moveKeyed(p.AccountWindowAmounts, keyRef, now)
+	moveKeyed(p.KeyOwnBalances, keyRef, now)
+	moveKeyed(p.KeyPriceRates, keyRef, now)
+	moveKeyed(p.KeyRateFactors, keyRef, now)
 	return keyRef, now, Save(*p)
 }
 

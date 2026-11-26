@@ -3,9 +3,11 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/yetone/magpie/internal/access"
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/usage"
 )
 
@@ -14,6 +16,10 @@ import (
 type observed struct {
 	watches []usage.Watch
 	routeID int64
+	// keyName is the gateway key the request came with, by the name the
+	// user gave it (access.Identity.KeyName), never its secret; "" without
+	// one. Each span carries it as the ledger's row does (CallerKeyName).
+	keyName string
 }
 
 type observedKey struct{}
@@ -27,9 +33,10 @@ func observeRequest(r *http.Request, kind string, body []byte) (*http.Request, *
 	}
 	// the agent it is recorded as, another magpie's own (callerFrom)
 	agent := callerOf(r).agent
-	q := usage.Request{Header: r.Header, Agent: agent, Session: observedSession(r.Header), Kind: observedKind(agent, kind, body),
-		Plain: local(r) && access.Caller(r.Context()).KeyID == "" && callerOf(r).via == ""}
-	o := &observed{}
+	who := access.Caller(r.Context())
+	q := usage.Request{Header: r.Header, Agent: agent, Session: observedSession(r.Header), Kind: observedKind(claudeCodeAs(r, agent), kind, body),
+		Plain: local(r) && who.KeyID == "" && callerOf(r).via == ""}
+	o := &observed{keyName: who.KeyName}
 	for _, ob := range observers {
 		if w := ob.Begin(q); w != nil {
 			o.watches = append(o.watches, w)
@@ -49,6 +56,15 @@ func observedSession(h http.Header) string {
 	return sessionOf(h)
 }
 
+// claudeCodeAs is agent, or "claude" for Claude Code an app runs under its
+// own key (claudeCodeInside).
+func claudeCodeAs(r *http.Request, agent string) string {
+	if claudeCodeInside(r, agent) {
+		return "claude"
+	}
+	return agent
+}
+
 // Claude's tool-less small tasks (titles, suggestions, haiku helpers) may
 // reuse the parent session but aren't recorded in its transcript. Keep their
 // gateway spans; a model name alone doesn't identify a helper or a subagent.
@@ -59,11 +75,54 @@ func observedKind(agent, kind string, body []byte) string {
 	return kind
 }
 
+// inferredKind is the kind of Claude Code's helper requests it names
+// nowhere in the request: its auto mode classifier and its AgentSummary,
+// told by their content. They are recorded as inferred
+// (usage.InferredSuffix), never as the client's word; "" for any other.
+func inferredKind(in http.Header, from provider.Protocol, body []byte) string {
+	if !fromClaudeCode(in) || from != provider.Anthropic {
+		return ""
+	}
+	switch {
+	case autoModeClassifierAsk(body):
+		return usage.KindAutoMode + usage.InferredSuffix
+	case agentSummaryAsk(body):
+		return usage.KindAgentSummary + usage.InferredSuffix
+	}
+	return ""
+}
+
+// agentSummaryAsk reports whether body, a Messages API request, is Claude
+// Code's AgentSummary: the sub-agent's conversation with a last user
+// message that ends in the ask for a few words of progress ("Describe
+// your most recent action in 3-5 words."). The bytes are looked at first:
+// every request passes here.
+func agentSummaryAsk(body []byte) bool {
+	if !bodyHas(body, "3-5 words") {
+		return false
+	}
+	req, err := parseAnthropic(body)
+	if err != nil || len(req.Messages) == 0 {
+		return false
+	}
+	last := req.Messages[len(req.Messages)-1]
+	if last.Role != "user" || len(last.Parts) == 0 {
+		return false
+	}
+	p := last.Parts[len(last.Parts)-1]
+	if p.Kind != Text {
+		return false
+	}
+	ask := strings.TrimSpace(p.Text)
+	return strings.HasPrefix(ask, "Describe your ") && strings.Contains(ask, " in 3-5 words")
+}
+
 func (o *observed) end(call Call, millis int64) {
 	if o == nil {
 		return
 	}
-	rec := usage.Record{RouteID: o.routeID, Time: call.Time, Agent: call.Agent, Model: call.Model, Status: call.Status, Millis: millis}
+	rec := usage.Record{RouteID: o.routeID, Time: call.Time, Agent: call.Agent, Model: call.Model, Status: call.Status, Millis: millis, CallerKeyName: o.keyName}
+	canceledAs(&rec, call.Status, call.Error)
 	for _, w := range o.watches {
 		w.End(rec)
 	}
@@ -79,7 +138,8 @@ func (o *observed) attempt(call Call, attempt Try, providerID, effort string, he
 	rec := usage.Record{RouteID: o.routeID, Time: attempt.Start, Agent: call.Agent,
 		Provider: providerID, Model: attempt.Model, Requested: call.Model, Served: u.Served, Effort: effort,
 		Input: u.Input, Output: u.Output, CacheRead: u.CacheRead, CacheWrite: u.CacheWrite, CacheUnknown: u.cacheNotCounted(), Reasoning: u.Reasoning,
-		Millis: time.Since(attempt.Start).Milliseconds(), Status: attempt.Status, TTFT: attempt.TTFT, FirstText: attempt.FirstText, FirstReasoning: attempt.FirstReasoning, ReasoningHidden: attempt.ReasoningHidden}
+		Millis: time.Since(attempt.Start).Milliseconds(), Status: attempt.Status, TTFT: attempt.TTFT, FirstText: attempt.FirstText, FirstReasoning: attempt.FirstReasoning, ReasoningHidden: attempt.ReasoningHidden, CallerKeyName: o.keyName}
+	canceledAs(&rec, attempt.Status, attempt.Error)
 	if wanted := usage.ObservedBodies(); wanted != usage.NoBodies {
 		reply, cut := capture.body.text(), capture.body.truncated
 		if !held.passing {

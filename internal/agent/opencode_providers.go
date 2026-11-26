@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"maps"
 	"slices"
 
 	"github.com/yetone/magpie/internal/edit"
@@ -10,8 +11,9 @@ import (
 // OpenCode 2 keeps a provider under providers, in words of its own, and
 // still reads OpenCode 1's provider: a provider named under both is the one
 // under providers, whole, and the other only a line in its log
-// (packages/core/src/config/normalize.ts, mergeMaps, at v2.1.4). magpie
-// writes its provider under provider, which both read. OpenChamber writes a
+// (packages/core/src/config/normalize.ts, mergeMaps, at v2.1.4). For
+// OpenCode 1 magpie writes its provider under provider, which both read; for
+// OpenCode 2 under providers alone (ocFile). OpenChamber writes a
 // provider its form saves under providers and takes it out of provider
 // (packages/web/server/lib/opencode/config-v2.js, writeSectionEntry), so
 // once it had saved magpie's, magpie's next sync put magpie's back under
@@ -37,12 +39,28 @@ func openCodeNative(block any) any {
 		out["package"] = "aisdk:" + npm
 	}
 	if o, ok := b["options"]; ok {
+		// setCacheKey is no setting of the package's but OpenCode 2's
+		// supportsPromptCacheKey, for the whole provider (migrate.ts,
+		// migrateStandardProvider; #5468)
+		if om, ok := o.(map[string]any); ok {
+			if ck, has := om["setCacheKey"]; has {
+				out["compatibility"] = map[string]any{"supportsPromptCacheKey": ck}
+				om = maps.Clone(om)
+				delete(om, "setCacheKey")
+				o = om
+			}
+		}
 		out["settings"] = o
 	}
 	// in the order magpie lists them (#4575): OpenCode lists a provider's
 	// models in the file's key order
+	// and none where the block has none (OpenCode's magpie plugin lists
+	// them: opencode_discover.go)
+	in, listed := b["models"].(orderedJSON)
+	if !listed {
+		return out
+	}
 	ms := orderedJSON{}
-	in, _ := b["models"].(orderedJSON)
 	for _, p := range in {
 		m, _ := p.v.(map[string]any)
 		e := map[string]any{"name": m["name"]}
@@ -107,6 +125,11 @@ func openCodeNativeVariant(id string, opts any) orderedJSON {
 func openCodeNativeKept(path string, block func() any) func() any {
 	return theirsKept(path, openCodeNativeKey, func() any {
 		v := openCodeNative(block())
+		// a supportsPromptCacheKey the file has already is the user's
+		// (#5468)
+		if _, set := edit.GetJSON(path, openCodeNativeKey+".compatibility.supportsPromptCacheKey"); set {
+			v = withoutOption(v, "compatibility", "supportsPromptCacheKey")
+		}
 		raw, ok := edit.GetJSON(path, openCodeNativeKey+".models")
 		if !ok {
 			return v
@@ -198,15 +221,20 @@ func syncOpenCodeNative(path string, block func() any) error {
 
 // openCodeWiringOff is wiringOff for magpie's provider in the OpenCode
 // config at path: under provider, and under providers where the file keeps
-// it there, which OpenCode 2 reads instead.
+// it there, which OpenCode 2 reads instead; under providers alone in a file
+// written for OpenCode 2 (ocFile). With neither, it is gone.
 func openCodeWiringOff(name, path, v1, key string) string {
 	under := func(prefix string) func(string) (string, bool) {
 		return func(k string) (string, bool) { return edit.GetJSON(path, prefix+k) }
 	}
-	if off := wiringOff(name, path, under("provider."+magpieID+".options."), "baseURL", v1, "apiKey", key); off != "" {
-		return off
+	_, legacy := edit.GetJSON(path, "provider."+magpieID)
+	_, native := edit.GetJSON(path, openCodeNativeKey)
+	if legacy || !native {
+		if off := wiringOff(name, path, under("provider."+magpieID+".options."), "baseURL", v1, "apiKey", key); off != "" {
+			return off
+		}
 	}
-	if _, ok := edit.GetJSON(path, openCodeNativeKey); !ok {
+	if !native {
 		return ""
 	}
 	return wiringOff(name, path, under(openCodeNativeKey+".settings."), "baseURL", v1, "apiKey", key)

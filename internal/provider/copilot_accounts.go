@@ -166,6 +166,7 @@ func moveAccountSettings(id string, moves map[string]string) error {
 			moved = moveKey(p.AccountModels, from, to) || moved
 			moved = moveKey(p.AccountCaps, from, to) || moved
 			moved = moveKey(p.AccountWindowCaps, from, to) || moved
+			moved = moveKey(p.AccountWindowAmounts, from, to) || moved
 			moved = moveKey(p.AccountConcurrency, from, to) || moved
 			moved = moveKey(p.AccountWeights, from, to) || moved
 			moved = moveKey(p.AccountNames, from, to) || moved
@@ -325,12 +326,13 @@ func copilotAccount(cfg string) (Provider, bool) {
 	return copilotProvider(ls[0].app, ls[0].Plan), true
 }
 
-// copilotAlsoOn is the Copilot accounts in use behind the first.
-func copilotAlsoOn() []Provider {
+// copilotAlsoOn is the Copilot accounts in use behind the first; withOff,
+// those turned off too, marked off.
+func copilotAlsoOn(withOff bool) []Provider {
 	var out []Provider
 	for _, c := range copilotLogins(copilotConfigDir()) {
-		if !c.Active && c.On {
-			out = append(out, copilotProvider(c.app, c.Plan))
+		if !c.Active && (c.On || withOff) {
+			out = append(out, offIf(copilotProvider(c.app, c.Plan), !c.On))
 		}
 	}
 	return out
@@ -357,7 +359,7 @@ func copilotUser(ctx context.Context, token, host string) (user, plan string, er
 		}
 		req.Header.Set("Authorization", "token "+token)
 		req.Header.Set("Accept", "application/json")
-		res, err := http.DefaultClient.Do(req)
+		res, err := Keyed(http.DefaultClient).Do(req)
 		if err != nil {
 			return 0, err
 		}

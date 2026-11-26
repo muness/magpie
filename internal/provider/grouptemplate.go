@@ -2,13 +2,13 @@ package provider
 
 import (
 	"cmp"
+	"encoding/json"
 	"fmt"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // A template is a routing group made of the user's own models for a need
@@ -33,10 +33,22 @@ const (
 	// providers, in order, so one vendor down or out of quota doesn't stop
 	// the agent.
 	TemplateSteady = "steady"
+	// TemplatePlan is the strongest model of each of up to three
+	// providers, those billed by a plan (a subscription or token plan)
+	// before the pay-as-you-go ones, so the allowance already paid for is
+	// spent first and a key is the last resort.
+	TemplatePlan = "plan"
+	// TemplateFast is the same strongest models as TemplateSteady, the
+	// provider that has answered fastest lately first (Fastest).
+	TemplateFast = "fast"
+	// TemplateEven is the strongest model alone, from every provider that
+	// serves it (up to four), taken in turn over all their keys and
+	// accounts (Rotate).
+	TemplateEven = "even"
 )
 
 // TemplateKinds are the templates, in the order they are offered.
-var TemplateKinds = []string{TemplateSmart, TemplateThrifty, TemplateSteady}
+var TemplateKinds = []string{TemplateSmart, TemplateThrifty, TemplateSteady, TemplatePlan, TemplateFast, TemplateEven}
 
 // The intents TemplateSmart's classifier chooses between. Hard comes
 // first, so a turn the classifier can't place stays on the strong model,
@@ -64,11 +76,14 @@ const (
 	NeedProvider  = "provider"
 	NeedProviders = "providers"
 	NeedCheap     = "cheap"
+	// NeedPlan: no provider is billed by a plan, so "plan first" has
+	// nothing to put first
+	NeedPlan = "plan"
 )
 
 // nonChat are words of a model id that isn't for an agent's chat: it
 // draws, speaks, listens, embeds or searches rather than answering a turn.
-var nonChat = regexp.MustCompile(`embed|rerank|image|imagen|dall-e|tts|whisper|audio|realtime|transcribe|moderation|ocr|veo|sora|speech|research|guard|computer-use`)
+var nonChat = lazyre.New(`embed|rerank|image|imagen|dall-e|tts|whisper|audio|realtime|transcribe|moderation|ocr|veo|sora|speech|research|guard|computer-use`)
 
 // smallWords are words of a cheap model's id; tinyWords those of one too
 // small to be trusted with an agent's turn when a larger cheap one is
@@ -77,7 +92,7 @@ var nonChat = regexp.MustCompile(`embed|rerank|image|imagen|dall-e|tts|whisper|a
 var (
 	smallWords = []string{"mini", "nano", "flash", "haiku", "lite", "small", "air", "turbo", "fast", "instant", "tiny", "highspeed"}
 	tinyWords  = []string{"nano", "lite", "tiny"}
-	sizeWord   = regexp.MustCompile(`^(\d+(?:\.\d+)?)b$`)
+	sizeWord   = lazyre.New(`^(\d+(?:\.\d+)?)b$`)
 )
 
 // sizeOf is how small a model's id says it is: small, and tiny.
@@ -122,17 +137,22 @@ type rated struct {
 // served, not a group, that answers an agent's chat, with its price — the
 // model's maker's list price when there is one, so a subscription's or a
 // relay's copy weighs as the model does, else what the provider charges.
-func templateModels() []rated {
-	s := settings.Load()
+func templateModels() []rated { return ratedIn(providerEntries()) }
+
+// ratedIn is templateModels among entries, the catalog without its groups:
+// what a group following a template is made of as the groups are built
+// (followTemplate), where asking Served would build them again.
+func ratedIn(entries []Entry) []rated {
+	s := heldSettings()
 	var out []rated
-	for _, e := range Served() {
-		if e.Group != "" || nonChat.MatchString(strings.ToLower(e.Model)) {
+	for _, e := range entries {
+		if e.Group != "" || e.Provider == nil || nonChat.MatchString(strings.ToLower(e.Model)) {
 			continue
 		}
 		r := rated{e: e}
 		if pr, ok := MakerPrice(e.Model); ok {
 			r.out, r.maker = pr.Output, true
-		} else if pr, ok := priceOf(s, e.Provider, true, e.Model, time.Time{}); ok {
+		} else if pr, ok := priceOf(s, *e.Provider, true, e.Model, time.Time{}); ok {
 			// without a rate window's rate (#2463): a template weighs how
 			// strong a model is, which the hour it is made in doesn't change
 			r.out = pr.Output
@@ -166,8 +186,9 @@ func strongest(ms []rated) []rated {
 }
 
 // cheapest are the models fit to be a cheap one beside strong, ranked
-// best first: priced at a quarter of strong or less (or, with no prices
-// to go by, a small model by its id), a known maker's first, the tiny ones
+// best first: priced at a quarter of strong or less, or below it with
+// an id that says small where strong's doesn't (or, with no prices to go
+// by, a small model by its id), a known maker's first, the tiny ones
 // last, then the newest and the dearest of them — the most able of the
 // cheap.
 func cheapest(ms []rated, strong rated) []rated {
@@ -177,7 +198,11 @@ func cheapest(ms []rated, strong rated) []rated {
 			continue
 		}
 		if strong.out > 0 && m.out > 0 {
-			if m.out <= strong.out/4 {
+			// a quarter of the price, or less dear and the small one by
+			// its id: a vendor's own tiers are often nearer than four
+			// times apart (DeepSeek V4 Pro $1.98 out, V4.1 Flash $0.60;
+			// Sonnet and Haiku three times, @qinzhidaoa on X)
+			if m.out <= strong.out/4 || m.out < strong.out && m.small && !strong.small {
 				out = append(out, m)
 			}
 		} else if m.small && !strong.small {
@@ -236,11 +261,14 @@ var TemplateNames = map[string]string{
 	TemplateSmart:   "Hard to strong, easy to cheap",
 	TemplateThrifty: "Cheap first",
 	TemplateSteady:  "Never stuck",
+	TemplatePlan:    "Plan first",
+	TemplateFast:    "Fastest first",
+	TemplateEven:    "Spread evenly",
 }
 
 // TemplateIDs are the ids agents pick a template's group as, before a
 // number when one is in use.
-var TemplateIDs = map[string]string{TemplateSmart: "smart-split", TemplateThrifty: "cheap-first", TemplateSteady: "never-stuck"}
+var TemplateIDs = map[string]string{TemplateSmart: "smart-split", TemplateThrifty: "cheap-first", TemplateSteady: "never-stuck", TemplatePlan: "plan-first", TemplateFast: "fastest-first", TemplateEven: "spread-evenly"}
 
 // templateOf is the template kind made of ms, its classifier a decider of
 // ds when there is one.
@@ -253,10 +281,21 @@ func templateOf(kind string, ms []rated, ds []Entry) Template {
 	}
 	best := strong[0]
 	switch kind {
-	case TemplateSteady:
-		// the strongest of each provider, up to three
+	case TemplateSteady, TemplatePlan, TemplateFast:
+		// the strongest of each provider, up to three; the plan ones
+		// first for TemplatePlan
+		pick := strong
+		if kind == TemplatePlan {
+			plan := func(m rated) bool { return m.e.Provider.BillingKind() == BillingPlan }
+			if !slices.ContainsFunc(strong, plan) {
+				t.Why, t.Need = "no provider of yours is billed by a plan: add a subscription or token plan", NeedPlan
+				return t
+			}
+			pick = slices.Clone(strong)
+			slices.SortStableFunc(pick, func(a, b rated) int { return -cmp.Compare(btoi(plan(a)), btoi(plan(b))) })
+		}
 		seen := map[string]bool{}
-		for _, m := range strong {
+		for _, m := range pick {
 			if len(t.Group.Members) == 3 {
 				break
 			}
@@ -269,6 +308,23 @@ func templateOf(kind string, ms []rated, ds []Entry) Template {
 			t.Group.Members = nil
 			t.Why, t.Need, t.Of = "it needs models from two providers: "+best.e.Provider.Name+" is the only one", NeedProviders, best.e.Provider.Name
 		}
+		if kind == TemplateFast {
+			t.Group.Routing = Fastest
+		}
+		return t
+	case TemplateEven:
+		// the one strongest model, from each provider that serves it
+		seen := map[string]bool{}
+		for _, m := range strong {
+			if len(t.Group.Members) == 4 {
+				break
+			}
+			if bareModel(m.e.Model) == bareModel(best.e.Model) && !seen[m.e.Provider.ID] {
+				seen[m.e.Provider.ID] = true
+				t.Group.Members = append(t.Group.Members, m.e.ID)
+			}
+		}
+		t.Group.Routing = Rotate
 		return t
 	}
 	cheap := cheapest(ms, best)
@@ -340,6 +396,7 @@ func AddTemplate(kind, name string) (Group, error) {
 		return Group{}, err
 	}
 	g := t.Group
+	g.Template = kind // its picks follow the user's models from now on
 	if name = strings.TrimSpace(name); name == "" {
 		name = g.Name
 	}
@@ -353,4 +410,105 @@ func AddTemplate(kind, name string) (Group, error) {
 		}
 	}
 	return g, nil
+}
+
+// followTemplate is g, a group following a template (Group.Template), with
+// the picks the template makes of ms now: its members, routing, rules and
+// classifier. A template that can't be made of them now (a provider
+// signed out) leaves the picks it had, so the group never goes empty.
+func followTemplate(g Group, ms []rated, ds []Entry) Group {
+	if !slices.Contains(TemplateKinds, g.Template) {
+		return g
+	}
+	t := templateOf(g.Template, ms, ds)
+	if t.Why != "" || len(t.Group.Members) == 0 {
+		return g
+	}
+	g.Members, g.Routing, g.Rules = t.Group.Members, t.Group.Routing, t.Group.Rules
+	g.SetClassifiers(t.Group.Classifiers())
+	// what named the members it had: a change to any of them made the
+	// picks the user's, so these are empty while it follows
+	g.Match, g.Placed, g.Off, g.Fast, g.Ultra, g.Weights, g.EffortMaps = nil, nil, nil, nil, nil, nil, nil
+	return g
+}
+
+// followsAfter is the template a group being saved (g, cleaned, own its
+// named members) follows from now on: the one it is given, else the one
+// it followed, and only while its picks are the template's as the user
+// reads them now (followTemplate). A save that changes a member, the
+// routing, a rule or the classifier makes the picks the user's, never
+// picked over again (the user's word over magpie's); a rename or a note
+// keeps it following.
+func followsAfter(g Group, own []string, stored []Group, entries []Entry) string {
+	kind := strings.TrimSpace(g.Template)
+	var was Group
+	if i := slices.IndexFunc(stored, func(x Group) bool { return x.ID == g.ID }); i >= 0 {
+		was = stored[i]
+		if kind == "" {
+			kind = was.Template
+		}
+	}
+	if !slices.Contains(TemplateKinds, kind) {
+		return ""
+	}
+	was.Template = kind
+	now := followTemplate(was, ratedIn(entries), OfferedDeciders(nil))
+	if len(now.Members) == 0 {
+		return "" // a new group whose template can't be made now
+	}
+	for i, m := range now.Members {
+		now.Members[i] = cleanMember(entries, m)
+	}
+	rules := slices.Clone(now.Rules)
+	for i := range rules {
+		rules[i].MapUses(func(u string) string { return cleanMember(entries, u) })
+	}
+	var err error
+	if now.Rules, err = cleanRules(rules, now.Members); err != nil {
+		return ""
+	}
+	if !GroupRouting(now.Routing) {
+		now.Routing = ""
+	}
+	g.Members = own
+	if picksOf(g) != picksOf(now) {
+		return ""
+	}
+	return kind
+}
+
+// picksOf is what of a group a template picks, and the user changes to
+// pick for themselves, as one string to compare: an empty list and none
+// are the same.
+func picksOf(g Group) string {
+	b, _ := json.Marshal(struct {
+		Members, Match, Off, Fast, Ultra, Classifiers []string
+		Routing                                       string
+		Rules                                         []Rule
+		Weights                                       map[string]int
+		EffortMaps                                    map[string]map[string]string
+	}{nonEmpty(g.Members), nonEmpty(g.Match), nonEmpty(g.Off), nonEmpty(g.Fast), nonEmpty(g.Ultra), nonEmpty(g.Classifiers()),
+		g.Routing, nonEmptyRules(g.Rules), nonEmptyMap(g.Weights), nonEmptyMap(g.EffortMaps)})
+	return string(b)
+}
+
+func nonEmpty(s []string) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	return s
+}
+
+func nonEmptyRules(rs []Rule) []Rule {
+	if len(rs) == 0 {
+		return nil
+	}
+	return rs
+}
+
+func nonEmptyMap[V any](m map[string]V) map[string]V {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }

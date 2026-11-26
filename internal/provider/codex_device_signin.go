@@ -52,7 +52,7 @@ func codexDevicePost(ctx context.Context, u string, body any) (int, []byte, erro
 	}
 	codexClientHeaders(req.Header, codexVersion())
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := Keyed(http.DefaultClient).Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -155,7 +155,7 @@ func startCodexDeviceSignIn(s *signInFlow) error {
 			l, err := codexExchange(ectx, ok.Code, ok.Verifier, base+"/deviceauth/callback")
 			if err == nil {
 				var using bool
-				err = keepLogin(ectx, func() (err error) { using, err = addLogin(l); return err })
+				err = keepLogin(ectx, func() (err error) { using, err = addLoginNamed(&l); return err })
 				if err == nil {
 					ecancel()
 					s.finish(SignInState{State: "done", User: l.User, Plan: l.Plan, Using: using})

@@ -40,6 +40,7 @@ func UserBinDirs() []string {
 	known := []string{
 		filepath.Join(appdir.Getenv("APPDATA"), "npm"),
 		filepath.Join(home, ".local", "bin"),
+		bunBin(),
 		filepath.Join(home, ".bun", "bin"),
 		filepath.Join(appdir.Getenv("LOCALAPPDATA"), "Volta", "bin"),
 		filepath.Join(appdir.Getenv("LOCALAPPDATA"), "pnpm"),
@@ -97,6 +98,9 @@ func LoginEnv(string) string { return "" }
 
 // LoginEnvKnown is "" on Windows too (LoginEnv).
 func LoginEnvKnown(string) string { return "" }
+
+// LoginEnvSaid is "" on Windows too (LoginEnv).
+func LoginEnvSaid(string) string { return "" }
 
 // ShellPath is LoginPath on Windows: PowerShell and cmd both take the
 // registry's PATH.

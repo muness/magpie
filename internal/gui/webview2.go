@@ -2,8 +2,11 @@ package gui
 
 import (
 	"fmt"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // magpie's windows are WebView2 on Windows, a runtime Windows 10 doesn't
@@ -65,6 +68,13 @@ var webView2Words = map[string][2]string{
 			"Die Download-Seite jetzt öffnen?"},
 }
 
+// webViewOcclusion is Chromium's tracking of whether a window is covered,
+// turned off for magpie's windows (windowsOptions): when it is wrong, as
+// for a window shown while the screen is locked or the display off, the
+// page stays white (screenback_windows.go). A hidden or minimised window is
+// told so by Wails (put_IsVisible) without it.
+const webViewOcclusion = "CalculateNativeWinOcclusion"
+
 // webView2Args sorts what the user put in WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
 // (webview2env.Args) into Wails' three options, which it passes as the
 // app's own arguments: the features to disable, the ones to enable, and
@@ -90,6 +100,41 @@ func webView2Args(env string) (disabled, enabled, other []string) {
 		}
 	}
 	return disabled, enabled, other
+}
+
+// isolateSandboxedFrames is the Chromium feature that runs a sandboxed
+// frame in a process of its own. WebView2 157 has it on, and Wails
+// (v3.0.0-beta.24) registers its WebResourceRequested filter with
+// AddWebResourceRequestedFilter, which isn't raised for the requests
+// such a frame makes: a plugin's page or panel (pluginpages.js, sandbox
+// allow-scripts) got its index.html, but its bridge.js, scripts and
+// stylesheet went out to the network as http://wails.localhost/... and
+// failed with ERR_CONNECTION_REFUSED, so the page never said hello and
+// showed "This page stopped working" (Mute06162 on X, 0.1.4066). Wails'
+// request cancellation took the frame for a worker too, and logged
+// "Worker request cancellation setup: The parameter is incorrect."
+const isolateSandboxedFrames = "IsolateSandboxedIframes"
+
+// sharedFrameProcess is disabled with isolateSandboxedFrames first, so a
+// sandboxed frame stays in its window's process, where Wails serves its
+// requests. The frame keeps its sandbox: an opaque origin, its own policy
+// (pagePolicy), no way to the window but messages. A user who enables
+// the feature in WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS keeps it on.
+func sharedFrameProcess(disabled, enabled []string) []string {
+	if slices.Contains(enabled, isolateSandboxedFrames) {
+		return disabled
+	}
+	return addFeatures([]string{isolateSandboxedFrames}, strings.Join(disabled, ","))
+}
+
+// occlusionOff adds webViewOcclusion to the disabled features, after the
+// user's own; a user who enables it in WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
+// keeps it on.
+func occlusionOff(disabled, enabled []string) []string {
+	if slices.Contains(enabled, webViewOcclusion) {
+		return disabled
+	}
+	return addFeatures(disabled, webViewOcclusion)
 }
 
 // addFeatures adds a comma list's features to have, each once.
@@ -126,4 +171,81 @@ func splitArgs(s string) []string {
 		out = append(out, cur.String())
 	}
 	return out
+}
+
+// WebView2 that does not come up. A magpie started while the one before it
+// is still going down finds the profile folder held by the old
+// msedgewebview2, and Wails waits a minute for a controller that never
+// arrives, then exits (@ljlwlcz on X, 0.1.3688: a restart by a script left
+// no window). Two things answer it: the start waits for the folder to be
+// free, and a start that still fails is tried again, a few times.
+
+// webView2TryEnv counts the starts that ended in a WebView2 failure; each
+// relaunch passes it on.
+const webView2TryEnv = "MAGPIE_WV2_TRY"
+
+// webView2Tries is how many starts are made before the failure is shown.
+const webView2Tries = 3
+
+// webView2Folder is the folder WebView2 keeps its profile in: the one magpie
+// passes Wails (webViewUserDataPath), else Wails' own default,
+// %AppData%\<exe name>.
+func webView2Folder(userDataPath, appData, exe string) string {
+	if userDataPath != "" {
+		return userDataPath
+	}
+	if appData == "" || exe == "" {
+		return ""
+	}
+	return filepath.Join(appData, filepath.Base(exe))
+}
+
+// webView2Failure says whether err is the webview not coming up, the
+// errors Wails' Embed reports: the controller timeout and the loader's.
+func webView2Failure(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "webview2")
+}
+
+// webView2Try is the number of starts already made, from the env value.
+func webView2Try(v string) int {
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// webView2Backoff is how long a start waits before the n-th try (n >= 1).
+func webView2Backoff(n int) time.Duration {
+	return time.Duration(n) * 2 * time.Second
+}
+
+// awaitWebView2Folder polls free until it says so or max passes, and says
+// whether it was free. sleep is a var for tests.
+func awaitWebView2Folder(free func() bool, max, step time.Duration, sleep func(time.Duration)) bool {
+	for waited := time.Duration(0); ; waited += step {
+		if free() {
+			return true
+		}
+		if waited >= max {
+			return false
+		}
+		sleep(step)
+	}
+}
+
+// webView2FailedNotice is the box shown when the webview would not start
+// after every try: what failed and what to do, in lang (English where it
+// has none of its own).
+func webView2FailedNotice(lang, reason, version string) (title, body string) {
+	if strings.HasPrefix(lang, "zh") {
+		return "magpie 的窗口没能打开",
+			fmt.Sprintf("WebView2 在 %d 次启动里都没有就绪（运行时 %s）。\r\n\r\n%s\r\n\r\n请结束残留的 msedgewebview2.exe 后重新打开 magpie；也可以用 \"magpie web\" 在浏览器里打开。详情见 magpie 的日志。", webView2Tries, version, reason)
+	}
+	return "magpie's window didn't open",
+		fmt.Sprintf("WebView2 was not ready in %d starts (runtime %s).\r\n\r\n%s\r\n\r\nEnd any leftover msedgewebview2.exe and open magpie again, or use \"magpie web\" in your browser. The details are in magpie's log.", webView2Tries, version, reason)
 }

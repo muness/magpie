@@ -40,12 +40,15 @@ func fresh(t *testing.T) {
 	t.Setenv("USERPROFILE", home) // Windows finds the home there
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
-	restingUntil.Lock()
-	restingUntil.m = map[string]time.Time{}
-	restingUntil.Unlock()
+	// a rest recorded here is let go when the test ends too: the next test
+	// in the process may not come through fresh (#6717)
+	noRests()
+	t.Cleanup(noRests)
 	sticks.Lock()
 	sticks.m = map[string]stick{}
 	sticks.Unlock()
+	provider.ForgetReorders()
+	t.Cleanup(provider.ForgetReorders)
 	refusedSeals.Lock()
 	refusedSeals.m = map[string]sealsRefused{}
 	refusedSeals.Unlock()
@@ -262,6 +265,21 @@ func TestRoutingGroups(t *testing.T) {
 	r := s.trace.routes[len(s.trace.routes)-1]
 	if r.Group == nil || r.Group.ID != "mine" || len(r.Order) != 2 || r.Order[0].Provider != "b" || r.Order[1].Model != "only-a" {
 		t.Fatalf("trace: %+v", r)
+	}
+
+	// renamed, the group still takes requests on its old id (xinvxueyuan
+	// on Discord); renamed back, it is its own id again
+	if err := provider.RenameGroup("mine", "ours"); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := postAs(t, s, "", `{"model":"group/mine","messages":[{"role":"user","content":"hi"}]}`); code != 200 || !strings.Contains(body, "from ka") {
+		t.Fatalf("old id: %d %s", code, body)
+	}
+	if r := s.trace.routes[len(s.trace.routes)-1]; r.Group == nil || r.Group.ID != "ours" {
+		t.Fatalf("old id trace: %+v", r)
+	}
+	if err := provider.RenameGroup("ours", "mine"); err != nil {
+		t.Fatal(err)
 	}
 
 	// removing one magpie found hides it; showing it brings it back

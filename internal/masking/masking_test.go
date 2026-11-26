@@ -94,9 +94,11 @@ type fake struct {
 	installed, fails bool
 }
 
-func (fake) ID() string        { return pii.AstrLinkGuard }
-func (fake) MinScore() float64 { return 0.8 }
-func (f fake) Installed() bool { return f.installed }
+func (fake) ID() string           { return pii.AstrLinkGuard }
+func (fake) MinScore() float64    { return 0.8 }
+func (f fake) Installed() bool    { return f.installed }
+func (fake) ManagesWeights() bool { return true }
+func (fake) Generation() string   { return "" }
 func (f fake) Find(_ context.Context, texts []string) ([][]redact.Found, error) {
 	if f.fails {
 		return nil, errors.New("pf-serve exited")
@@ -134,6 +136,47 @@ func TestNoModelYetMasksByTheRules(t *testing.T) {
 	}
 	if o := options(); o.Model == nil || !o.NamesByModel || len(fetches) != 1 {
 		t.Fatalf("on disk: model %v, names by model %v, fetches %v", o.Model != nil, o.NamesByModel, fetches)
+	}
+}
+
+// pluginFake is a plugin's model: its weights are the user's, nothing to
+// download, and gen is its build.
+type pluginFake struct {
+	fake
+	gen string
+}
+
+func (pluginFake) ID() string           { return "external/plugin/0123456789abcdef/v1" }
+func (pluginFake) ManagesWeights() bool { return false }
+func (p pluginFake) Generation() string { return p.gen }
+
+// A plugin's model picked while its plugin is off or its files are gone
+// masks by the rules alone, though the user turned the model on, and
+// starts no download; there, its build goes with what it finds.
+func TestPluginModelUnavailableIsTheRules(t *testing.T) {
+	h := t.TempDir()
+	t.Setenv("HOME", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
+	m := pluginFake{gen: "g1"}
+	if err := settings.Save(settings.Settings{Redact: true, RedactPersonal: true, RedactModel: true, RedactModelName: m.ID()}); err != nil {
+		t.Fatal(err)
+	}
+	fetches := 0
+	wasPicked, wasFetch, wasDisk := picked, fetch, onDisk
+	picked = func(settings.Settings) pii.Model { return m }
+	fetch = func(pii.Model, bool) { fetches++ }
+	onDisk = func() bool { return false }
+	t.Cleanup(func() { picked, fetch, onDisk = wasPicked, wasFetch, wasDisk })
+	o := options()
+	if o.Model != nil || fetches != 0 {
+		t.Fatalf("unavailable: model %v, fetches %d", o.Model != nil, fetches)
+	}
+	if out, n := redact.Mask("key sk-ant-api03-"+strings.Repeat("a", 40), o); n != 1 || strings.Contains(out, "aaaa") {
+		t.Fatalf("the rules didn't mask: %q", out)
+	}
+	m.installed = true
+	if o := options(); o.Model == nil || o.ModelGeneration != "g1" || o.NamesByModel {
+		t.Fatalf("available: model %v, generation %q, names by model %v", o.Model != nil, o.ModelGeneration, o.NamesByModel)
 	}
 }
 
@@ -220,6 +263,7 @@ func TestDefaultModelHangingIsTheRules(t *testing.T) {
 	// TestStrictModelStalledIsTheRulesForWhatItDidntRead's)
 	wasStrict := strictWait
 	strictWait = time.Hour
+	behind.Store(0) // not behind: a strict wait is waited whole
 	t.Cleanup(func() { strictWait = wasStrict })
 	done := make(chan any, 1)
 	go func() {
@@ -276,7 +320,7 @@ func TestStrictModelStalledIsTheRulesForWhatItDidntRead(t *testing.T) {
 	fetch = func(pii.Model, bool) {}
 	onDisk = func() bool { return true }
 	strictWait = 200 * time.Millisecond
-	t.Cleanup(func() { picked, fetch, onDisk, strictWait = wasPicked, wasFetch, wasDisk, wasWait })
+	t.Cleanup(func() { picked, fetch, onDisk, strictWait = wasPicked, wasFetch, wasDisk, wasWait; behind.Store(0) })
 
 	key := "sk-ant-api03-" + strings.Repeat("a", 40)
 	mask := func(body []byte) ([]byte, int, any) {
@@ -319,6 +363,56 @@ func TestStrictModelStalledIsTheRulesForWhatItDidntRead(t *testing.T) {
 	}
 	if strings.Contains(string(b), "Liu Xiang") || strings.Contains(string(b), "aaaa") {
 		t.Fatalf("what the model read wasn't masked with its find, or the rest not by the rules: %s", b)
+	}
+}
+
+// slow is a model that reads a text it has "seen" at once and needs
+// longer than any wait for one it hasn't: a CPU too slow for what the
+// agents send.
+type slow struct{ fake }
+
+func (slow) Find(ctx context.Context, texts []string) ([][]redact.Found, error) {
+	missing := 0
+	for _, s := range texts {
+		if strings.Contains(s, "unread") {
+			missing++
+		}
+	}
+	if missing == 0 {
+		return make([][]redact.Found, len(texts)), nil
+	}
+	<-ctx.Done()
+	return make([][]redact.Found, len(texts)), &pii.Partial{Missing: missing, Of: len(texts), Err: ctx.Err()}
+}
+
+// vsoullai on X, #4856 (Windows, the local model turned on): the model
+// couldn't keep up, and each request waited all of strictWait for it, one
+// after another. Once a request's own text wasn't read in its strictWait,
+// the next wait defaultWait, until a request is read in full again. The
+// rules mask what the model didn't read either way.
+func TestStrictModelBehindWaitsTheDefault(t *testing.T) {
+	wasStrict, wasDefault := strictWait, defaultWait
+	strictWait, defaultWait = 2*time.Second, 50*time.Millisecond
+	behind.Store(0)
+	t.Cleanup(func() { strictWait, defaultWait = wasStrict, wasDefault; behind.Store(0) })
+	m := slow{fake{installed: true}}
+	took := func(text string) time.Duration {
+		start := time.Now()
+		model(context.Background(), m, 0.8, true)([]string{text})
+		return time.Since(start)
+	}
+	if d := took("unread tool result"); d < strictWait {
+		t.Fatalf("the first request didn't wait strictWait: %v", d)
+	}
+	for i := range 3 {
+		if d := took("unread tool result"); d >= strictWait/2 {
+			t.Fatalf("request %d after the model fell behind waited %v", i+2, d)
+		}
+	}
+	// a request read in full: the model caught up, strictWait again
+	took("read before")
+	if d := took("unread tool result"); d < strictWait {
+		t.Fatalf("after one read in full, a request waited %v", d)
 	}
 }
 

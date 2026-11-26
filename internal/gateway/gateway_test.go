@@ -100,11 +100,24 @@ func setup(t *testing.T, proto provider.Protocol, f *fake) *httptest.Server {
 }
 
 // noRests lifts every rest the package's tests have recorded.
+// noRests clears the package's rests: what rests, why, and what was
+// lifted. They are package-global, so a rest one test records holds the
+// next test's account of the same key in the same process (#6717).
 func noRests() {
 	restingUntil.Lock()
 	restingUntil.m = map[string]time.Time{}
 	restingUntil.note = map[string]Rest{}
+	restingUntil.lifted = map[string]time.Time{}
+	restingUntil.renewAsked = nil
+	restingUntil.askedResting = nil
 	restingUntil.Unlock()
+	codexHolds.Lock()
+	codexHolds.m = nil
+	codexHolds.Unlock()
+	limitNotices.Lock()
+	limitNotices.m = map[string]LimitNotice{}
+	limitNotices.Unlock()
+	noticesDropped.Store(false)
 }
 
 func post(t *testing.T, path, body string) (int, string) {
@@ -441,6 +454,15 @@ func TestWrongEndpoint(t *testing.T) {
 		{400, agentRouterEscaped, true}, // escaped (#1669)
 		{400, `{"error":{"message":"模型 gpt-5.6-sol 不支持 /v1/chat/completions 接口"}}`, true}, // its first clause alone
 		{400, `{"error":{"message":"请改用 /v1/responses（OpenAI Responses API）。"}}`, true},   // its second alone
+		// WandAPI's 404 (equinox0253 on X), and a missing model's
+		{404, `{"error":{"message":"模型 gpt-6.1-sol 不支持当前入口协议","type":"new_api_error"}}`, true},
+		{404, `{"error":{"message":"模型 gpt-6.1-sol 不存在","type":"new_api_error"}}`, false},
+		// WandAPI's 404 for gpt-6.1-terra, its 181 bytes as sent (equinox0253
+		// on X, 11-13): the entry protocol named in other words
+		{404, wandAPINoSource, true},
+		// sub2api's 403 for a group not let dispatch Messages (Sidrune AI,
+		// 11-20)
+		{403, sub2apiNoDispatch, true},
 		// new-api's words for a model no channel serves (written from
 		// memory, not from the report): the model, not the API
 		{400, `{"error":{"message":"当前分组 default 下对于模型 gone 无可用渠道"}}`, false},
@@ -609,6 +631,40 @@ func TestResponsesClientChatUpstream(t *testing.T) {
 	}
 	if len(done) != 2 || done[1]["type"] != "function_call" || done[1]["call_id"] != "call_9" || done[1]["arguments"] != `{"cmd":"ls"}` {
 		t.Errorf("items: %v", done)
+	}
+}
+
+// Every event magpie writes for a Responses client is shaped as the typed
+// client reads it: a sequence_number on each, and a whole Response wherever
+// one is carried. A missing field is a turn the client drops whole
+// ("serialization error: missing field ..."), which is what let this filter
+// after one field at a time fail repeatedly.
+func TestResponsesEventsAreClientShaped(t *testing.T) {
+	f := &fake{t: t, reply: sse(
+		`data: {"id":"c1","model":"m1","choices":[{"delta":{"content":"ok"}}]}`,
+		`data: {"id":"c1","choices":[{"delta":{},"finish_reason":"stop"}]}`)}
+	setup(t, provider.Chat, f)
+	code, body := post(t, "/v1/responses", `{"model":"m1","stream":true,"input":"hi"}`)
+	if code != 200 {
+		t.Fatalf("status %d: %s", code, body)
+	}
+	seen := 0
+	for _, e := range events(body) {
+		seen++
+		typ, _ := e["type"].(string)
+		if _, ok := e["sequence_number"]; !ok {
+			t.Errorf("%s carries no sequence_number: %v", typ, e)
+		}
+		if r, ok := e["response"].(map[string]any); ok {
+			for _, k := range []string{"id", "object", "created_at", "status", "model", "output"} {
+				if _, ok := r[k]; !ok {
+					t.Errorf("%s's response lacks %s: %v", typ, k, r)
+				}
+			}
+		}
+	}
+	if seen == 0 {
+		t.Fatal("no events in a translated reply")
 	}
 }
 
@@ -1021,6 +1077,68 @@ func TestModelsListContext(t *testing.T) {
 		}
 	}
 	t.Fatalf("no group/big: %s", rec.Body.String())
+}
+
+// One longest context for every model (WJaunita45604 on X): /v1/models
+// says no window above it for a model the user set none for, and a model's
+// own value stays.
+func TestModelsListContextCap(t *testing.T) {
+	setup(t, provider.Chat, &fake{t: t})
+	p, err := provider.Find("fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Models = []string{"m1", "m2"}
+	p.Contexts = map[string]int{"m2": 900000}
+	if err := provider.Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(catalog.CachePath(), []byte(`{"x":{"models":{"m1":{"id":"m1","limit":{"context":1000000}},"m2":{"id":"m2","limit":{"context":1000000}}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+	windows := func() map[string]float64 {
+		rec := httptest.NewRecorder()
+		New().Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
+		var out struct {
+			Data []map[string]any `json:"data"`
+		}
+		json.Unmarshal(rec.Body.Bytes(), &out)
+		got := map[string]float64{}
+		for _, m := range out.Data {
+			id, _ := m["id"].(string)
+			for _, k := range []string{"context_window", "context_length", "max_input_tokens"} {
+				if n, ok := m[k].(float64); ok {
+					if prev, seen := got[id]; seen && prev != n {
+						t.Fatalf("%s says two windows: %v", id, m)
+					}
+					got[id] = n
+				}
+			}
+		}
+		return got
+	}
+	if got := windows(); got["fake/m1"] != 1000000 || got["fake/m2"] != 900000 {
+		t.Fatalf("before the cap: %v", got)
+	}
+	if err := provider.SetContextCap(200000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { provider.SetContextCap(0) })
+	if got := windows(); got["fake/m1"] != 200000 || got["fake/m2"] != 900000 {
+		t.Fatalf("under a 200K cap: %v, want m1 200000 and m2's own 900000", got)
+	}
+	if err := provider.SetContextCapAll(true); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { provider.SetContextCapAll(false) })
+	if got := windows(); got["fake/m1"] != 200000 || got["fake/m2"] != 200000 {
+		t.Fatalf("under a 200K cap on every model: %v, want both 200000", got)
+	}
 }
 
 func TestModelsListReasoning(t *testing.T) {

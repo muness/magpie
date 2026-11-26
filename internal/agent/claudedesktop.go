@@ -40,7 +40,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -48,6 +47,7 @@ import (
 	"github.com/yetone/magpie/internal/desktopdir"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -66,6 +66,10 @@ type desktopPaths struct {
 	// %APPDATA%\Claude on Windows) and in Claude-3p, its userData in 3p
 	// mode. magpie only ever adds the language to the second.
 	app, app3p string
+	// mcpFrom is the claude_desktop_config.json whose MCP servers the 3p
+	// mode is given (desktopCarryMCP): config, but for the isolated
+	// Desktop, whose own file is Claude-Magpie-3p's, Claude's
+	mcpFrom string
 }
 
 func desktopPathsOf(dir, dir3p string) desktopPaths {
@@ -76,6 +80,7 @@ func desktopPathsOf(dir, dir3p string) desktopPaths {
 		config3p: filepath.Join(dir3p, "claude_desktop_config.json"),
 		library:  lib, meta: filepath.Join(lib, "_meta.json"), prof: filepath.Join(lib, desktopProfileID+".json"),
 		app: filepath.Join(dir, "config.json"), app3p: filepath.Join(dir3p, "config.json"),
+		mcpFrom: filepath.Join(dir, "claude_desktop_config.json"),
 	}
 }
 
@@ -86,10 +91,20 @@ func desktopDirs(goos, home string, getenv func(string) string) (string, string)
 	return d.Mode, d.ThreeP
 }
 
-// desktopSets are those of every set of Desktop's folders, Find's first:
-// for a packaged Desktop the package's and the real ones, each with its
-// own stash.
+// desktopSets are the sets of Desktop's folders magpie wires: the
+// isolated Desktop's alone while it is on (desktopIsolatedOn), else
+// desktopUsualSets.
 func desktopSets(goos, home string, getenv func(string) string) []desktopPaths {
+	if p, ok := desktopIsolatedSet(goos, home, getenv); ok && desktopIsolatedOn() {
+		return []desktopPaths{p}
+	}
+	return desktopUsualSets(goos, home, getenv)
+}
+
+// desktopUsualSets are those of every set of Desktop's folders, Find's
+// first: for a packaged Desktop the package's and the real ones, each with
+// its own stash.
+func desktopUsualSets(goos, home string, getenv func(string) string) []desktopPaths {
 	var out []desktopPaths
 	for _, d := range desktopdir.Sets(goos, home, getenv) {
 		p := desktopPathsOf(d.Mode, d.ThreeP)
@@ -105,10 +120,12 @@ func desktopSets(goos, home string, getenv func(string) string) []desktopPaths {
 // DesktopConfigs3p are the claude_desktop_config.json files Claude Desktop
 // reads in its 3p mode: there its whole userData is Claude-3p, its MCP
 // servers too (%LOCALAPPDATA%\Claude-3p on Windows, and the MSIX package's;
-// Claude-3p beside Claude elsewhere).
+// Claude-3p beside Claude elsewhere). The isolated Desktop's
+// Claude-Magpie-3p is not one of them: the library gives it servers of
+// its own (DesktopTwinApp).
 func DesktopConfigs3p(home string) []string {
 	var out []string
-	for _, p := range desktopSets(desktopdir.OS, home, os.Getenv) {
+	for _, p := range desktopUsualSets(desktopdir.OS, home, os.Getenv) {
 		out = append(out, p.config3p)
 	}
 	return out
@@ -117,13 +134,23 @@ func DesktopConfigs3p(home string) []string {
 func claudeDesktop(home string) *Agent {
 	sets := desktopdir.Sets(desktopdir.OS, home, os.Getenv)
 	ps := desktopSets(desktopdir.OS, home, os.Getenv)
-	p := ps[0]
+	// its row shows the usual folder's file, the library's too, whichever
+	// Desktop magpie wires
+	p := desktopUsualSets(desktopdir.OS, home, os.Getenv)[0]
+	iso := ps[0].key == desktopIsolatedKey
 	return &Agent{
 		ID: "claude-desktop", Name: "Claude Desktop", Icon: "claude-color", Aliases: []string{"claude-app"},
 		Dir: p.dir, Path: p.config,
 		detect: func() bool {
-			// its own data (%APPDATA%\Claude on Windows, or the MSIX
-			// package's), the folder magpie writes or Claude-3p
+			// on Windows Desktop's uninstall leaves %APPDATA%\Claude
+			// behind, its claude_desktop_config.json in it (alien_jambob on
+			// X: Desktop uninstalled and still listed), so there only its
+			// program says it is here; one still on magpie stays listed
+			// too, to be turned off
+			if desktopdir.OS == "windows" {
+				return desktopInstalled(home) || desktopWiredAny(ps)
+			}
+			// its own data, the folder magpie writes or Claude-3p
 			for _, s := range sets {
 				for _, d := range s.All() {
 					if isDir(d) {
@@ -131,12 +158,18 @@ func claudeDesktop(home string) *Agent {
 					}
 				}
 			}
-			// installed on Windows and not yet opened: none of them yet
-			return desktopdir.Installed(desktopdir.OS, home, os.Getenv)
+			// the isolated Desktop's folder
+			return iso && isDir(ps[0].dir3p)
 		},
 		Notice: func() string {
+			if iso {
+				if desktopWiredAny(ps) {
+					return noticeClaudedesktopIsolated.String()
+				}
+				return noticeClaudedesktopIsolatedOff.String()
+			}
 			if desktopWiredAny(ps) {
-				return noticeClaudedesktop1.String() + " " + noticeClaudedesktop3.String()
+				return noticeClaudedesktop1.String() + " " + noticeClaudedesktop3.String() + " " + noticeClaudedesktop5.String()
 			}
 			return noticeClaudedesktop2.String() + " " + noticeClaudedesktop4.String()
 		},
@@ -154,6 +187,7 @@ func claudeDesktop(home string) *Agent {
 			}
 			return ""
 		},
+		Gateway: desktopGateway,
 		Fields: append([]Field{{
 			Key: "provider", Label: "provider",
 			Get: func() string {
@@ -162,41 +196,15 @@ func claudeDesktop(home string) *Agent {
 				}
 				return ""
 			},
-			Set: func(v string) error {
-				on := desktopOn
-				if v == "" {
-					on = desktopOff
-				}
-				desktopAdoptStash(ps)
-				src := desktopLocaleFrom(ps)
-				for _, p := range ps {
-					if src != "" {
-						p.app = src
-					}
-					if err := on(p); err != nil {
-						return err
-					}
-				}
-				// its Code tab is Claude Code, told what Desktop's ids for
-				// magpie's models can do while that one runs on magpie
-				_ = claude(home).Sync()
-				// and a running distro's, which a Code tab session with
-				// WSL as its host runs on (a stopped one is written on
-				// the round after it starts)
-				for _, a := range wslAgents() {
-					if strings.HasPrefix(a.ID, "claude@wsl:") && a.Sync != nil {
-						_ = a.Sync()
-					}
-				}
-				return nil
-			},
+			Set: func(v string) error { return desktopApply(home, ps, v) },
 			Options: func(map[string]string) []Option {
 				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie",
 					Note: "Desktop's third-party gateway: Code and Cowork on magpie's models, no Anthropic sign-in (restart Desktop)"}}
 			},
-		}}, append(desktopTierFields(home, ps), desktopSubagentField(ps), desktopSubagentEffortField(ps))...),
+		}, desktopGatewayField(ps, func() error { return desktopApply(home, ps, magpieID) })}, append(desktopTierFields(home, ps), desktopSubagentField(ps), desktopSubagentEffortField(ps))...),
 		// a Desktop already on magpie gets the import and tool search
-		// policies too (desktopSeedImport, desktopSeedToolSearch), and a
+		// policies too (desktopSeedImport, desktopSeedToolSearch,
+		// desktopSeedPrefer1M), and a
 		// profile for magpie's gateway it applies a key the gateway takes
 		// (desktopKeyApplied)
 		Sync: func() error {
@@ -207,6 +215,9 @@ func claudeDesktop(home string) *Agent {
 						errs = append(errs, err)
 					}
 					if err := desktopSeedToolSearch(p); err != nil {
+						errs = append(errs, err)
+					}
+					if err := desktopSeedPrefer1M(p); err != nil {
 						errs = append(errs, err)
 					}
 					if err := desktopKeyApplied(p); err != nil {
@@ -229,6 +240,38 @@ func claudeDesktop(home string) *Agent {
 			return joinErrs(errs)
 		},
 	}
+}
+
+// desktopInstalled reports whether Desktop's program is installed on this
+// Windows, whatever folders it has (desktopdir.Installed: Squirrel's
+// claude.exe or the MSIX's package folder), or opened yet (#1482): or
+// whether the AppX registry has its package, the Store's or the one its
+// setup.exe installs, for a package folder not made yet.
+func desktopInstalled(home string) bool {
+	if desktopdir.Installed(desktopdir.OS, home, os.Getenv) {
+		return true
+	}
+	for _, pkg := range windowsStorePackages() {
+		// name_version_architecture_resourceid_publisher: the main
+		// package, with no resource id
+		f := strings.Split(pkg, "_")
+		if len(f) == 5 && f[3] == "" && (f[0] == "Claude" || f[0] == "AnthropicPBC.Claude") {
+			return true
+		}
+	}
+	return false
+}
+
+// DesktopApp is Claude Desktop as the library knows it, with its file at
+// path in dir: on Windows listed only while its program is installed
+// (desktopInstalled), as the folder its uninstall leaves behind is no sign
+// of it; elsewhere by that folder, as any agent is.
+func DesktopApp(home, dir, path string) *Agent {
+	a := &Agent{ID: "claude-desktop", Name: "Claude Desktop", Icon: "claude-color", Dir: dir, Path: path}
+	if desktopdir.OS == "windows" {
+		a.detect = func() bool { return desktopInstalled(home) }
+	}
+	return a
 }
 
 // desktopRead are the sets of Desktop's folders whose wiring counts: the
@@ -266,7 +309,8 @@ func desktopCheck(p desktopPaths) string {
 	if !desktop3p(p, prof) {
 		return "Claude Desktop's deploymentMode (Claude-3p/claude_desktop_config.json) is 1p now, so it signs in with Anthropic rather than using magpie"
 	}
-	want := agentKey("claude-desktop")
+	gw := desktopGateway()
+	want := desktopKey(gw)
 	return wiringOff("Claude Desktop", prof, func(k string) (string, bool) {
 		v, ok := edit.GetJSON(prof, k)
 		if k != "inferenceGatewayApiKey" {
@@ -283,7 +327,7 @@ func desktopCheck(p desktopPaths) string {
 			return want, true // a key of magpie's other than Desktop's own
 		}
 		return open, ok
-	}, "inferenceGatewayBaseUrl", gateway.URL(), "inferenceGatewayApiKey", want)
+	}, "inferenceGatewayBaseUrl", gw, "inferenceGatewayApiKey", want)
 }
 
 // desktop3p: Desktop starts in its 3p mode with prof, the gateway profile
@@ -352,7 +396,7 @@ func desktopKeyApplied(p desktopPaths) error {
 	if f == "" {
 		return nil
 	}
-	want := agentKey("claude-desktop")
+	want := desktopKey(desktopGateway())
 	v, _ := edit.GetJSON(f, "inferenceGatewayApiKey")
 	// a key Desktop sealed that magpie can't open is left as it is
 	if open, known := desktopOpen("inferenceGatewayApiKey", v); !known || desktopKeyTaken(open, want) {
@@ -363,6 +407,37 @@ func desktopKeyApplied(p desktopPaths) error {
 		kvs = append(kvs, edit.KV{Path: "inferenceGatewayAuthScheme", Value: "bearer"})
 	}
 	return edit.SetJSON(f, kvs...)
+}
+
+// desktopApply turns Desktop's wiring on for v == magpieID, off for "",
+// or writes it again where the address or key changed.
+func desktopApply(home string, ps []desktopPaths, v string) error {
+	on := desktopOn
+	if v == "" {
+		on = desktopOff
+	}
+	desktopAdoptStash(ps)
+	src := desktopLocaleFrom(ps)
+	for _, p := range ps {
+		if src != "" {
+			p.app = src
+		}
+		if err := on(p); err != nil {
+			return err
+		}
+	}
+	// its Code tab is Claude Code, told what Desktop's ids for
+	// magpie's models can do while that one runs on magpie
+	desktopClaudeSync(home)
+	// and a running distro's, which a Code tab session with
+	// WSL as its host runs on (a stopped one is written on
+	// the round after it starts)
+	for _, a := range wslAgents() {
+		if strings.HasPrefix(a.ID, "claude@wsl:") && a.Sync != nil {
+			_ = a.Sync()
+		}
+	}
+	return nil
 }
 
 // desktopTierFields pick the model each of Claude Code's tiers runs on in
@@ -397,7 +472,7 @@ func desktopTierFields(home string, ps []desktopPaths) []Field {
 					}
 				}
 				if desktopWiredAny(ps) {
-					_ = claude(home).Sync()
+					desktopClaudeSync(home)
 				}
 				return joinErrs(errs)
 			},
@@ -548,11 +623,13 @@ const (
 	desktopLocale  = "claude-desktop.locale"
 	desktopImport  = "claude-desktop.import"
 	desktopSearch  = "claude-desktop.tool-search"
+	desktopLong    = "claude-desktop.prefer-1m"
+	desktopSSH     = "claude-desktop.ssh-hosts"
 	desktopMCP     = "claude-desktop.mcp"
 	desktopMCPSeen = "claude-desktop.mcp-seen"
 )
 
-var desktopStashKeys = []string{desktopStashed, desktopMode, desktopMode3p, desktopApplied, desktopMade, desktopProfile, desktopLocale, desktopImport, desktopSearch, desktopMCP, desktopMCPSeen, desktopModelsMark}
+var desktopStashKeys = []string{desktopStashed, desktopMode, desktopMode3p, desktopApplied, desktopMade, desktopProfile, desktopLocale, desktopImport, desktopSearch, desktopLong, desktopSSH, desktopMCP, desktopMCPSeen, desktopModelsMark, desktopDiscoveryMark}
 
 // desktopAdoptStash moves the stash a packaged Desktop's folders got
 // before they had keys of their own (when magpie wrote only one set) onto
@@ -629,10 +706,11 @@ func desktopOn(p desktopPaths) error {
 			return err
 		}
 	}
+	gw := desktopGateway()
 	kvs := []edit.KV{
 		{Path: "inferenceProvider", Value: "gateway"},
-		{Path: "inferenceGatewayBaseUrl", Value: gateway.URL()},
-		{Path: "inferenceGatewayApiKey", Value: agentKey("claude-desktop")},
+		{Path: "inferenceGatewayBaseUrl", Value: gw},
+		{Path: "inferenceGatewayApiKey", Value: desktopKey(gw)},
 		{Path: "inferenceGatewayAuthScheme", Value: "bearer"},
 	}
 	// policies seeded once: the user may tighten them in Desktop
@@ -650,6 +728,16 @@ func desktopOn(p desktopPaths) error {
 	}
 	if err := desktopSeedToolSearch(p); err != nil {
 		return err
+	}
+	if err := desktopSeedPrefer1M(p); err != nil {
+		return err
+	}
+	// pointed at an address of this computer's for SSH remote sessions,
+	// which 3p mode allows no host for until the profile says so
+	if gw != gateway.URL() {
+		if err := desktopSeedSSH(p); err != nil {
+			return err
+		}
 	}
 
 	// a profile for magpie's gateway the user applied since magpie's
@@ -742,6 +830,27 @@ func desktopSeedToolSearch(p desktopPaths) error {
 	return desktopSeedOnce(p, desktopSearch, "toolSearchEnabled", true)
 }
 
+// desktopSeedPrefer1M turns on Desktop's own "Use 1M wherever it's
+// available" (modelPrefer1mContext, 3p only, off by default) in magpie's
+// profile, so a model Desktop offers a 1M entry for is shown by that entry
+// alone and its Code tab hands Claude Code the "[1m]" id. Desktop
+// 5.11492 starts the Code tab's Claude Code with
+// CLAUDE_CODE_MAX_CONTEXT_TOKENS=200000 in its --settings whenever the
+// provider routes models itself, the gateway too (Fcn and Lcn in its
+// app.asar), and those flag settings come before ~/.claude/settings.json,
+// so the window magpie tells Claude Code there (claudeContextEnv) no longer
+// reached it: every model listed by its plain id ran at 200K, a 1M one too
+// (fwxkogaia on X, v0.1.4321). Claude Code takes a "[1m]" id for 1M whatever
+// that variable says (pT in 2.1.322). Desktop offers the 1M entry only for
+// a row whose max_input_tokens is 1M or more (magpie lists none of its rows
+// with supports_1m), so only models of 1M or more change; a smaller one
+// past 200K still runs at Desktop's 200K. Seeded once, as
+// toolSearchEnabled is: the user's own value, false too, or their taking it
+// away since, stays theirs.
+func desktopSeedPrefer1M(p desktopPaths) error {
+	return desktopSeedOnce(p, desktopLong, "modelPrefer1mContext", true)
+}
+
 // desktopSeedOnce writes key in magpie's profile once, where the profile
 // has none, and marks it in the stash under mark: once marked it is never
 // written again, so the user's own value, or their taking it away, holds.
@@ -788,8 +897,8 @@ func desktopServers(path string) map[string]json.RawMessage {
 // (/api/organizations/<org>/mcp/servers/…), and 3p mode has none.
 func desktopCarryMCP(p desktopPaths) error {
 	stash(map[string]string{desktopMCPSeen + p.key: "1"})
-	own := desktopServers(p.config)
-	if len(own) == 0 || desktopObject(p.config3p) != nil {
+	own := desktopServers(p.mcpFrom)
+	if p.mcpFrom == p.config3p || len(own) == 0 || desktopObject(p.config3p) != nil {
 		return nil
 	}
 	if _, has := edit.GetJSONRaw(p.config3p, "mcpServers"); has && desktopServers(p.config3p) == nil {
@@ -860,7 +969,7 @@ func desktopSameJSON(a, b json.RawMessage) bool {
 // desktopLocaleName is a language Desktop takes for its "locale": the
 // names of its catalogs (lit in Desktop 2.7032's main process,
 // /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*\.json$/).
-var desktopLocaleName = regexp.MustCompile(`^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$`)
+var desktopLocaleName = lazyre.New(`^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$`)
 
 // desktopLocaleFrom is the config.json, of every set's signed-in
 // userData, that names a language: the first set's (where Desktop runs)
@@ -887,7 +996,7 @@ func desktopLocaleFrom(ps []desktopPaths) string {
 //
 // It holds only for a language Desktop's 3p window has. That window is
 // its bundled UI (Resources/ion-dist), with 11 catalogs and no Chinese up
-// to 3.6556.2 at least; on every start it asks the main process for its
+// to 4.23118.0 at least; on every start it asks the main process for its
 // own pick (requestLocaleChange: its localStorage, else navigator.languages
 // mapped onto those 11, else en-US), and the main process writes that into
 // Claude-3p/config.json. So a Chinese "locale" there, carried or set by
@@ -1057,7 +1166,13 @@ func desktopOwnGatewayProfile(p desktopPaths) []byte {
 // (127.0.0.1, localhost or ::1, with or without /v1).
 func desktopIsOurGateway(u string) bool {
 	a, err := url.Parse(strings.TrimSpace(u))
-	if err != nil || a.Port() == "" {
+	if err != nil {
+		return false
+	}
+	if desktopOurAddress(a) {
+		return true
+	}
+	if a.Port() == "" {
 		return false
 	}
 	ours, err := url.Parse(gateway.URL())
@@ -1094,4 +1209,16 @@ var (
 	// (xgddm88 on X: 之前的工程和会话记录全没了).
 	noticeClaudedesktop3 = newNotice("Chats and projects from your Anthropic sign-in stay in Desktop's own profile, not shown on magpie; nothing is deleted, and turning this off brings them back.")
 	noticeClaudedesktop4 = newNotice("Your chats and projects from before are back there.")
+	// and how to go on with them on magpie (Jacky_yyyyyyyy on X): Desktop's
+	// own importer, which magpie's profile turns on (desktopSeedImport).
+	// With claudeAiImport.enabled, 2.7032 and 4.16336 offer it in 3p mode
+	// under Settings → Import: Claude.ai's chats and projects (a sign-in
+	// to Claude.ai there, or its data export zip) and the Code and Cowork
+	// sessions of the signed-in profile, copied in under new ids, the
+	// originals left alone.
+	noticeClaudedesktop5 = newNotice("To go on with them on magpie, open Settings → Import in Desktop: it can copy in your Claude.ai chats and projects and this computer's earlier sessions, and leaves the originals as they are.")
+	// the isolated Desktop (#5671): magpie's is its own app, and the
+	// user's Claude.app stays signed in with Anthropic
+	noticeClaudedesktopIsolated    = newNotice("Open Claude Magpie from Applications to use Claude Desktop on magpie. Your own Claude Desktop stays signed in with Anthropic.")
+	noticeClaudedesktopIsolatedOff = newNotice("Quit Claude Magpie if it is open: it no longer runs on magpie.")
 )

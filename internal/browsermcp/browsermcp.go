@@ -10,6 +10,16 @@
 // (lutra_fs on Discord: the search was an address in Settings alone).
 // `magpie mcp vision` is image recognition's (gateway.VisionMCPPath), the
 // Library's Magpie Image Recognition (matrix0487 on Discord, #4653).
+// `magpie mcp memory` is memory's (gateway.MemoryMCPPath), sent with the
+// folder the agent started it in, for the project its memories are kept
+// for, and the client name the agent gave at initialize, for which agent
+// it is.
+// `magpie mcp sessions` is the sessions' (gateway.SessionsMCPPath): what
+// was said in every agent's sessions on this computer.
+// `magpie mcp artifacts` is the artifacts' (gateway.ArtifactsMCPPath),
+// sent as memory's is, with the folder the agent started it in, which a
+// page's relative file_path is read from, and the agent's client name,
+// which its versions are recorded under.
 package browsermcp
 
 import (
@@ -56,6 +66,49 @@ func RunVision(args []string) error {
 	return serveVision(os.Stdin, os.Stdout, gatewayBase())
 }
 
+// RunMemory serves the memory MCP server on stdin and stdout until stdin
+// ends.
+func RunMemory(args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("magpie mcp memory takes no arguments")
+	}
+	wd, _ := os.Getwd()
+	return serveMemory(os.Stdin, os.Stdout, gatewayBase(), wd)
+}
+
+// RunSessions serves the sessions MCP server on stdin and stdout until
+// stdin ends.
+func RunSessions(args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("magpie mcp sessions takes no arguments")
+	}
+	return serveSessions(os.Stdin, os.Stdout, gatewayBase())
+}
+
+// RunArtifacts serves the artifacts MCP server on stdin and stdout until
+// stdin ends.
+func RunArtifacts(args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("magpie mcp artifacts takes no arguments")
+	}
+	wd, _ := os.Getwd()
+	return serveArtifacts(os.Stdin, os.Stdout, gatewayBase(), wd)
+}
+
+// serveArtifacts passes each line to the gateway's artifacts server, as
+// serveMemory does. A publish may carry a version's files inline, up to
+// what the gateway takes.
+func serveArtifacts(in io.Reader, out io.Writer, base, wd string) error {
+	b := &bridge{base: base, path: gateway.ArtifactsMCPPath, title: "Magpie Artifacts", client: &http.Client{Timeout: 2 * time.Minute}, out: out, most: 96 << 20}
+	return relay(in, withFolder(b, wd))
+}
+
+// serveSessions passes each line to the gateway's sessions server. A
+// search while the index is first made reads for a few seconds.
+func serveSessions(in io.Reader, out io.Writer, base string) error {
+	return relay(in, &bridge{base: base, path: gateway.SessionsMCPPath, title: "Magpie Sessions", client: &http.Client{Timeout: time.Minute}, out: out})
+}
+
 func gatewayBase() string {
 	base := strings.TrimRight(os.Getenv("MAGPIE_GATEWAY"), "/")
 	if base == "" {
@@ -92,6 +145,62 @@ func serveVision(in io.Reader, out io.Writer, base string) error {
 	wd, _ := os.Getwd()
 	return relay(in, &bridge{base: base, path: gateway.VisionMCPPath, title: "Magpie Image Recognition", client: &http.Client{Timeout: 5 * time.Minute}, out: out,
 		most: 32 << 20, fix: func(b []byte) []byte { return imageFrom(b, wd) }})
+}
+
+// serveMemory passes each line to the gateway's memory server, with wd,
+// the folder the agent started this in, and the client name its
+// initialize gave.
+func serveMemory(in io.Reader, out io.Writer, base, wd string) error {
+	b := &bridge{base: base, path: gateway.MemoryMCPPath, title: "Magpie Memory", client: &http.Client{Timeout: time.Minute}, out: out}
+	return relay(in, withFolder(b, wd))
+}
+
+// withFolder sends b's messages with wd and the client name its
+// initialize gave.
+func withFolder(b *bridge, wd string) *bridge {
+	var mu sync.Mutex
+	client := ""
+	b.fix = func(body []byte) []byte {
+		// read in order, before the calls after it are passed on
+		if name := clientName(body); name != "" {
+			mu.Lock()
+			client = name
+			mu.Unlock()
+		}
+		return body
+	}
+	b.header = func(h http.Header) {
+		if wd != "" {
+			h.Set(gateway.MemoryCwdHeader, wd)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if client != "" {
+			h.Set(gateway.MemoryClientHeader, client)
+		}
+	}
+	return b
+}
+
+// clientName is the client's name an initialize message gives, "" for
+// any other message.
+func clientName(b []byte) string {
+	var m struct {
+		Method string `json:"method"`
+		Params struct {
+			ClientInfo struct {
+				Name string `json:"name"`
+			} `json:"clientInfo"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(b, &m) != nil || m.Method != "initialize" {
+		return ""
+	}
+	n := strings.TrimSpace(m.Params.ClientInfo.Name)
+	if len(n) > 64 || strings.ContainsAny(n, "\r\n") {
+		return ""
+	}
+	return n
 }
 
 // imageFrom is the message b with analyze_image's image, when it is a path
@@ -179,7 +288,8 @@ func relay(in io.Reader, s *bridge) error {
 // bridge passes one stdio session's messages to the gateway's server at
 // path, title naming it when the gateway can't be reached; a session ""
 // sends no session header. most is the longest line it reads (16 MiB when
-// 0), and fix, when set, makes each message what the gateway is sent.
+// 0), and fix, when set, makes each message what the gateway is sent;
+// header, when set, adds to each request's headers.
 type bridge struct {
 	base, path, title, session string
 	client                     *http.Client
@@ -187,6 +297,7 @@ type bridge struct {
 	out                        io.Writer
 	most                       int
 	fix                        func([]byte) []byte
+	header                     func(http.Header)
 }
 
 func (s *bridge) write(b []byte) {
@@ -214,6 +325,9 @@ func (s *bridge) pass(m message, body []byte) {
 	r.Header.Set("Authorization", "Bearer "+gateway.Token)
 	if s.session != "" {
 		r.Header.Set(gateway.BrowserSessionHeader, callerSession(body, s.session))
+	}
+	if s.header != nil {
+		s.header(r.Header)
 	}
 	resp, err := s.client.Do(r)
 	if err != nil {

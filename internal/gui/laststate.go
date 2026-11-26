@@ -80,6 +80,8 @@ func keepState(s stateJSON) {
 
 // keptFile is what keepState keeps of s.
 func keptFile(s stateJSON) stateFile {
+	// kept as it is sent, each option list once
+	s = shareOptions(s)
 	s.Settings = settings.Settings{}
 	// and what is told once: a notice, a file recovered after a crash
 	s.Notice, s.Connected, s.Recovered = "", nil, nil
@@ -128,7 +130,7 @@ func lastKnown() (stateJSON, bool) {
 	if len(b) == 0 || json.Unmarshal(b, &f) != nil || f.Version != Version || f.State.Agents == nil {
 		return stateJSON{}, false
 	}
-	f.State.Settings = settings.Load()
+	f.State.Settings = stateSettings(settings.Load())
 	f.State.Last = true
 	return f.State, true
 }

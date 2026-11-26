@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yetone/magpie/internal/settings"
 )
 
 func TestLimitWindow(t *testing.T) {
@@ -458,5 +460,75 @@ func TestSeveralLimits(t *testing.T) {
 	at(1, &Limit{Period: "day", Tokens: 9})
 	if who, _ := Authenticate(secret); len(who.Limits()) != 2 || who.More[0].Period != "day" {
 		t.Fatalf("authenticated without its second limit: %+v", who.More)
+	}
+}
+
+// A "total" limit (@Cyrus_4433 on X) is a kept period: it starts when set
+// or reset, ends a century off, and an old file without it reads the same.
+func TestLimitTotal(t *testing.T) {
+	since := time.Date(2026, 3, 4, 5, 6, 0, 0, time.UTC)
+	l := &Limit{Period: "total", Cost: 300, Since: since}
+	for _, now := range []time.Time{since, since.AddDate(0, 7, 0), since.AddDate(40, 0, 0)} {
+		start, reset := l.Window(now)
+		if !start.Equal(since) || !reset.After(now.AddDate(50, 0, 0)) {
+			t.Errorf("at %s: %s – %s", now, start, reset)
+		}
+	}
+	if start, _ := (&Limit{Period: "total", Cost: 1}).Window(since); !start.Equal(epoch) {
+		t.Errorf("no Since starts at %s", start)
+	}
+	v, err := (&Limit{Period: "total", Days: 3, Hours: 4, Cost: 300}).Valid()
+	if err != nil || v.Period != "total" || v.Days != 0 || v.Hours != 0 || v.Per() != "total" {
+		t.Fatalf("%+v %v", v, err)
+	}
+	if v, _ := (&Limit{Period: "month", Cost: 5}).Valid(); v.Period != "month" {
+		t.Errorf("month: %+v", v)
+	}
+	// setting it starts it, a new cap keeps it, a period change starts anew
+	now := time.Date(2026, 10, 10, 8, 0, 0, 0, time.UTC)
+	if got := sinceOf(nil, v0("total"), now); !got.Equal(now) {
+		t.Errorf("new total since %s", got)
+	}
+	if got := sinceOf(&Limit{Period: "total", Since: since}, v0("total"), now); !got.Equal(since) {
+		t.Errorf("a new cap restarted it: %s", got)
+	}
+	if got := sinceOf(&Limit{Period: "month"}, v0("total"), now); !got.Equal(now) {
+		t.Errorf("month to total since %s", got)
+	}
+	if got := sinceOf(&Limit{Period: "total", Since: since}, v0("month"), now); !got.IsZero() {
+		t.Errorf("total to month since %s", got)
+	}
+}
+
+func v0(period string) *Limit { return &Limit{Period: period, Cost: 1} }
+
+// A day that starts at 4 moves every calendar window: at 02:00 on the 15th
+// the day is the 14th's from 04:00, the week and the month are those the
+// 14th is in, and with the start at 0 nothing moves.
+func TestLimitWindowFollowsTheDayStart(t *testing.T) {
+	t.Cleanup(func() { s := settings.Load(); s.DayStart = 0; settings.Save(s) })
+	loc := time.FixedZone("X", 8*3600)
+	at := func(d, h int) time.Time { return time.Date(2026, 9, d, h, 0, 0, 0, loc) }
+	cases := []struct {
+		period, start, name string
+		now, from, to       time.Time
+	}{
+		{"day", "4", "day", at(15, 2), at(14, 4), at(15, 4)},
+		{"day", "4", "day after", at(15, 4), at(15, 4), at(16, 4)},
+		{"week", "4", "week starts Monday 4am", at(14, 2), at(7, 4), at(14, 4)}, // Mon 14th 02:00 is still Sunday's
+		{"month", "4", "month", at(1, 2), time.Date(2026, 8, 1, 4, 0, 0, 0, loc), at(1, 4)},
+		{"day", "0", "plain", at(15, 2), at(15, 0), at(16, 0)},
+	}
+	for _, c := range cases {
+		n := int(c.start[0] - '0')
+		s := settings.Load()
+		s.DayStart = n
+		if err := settings.Save(s); err != nil {
+			t.Fatal(err)
+		}
+		from, to := Window(c.period, c.now)
+		if !from.Equal(c.from) || !to.Equal(c.to) || from.Location() != loc {
+			t.Errorf("%s: Window(%s, %v) = %v..%v in %v, want %v..%v in %v", c.name, c.period, c.now, from, to, from.Location(), c.from, c.to, loc)
+		}
 	}
 }

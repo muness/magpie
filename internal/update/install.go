@@ -1,8 +1,10 @@
 package update
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // The Windows app is one exe with no installer, and the site's download
@@ -26,10 +29,32 @@ import (
 // file. Opened again, it opens the installed copy, or puts itself there
 // first when it is the newer version.
 //
+// The first time, before anything is copied, the user is asked where to
+// put it (AskFolder, Windows' own dialog in the GUI), with that folder as
+// the default (feng_21795_78266 on Discord). A folder other than the
+// default is kept in HKCU\Software\magpie (InstallLocation), so a
+// download opened later finds it there, never asks again and never moves
+// it. A folder the user can't write to is refused with the reason:
+// magpie installs for the one user, updates itself without an
+// administrator, and its login item and PATH are the user's own, so a
+// copy in Program Files would need an administrator for every update.
+//
+// A copy still named as the site's download (magpie-windows-amd64.exe,
+// magpie-windows-amd64 (1).exe) is a download wherever it is kept: a
+// browser set to save into D:\下载, or a download moved into a folder of
+// the user's own and updated in place there. Run like that, a deleted
+// download was a deleted magpie, and each copy opened was an app of its
+// own to Windows, with its own Start menu and taskbar entries
+// (@XBJNTMs2mDbsvPH on X). So it asks the same question the first time.
+// Cancel there is kept (HKCU\Software\magpie, NotInstalled): that copy
+// runs where it is from then on and is never asked about again. Outside
+// a download folder it is only ever installed through the dialog, which
+// the user sees.
+//
 // It is left alone, and runs where it is as before, when it runs from
-// anywhere else (a folder the user chose: D:\Tools, a USB drive), when it
-// is portable (a data folder or .portable file beside it, appdir), or
-// with MAGPIE_NO_INSTALL=1.
+// anywhere else under a name of its own (D:\Tools\magpie.exe, a USB
+// drive), when it is portable (a data folder or .portable file beside
+// it, appdir), or with MAGPIE_NO_INSTALL=1.
 
 // NoInstallEnv, set to 1, keeps a magpie run from Downloads there.
 const NoInstallEnv = "MAGPIE_NO_INSTALL"
@@ -58,7 +83,150 @@ var (
 	// installCLI puts the installed folder on the user's PATH with the
 	// command a terminal runs there
 	installCLI = cliPlace
+	// recordedDir is the folder the user chose to install in, "" when
+	// none was (the default, or a magpie installed before it could be
+	// chosen); recordDir keeps it
+	recordedDir = readInstallDir
+	recordDir   = writeInstallDir
+	// declinedExe is the download kept outside a download folder that
+	// the user would rather not install (Cancel); declineExe keeps it
+	declinedExe = readDeclined
+	declineExe  = writeDeclined
 )
+
+// downloadName is the name the site's Windows download has, with the
+// suffix a browser adds to a second one: magpie-windows-amd64.exe,
+// magpie-windows-arm64 (1).exe.
+var downloadName = lazyre.New(`(?i)^magpie-windows-(amd64|arm64)\b[^\\/]*\.exe$`)
+
+// isDownload says whether exe is a download Settle installs: one in a
+// folder downloads land in, or one kept elsewhere under the download's
+// name that the user hasn't declined to install. ask is whether the
+// latter can be asked about; it is never installed unasked.
+func isDownload(exe string, ask bool) bool {
+	if downloadFolder(filepath.Dir(exe)) {
+		return true
+	}
+	if !ask || !downloadName.MatchString(filepath.Base(exe)) {
+		return false
+	}
+	d := declinedExe()
+	return d == "" || !samePath(exe, d)
+}
+
+// AskFolder, when set, asks the user where to install the download,
+// offering suggest, a folder: it answers the folder chosen, which check
+// has accepted, or "" when the user would rather not install (the
+// download then runs where it is). Unset, the suggestion is taken.
+var AskFolder func(suggest string, check func(dir string) error) string
+
+// ErrNeedsAdmin is a folder chosen to install in that only an
+// administrator can write to.
+var ErrNeedsAdmin = errors.New("only an administrator can write to this folder")
+
+// ErrDownloadFolder is a folder chosen to install in that downloads land
+// in: the copy there would be taken for a download again.
+var ErrDownloadFolder = errors.New("downloads land in this folder")
+
+// InstallDir is the folder a folder picked in AskFolder's dialog means:
+// itself when it is named magpie, else a magpie folder inside it, as
+// installers do.
+func InstallDir(picked string) string {
+	picked = filepath.Clean(picked)
+	if strings.EqualFold(filepath.Base(picked), "magpie") {
+		return picked
+	}
+	return filepath.Join(picked, "magpie")
+}
+
+// Installable says why dir can't be installed in, nil when it can: a
+// file is written into it and removed, and the folders made for that are
+// removed again, so a folder looked at and then not chosen isn't left.
+//
+// Only the folders this call made itself are removed, one by one from
+// the deepest up and only while empty, so a folder that was there
+// already is never taken: a folder whose Stat fails for any reason but
+// "not there" (no permission to look, a share that doesn't answer) is
+// unknown, and the check refuses rather than make or remove anything.
+func Installable(dir string) error {
+	if !filepath.IsAbs(dir) {
+		return fmt.Errorf("%s is not a full path", dir)
+	}
+	if downloadFolder(dir) {
+		return ErrDownloadFolder
+	}
+	// the folders missing on the way to dir, outermost first
+	var missing []string
+	for d := filepath.Clean(dir); ; d = filepath.Dir(d) {
+		there, err := present(d)
+		if err != nil {
+			return fmt.Errorf("can't tell whether %s is there: %w", d, err)
+		}
+		if there {
+			break
+		}
+		if filepath.Dir(d) == d {
+			return fmt.Errorf("%s is not there", d)
+		}
+		missing = append([]string{d}, missing...)
+	}
+	var made []string
+	defer func() {
+		for i := len(made) - 1; i >= 0; i-- {
+			os.Remove(made[i])
+		}
+	}()
+	for _, d := range missing {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				continue // made by someone else meanwhile: theirs, kept
+			}
+			return writeErr(err)
+		}
+		made = append(made, d)
+	}
+	f, err := os.CreateTemp(dir, ".magpie-install-*")
+	if err != nil {
+		return writeErr(err)
+	}
+	f.Close()
+	os.Remove(f.Name())
+	return nil
+}
+
+func writeErr(err error) error {
+	if errors.Is(err, fs.ErrPermission) {
+		return ErrNeedsAdmin
+	}
+	return err
+}
+
+// exeName is what the installed copy is called.
+const exeName = "magpie.exe"
+
+// installed is where magpie is installed: the folder the user chose, else
+// the default; ok is false when neither holds it, and to is then where
+// to offer, the folder chosen before first.
+func installed() (to string, ok bool) {
+	def := installTarget()
+	if def == "" {
+		return "", false
+	}
+	var chosen string
+	if d := recordedDir(); d != "" && filepath.IsAbs(d) {
+		chosen = filepath.Join(d, exeName)
+		if exists(chosen) {
+			return chosen, true
+		}
+	}
+	if exists(def) {
+		return def, true
+	}
+	if chosen != "" {
+		return chosen, false
+	}
+	return def, false
+}
 
 // Settle installs the desktop app run from a download folder (see
 // above), and says what to open instead of running on here: from is this
@@ -86,15 +254,44 @@ func Settle() (from, to string) {
 // settle is Settle for exe: the installed exe to open instead, "" to run
 // exe where it is.
 func settle(exe string) (string, error) {
-	to := installTarget()
-	if to == "" || samePath(exe, to) || !downloadFolder(filepath.Dir(exe)) || portableData() != "" {
+	to, ok := installed()
+	if to == "" || samePath(exe, to) || !isDownload(exe, ok || AskFolder != nil) || portableData() != "" {
 		return "", nil
 	}
-	if !exists(to) {
-		if err := installFresh(exe, to); err != nil {
-			return "", err
+	if !ok {
+		dir := filepath.Dir(to)
+		if AskFolder != nil {
+			if dir = AskFolder(dir, Installable); dir == "" {
+				if !downloadFolder(filepath.Dir(exe)) {
+					// kept where the user put it: not asked again
+					if err := declineExe(exe); err != nil {
+						log.Println("install: keeping the answer:", err)
+					}
+				}
+				return "", nil
+			}
 		}
-		return to, nil
+		to = filepath.Join(dir, exeName)
+		if samePath(exe, to) {
+			return "", nil
+		}
+		// the default needs no record, unless one names another folder
+		if !samePath(to, installTarget()) || recordedDir() != "" {
+			if err := recordDir(dir); err != nil {
+				log.Println("install: keeping the folder chosen:", err)
+			}
+		}
+		there, err := present(to)
+		if err != nil {
+			// a file there that can't be looked at would be moved over
+			return "", fmt.Errorf("can't tell whether %s is there: %w", to, err)
+		}
+		if !there {
+			if err := installFresh(exe, to); err != nil {
+				return "", err
+			}
+			return to, nil
+		}
 	}
 	if sameFile(exe, to) || sameBytes(exe, to) {
 		return to, nil
@@ -187,8 +384,7 @@ func copyBeside(exe, to string) (string, error) {
 // once the installed one has said it. When to can't be started, this one
 // runs on.
 func Forward(from, to string) error {
-	marker := filepath.Join(os.TempDir(), fmt.Sprintf("magpie-installed-%d", os.Getpid()))
-	os.Remove(marker)
+	marker := markerPath(fmt.Sprintf("magpie-installed-%d", os.Getpid()), to)
 	defer os.Remove(marker)
 	var env []string
 	for _, e := range os.Environ() {
@@ -248,8 +444,8 @@ func forwards(exe string) bool {
 	if runtime.GOOS != "windows" || os.Getenv(NoInstallEnv) == "1" {
 		return false
 	}
-	to := installTarget()
-	return to != "" && !samePath(exe, to) && downloadFolder(filepath.Dir(exe)) && portableData() == "" && exists(to)
+	to, ok := installed()
+	return ok && !samePath(exe, to) && isDownload(exe, true) && portableData() == ""
 }
 
 // samePath says whether two paths name the same file, Windows' way: in

@@ -233,3 +233,34 @@ func TestCopilotUsageResets(t *testing.T) {
 		t.Fatalf("completions counted: %v %v", used, renews)
 	}
 }
+
+// Lapsing is what a window loses soon unspent as points of the used
+// share, fading to nothing a week out; never guessed from what is left.
+func TestAllowanceLapsing(t *testing.T) {
+	now := time.Now()
+	near := func(got, want float64) bool { return got > want*0.999 && got < want*1.001 }
+	w := func(used float64, in time.Duration, amount, of float64) Allowance {
+		return Allowance{{Used: used, Of: of, RunsOut: now.Add(in), RunsOutLeft: amount}}
+	}
+	// 500 of 5000 lapse in a day: 10 points, whole
+	if got := w(50, 24*time.Hour, 500, 5000).Lapsing("m", now); !near(got, 10) {
+		t.Fatalf("a day out: %v", got)
+	}
+	// a check-in reward of 20 credits ending in 6 days, in a 5100 pool:
+	// 0.39 points, not faded away (kudi3699 on X)
+	if got := w(50, 6*24*time.Hour, 20, 5100).Lapsing("m", now); !near(got, 100*20.0/5100) {
+		t.Fatalf("a small reward 6 days out: %v", got)
+	}
+	if got := w(50, 8*24*time.Hour, 500, 5000).Lapsing("m", now); got != 0 {
+		t.Fatalf("past the horizon: %v", got)
+	}
+	if got := w(50, 24*time.Hour, 0, 5000).Lapsing("m", now); got != 0 {
+		t.Fatalf("an amount not told was guessed: %v", got)
+	}
+	if got := w(95, 24*time.Hour, 4000, 5000).Lapsing("m", now); !near(got, 5) {
+		t.Fatalf("more than is left: %v", got)
+	}
+	if got := w(50, -time.Hour, 500, 5000).Lapsing("m", now); got != 0 {
+		t.Fatalf("already lapsed: %v", got)
+	}
+}

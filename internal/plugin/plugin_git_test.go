@@ -1,9 +1,17 @@
 package plugin
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -79,6 +87,7 @@ func fakeBun(args []string) error {
 		return fmt.Errorf("unexpected %q", args)
 	}
 	var pj map[string]any
+	failSays := "" // what Bun says failing after it wrote package.json
 	b, err := os.ReadFile("package.json")
 	if err != nil {
 		return err
@@ -103,6 +112,32 @@ func fakeBun(args []string) error {
 			if s == spec && lock[n] != "" {
 				return nil // as bun: the lock's commit stays
 			}
+		}
+		// a package npm doesn't have, as Bun 1.4.4 says it: nothing written
+		if n := os.Getenv("MAGPIE_FAKE_BUN_NPM404"); n != "" && !IsPath(spec) && Name(spec) == n {
+			fmt.Println("bun add v1.4.4 (38afee6c8)")
+			fmt.Println("Resolving dependencies")
+			fmt.Println("Resolved, downloaded and extracted [1]")
+			fmt.Println("error: GET https://registry.npmjs.org/" + strings.Replace(n, "/", "%2f", 1) + " - 404")
+			return errors.New("exit 1")
+		}
+		// a tarball of plugins/dist (installDist): the package it holds,
+		// copied as Bun 1.4.4 copies it, from its install cache's entry
+		// for the tarball, which it trusts whole once it is there
+		if IsPath(spec) && strings.HasSuffix(spec, ".tgz") {
+			name, held, err := fakeDistAdd(spec)
+			if err != nil {
+				return err
+			}
+			deps[name] = spec
+			if held {
+				// as the reporter's Bun 1.4.4 said it: installed, the
+				// dependency written, and exit 1
+				failSays = "bun add v1.4.4 (38afee6c8)\nResolving dependencies\nResolved, downloaded and extracted [1]\n" +
+					"Unexpected: failed copying files from cache to destination for package " + name + "\n" +
+					"Saved lockfile\n\ninstalled " + name + "@" + spec + "\n\n1 package removed [43.00ms]\nFailed to install 1 package\n"
+			}
+			break
 		}
 		if !IsGit(spec) {
 			name := Name(spec)
@@ -143,6 +178,9 @@ func fakeBun(args []string) error {
 			lock[name] = commit
 		}
 	case "remove":
+		if os.Getenv("MAGPIE_FAKE_BUN_NOREMOVE") == "1" {
+			return errors.New("error: lockfile had changes, but lockfile is frozen")
+		}
 		for _, n := range args[2:] {
 			delete(deps, n)
 			delete(lock, n)
@@ -157,7 +195,139 @@ func fakeBun(args []string) error {
 		return err
 	}
 	b, _ = json.Marshal(lock)
-	return os.WriteFile("fake.lock", b, 0o644)
+	if err := os.WriteFile("fake.lock", b, 0o644); err != nil {
+		return err
+	}
+	if failSays != "" {
+		fmt.Print(failSays)
+		return errors.New("exit 1")
+	}
+	// as bun does on Windows with a file of a package's copy held open:
+	// package.json written, then every command fails over that package
+	// while it is a dependency (CHENGJIAHEGOXIS's agency-agents)
+	// ($MAGPIE_FAKE_BUN_BUSY_SAYS: Bun's whole output instead)
+	if n := os.Getenv("MAGPIE_FAKE_BUN_BUSY"); n != "" && deps[n] != "" {
+		if says := os.Getenv("MAGPIE_FAKE_BUN_BUSY_SAYS"); says != "" {
+			fmt.Print(says)
+			return errors.New("exit 1")
+		}
+		fmt.Println("bun add v1.4.2 (fake)")
+		fmt.Println("EBUSY: failed copying files from cache to destination for package " + n)
+		return errors.New("exit 1")
+	}
+	return nil
+}
+
+// fakeDistAdd puts the package in the tarball at path into node_modules
+// as Bun 1.4.4 does: extracted into the install cache's entry for the
+// tarball (@T@sha512-<32 hex>@@@1) when there is none, and copied from
+// that entry, whatever it holds. A copy over a folder holding .held (a
+// file of the old copy held open, as on Windows) isn't made, and held
+// says so; $MAGPIE_FAKE_BUN_HELD=1 is a copy it can never make (the
+// reporter's, v0.1.4241), and $MAGPIE_FAKE_BUN_LOSE a file that never
+// reaches the copy. A copy whose .bun-tag is the tarball's integrity is
+// taken as installed and never copied over.
+func fakeDistAdd(path string) (name string, held bool, err error) {
+	tgz, err := os.ReadFile(path)
+	if err != nil {
+		return "", false, err
+	}
+	name, _, err = fakeTarball(path)
+	if err != nil {
+		return "", false, err
+	}
+	if os.Getenv("BUN_INSTALL_CACHE_DIR") == "" {
+		return "", false, errors.New("no BUN_INSTALL_CACHE_DIR")
+	}
+	sum := sha512.Sum512(tgz)
+	entry := filepath.Join(os.Getenv("BUN_INSTALL_CACHE_DIR"), "@T@sha512-"+hex.EncodeToString(sum[:])[:32]+"@@@1")
+	if _, err := os.Stat(entry); err != nil {
+		gz, err := gzip.NewReader(bytes.NewReader(tgz))
+		if err != nil {
+			return "", false, err
+		}
+		tr := tar.NewReader(gz)
+		for {
+			h, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return "", false, err
+			}
+			_, rel, _ := strings.Cut(h.Name, "/")
+			to := filepath.Join(entry, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(to), 0o755); err != nil {
+				return "", false, err
+			}
+			b, _ := io.ReadAll(tr)
+			if err := os.WriteFile(to, b, 0o644); err != nil {
+				return "", false, err
+			}
+		}
+		link := filepath.Join(os.Getenv("BUN_INSTALL_CACHE_DIR"), filepath.FromSlash(name))
+		os.MkdirAll(link, 0o755)
+		os.Symlink(entry, filepath.Join(link, filepath.Base(entry)))
+	}
+	at := filepath.Join("node_modules", filepath.FromSlash(name))
+	// a copy whose .bun-tag is the tarball's integrity is installed, as
+	// Bun 1.4.4 checks a tarball's copy, and left as it is
+	if tag, err := os.ReadFile(filepath.Join(at, ".bun-tag")); err == nil && string(tag) == "sha512-"+base64.StdEncoding.EncodeToString(sum[:]) {
+		return name, false, nil
+	}
+	if _, err := os.Stat(filepath.Join(at, ".held")); err == nil || os.Getenv("MAGPIE_FAKE_BUN_HELD") == "1" {
+		return name, true, nil
+	}
+	err = filepath.WalkDir(entry, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, _ := filepath.Rel(entry, p)
+		if rel == os.Getenv("MAGPIE_FAKE_BUN_LOSE") {
+			return nil // a file taken out of every copy as it is made
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(at, rel)), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(at, rel), b, 0o644)
+	})
+	if err != nil {
+		return "", false, err
+	}
+	return name, false, nil
+}
+
+// fakeTarball is the name and version of the package in the tarball at
+// path.
+func fakeTarball(path string) (name, version string, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return "", "", err
+	}
+	tr := tar.NewReader(gz)
+	for {
+		h, err := tr.Next()
+		if err != nil {
+			return "", "", fmt.Errorf("%s has no package/package.json: %v", path, err)
+		}
+		if h.Name != "package/package.json" {
+			continue
+		}
+		var p struct{ Name, Version string }
+		if err := json.NewDecoder(tr).Decode(&p); err != nil {
+			return "", "", err
+		}
+		return p.Name, p.Version, nil
+	}
 }
 
 // fakeFetch clones spec's repository and puts the package in it at
@@ -336,7 +506,7 @@ func gitSandbox(t *testing.T) (github, log string) {
 		}
 		cmd := exec.CommandContext(ctx, self, args...)
 		cmd.Dir = dir
-		cmd.Env = append(os.Environ(), "MAGPIE_FAKE_BUN=1", "MAGPIE_FAKE_GITHUB="+github, "MAGPIE_FAKE_BUN_LOG="+log)
+		cmd.Env = append(os.Environ(), "MAGPIE_FAKE_BUN=1", "MAGPIE_FAKE_GITHUB="+github, "MAGPIE_FAKE_BUN_LOG="+log, "BUN_INSTALL_CACHE_DIR="+installCacheDir())
 		return cmd
 	}
 	t.Cleanup(func() { bunCommand = orig })

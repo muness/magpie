@@ -22,6 +22,7 @@ import (
 // as the variant at that level, told that level; with none picked they go
 // as before, and another agent's requests never take its pick.
 func TestAntigravityAgentEffort(t *testing.T) {
+	t.Cleanup(provider.AntigravityBuiltinForTest()) // the retired built-in route
 	fresh(t)
 	logins := []map[string]any{{
 		"agent": "antigravity", "user": "a@example.com", "on": true,
@@ -74,9 +75,9 @@ func TestAntigravityAgentEffort(t *testing.T) {
 		return rec.Result(), nil
 	})}
 	// the id the envelope went out under and the level it was told
-	asked := func(agent string) (string, string) {
+	askedFor := func(agent, model string) (string, string) {
 		t.Helper()
-		postFrom(t, s, agent, "/v1/chat/completions", `{"model":"antigravity/gemini-3.8-flash","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+		postFrom(t, s, agent, "/v1/chat/completions", `{"model":"`+model+`","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
 		mu.Lock()
 		defer mu.Unlock()
 		var env struct {
@@ -93,6 +94,10 @@ func TestAntigravityAgentEffort(t *testing.T) {
 			t.Fatalf("%v: %s", err, sent)
 		}
 		return env.Model, env.Request.GenerationConfig.ThinkingConfig.ThinkingLevel
+	}
+	asked := func(agent string) (string, string) {
+		t.Helper()
+		return askedFor(agent, "antigravity/gemini-3.8-flash")
 	}
 
 	base, baseLevel := asked("antigravity")
@@ -113,6 +118,11 @@ func TestAntigravityAgentEffort(t *testing.T) {
 		if m, l := asked("opencode"); m != base || l != baseLevel {
 			t.Errorf("picked %s for Antigravity, opencode's went as %s at %q, want %s at %q", c.pick, m, l, base, baseLevel)
 		}
+	}
+	// the level the app's own picker sent, as the model's ":low" suffix
+	// (its catalog lists one model a level), outranks the row's pick
+	if m, l := askedFor("antigravity", "antigravity/gemini-3.8-flash:low"); m != "gemini-3.8-flash-low" || l != "low" {
+		t.Errorf("picked high, asked :low in the app: went as %s at %q, want gemini-3.8-flash-low at \"low\"", m, l)
 	}
 	if err := provider.SetAgentEffort("antigravity", ""); err != nil {
 		t.Fatal(err)

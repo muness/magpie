@@ -2,8 +2,11 @@ package gui
 
 import (
 	"math"
+	"os"
 	"runtime"
 	"runtime/debug"
+	"runtime/metrics"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -144,19 +147,20 @@ func TestTightGCRetunesAfterACollection(t *testing.T) {
 	}
 }
 
-// TestSteadyPercent: between reads the heap grows by half of what it
-// holds, by 32 MB when that is more, and never by more than Go's default.
+// TestSteadyPercent: between reads the heap grows by a quarter of what it
+// holds, by 16 MB when that is more, and never by more than Go's default.
 func TestSteadyPercent(t *testing.T) {
 	for _, c := range []struct {
 		live int64
 		want int
 	}{
-		{0, 50},
-		{60 << 20, 53},
-		{64 << 20, 50},
+		{0, 25},
+		{60 << 20, 26},
+		{64 << 20, 25},
+		{8 << 20, 100},
 		{16 << 20, 100},
-		{32 << 20, 100},
-		{500 << 20, 50},
+		{32 << 20, 50},
+		{500 << 20, 25},
 	} {
 		if got := steadyPercent(c.live); got != c.want {
 			t.Errorf("steadyPercent(%d MB) = %d, want %d", c.live>>20, got, c.want)
@@ -193,10 +197,11 @@ func TestSteadyGCKeepsTheUsersGOGC(t *testing.T) {
 	}
 }
 
-// TestSteadyGCRetunesAfterACollection: from the start GOGC is half, each
-// collection sets it for the heap it left (a test's heap is under the
-// room: Go's 100), a read under a tight GC still sets its tenth, and after
-// the read the next collection sets it for the heap again.
+// TestSteadyGCRetunesAfterACollection: from the start GOGC is a quarter,
+// each collection sets it for the heap it left (steadyPercent: a whole
+// package's test heap is over 16 MB, so not always Go's 100), a read
+// under a tight GC still sets its tenth, and after the read the next
+// collection sets it for the heap again.
 func TestSteadyGCRetunesAfterACollection(t *testing.T) {
 	steadyOff(t)
 	t.Setenv("GOGC", "")
@@ -205,18 +210,29 @@ func TestSteadyGCRetunesAfterACollection(t *testing.T) {
 	if got := gcPercent(); got != steadyGCPercent {
 		t.Fatalf("GOGC before a collection = %d, want %d", got, steadyGCPercent)
 	}
-	collectUntil := func(want int) {
+	// retuned: GOGC is steadyPercent of the heap the last collection left,
+	// which a test's heap of under 64 MB tells from the quarter set before
+	retuned := func() {
 		t.Helper()
 		deadline := time.Now().Add(10 * time.Second)
-		for gcPercent() != want {
-			if time.Now().After(deadline) {
-				t.Fatalf("GOGC after collections = %d, want %d", gcPercent(), want)
-			}
+		for {
 			runtime.GC()
 			time.Sleep(time.Millisecond)
+			s := []metrics.Sample{{Name: "/gc/heap/live:bytes"}}
+			metrics.Read(s)
+			live := int64(s[0].Value.Uint64())
+			want := steadyPercent(live)
+			if want == steadyGCPercent {
+				t.Skipf("a live heap of %d MB is retuned to the quarter it starts at", live>>20)
+			}
+			if got := gcPercent(); got == want {
+				return
+			} else if time.Now().After(deadline) {
+				t.Fatalf("GOGC after collections = %d, want %d for %d MB live", got, want, live>>20)
+			}
 		}
 	}
-	collectUntil(100)
+	retuned()
 	debug.SetGCPercent(steadyGCPercent)
 	undo := tightenGC()
 	if got := gcPercent(); got != tightGCPercent {
@@ -228,5 +244,38 @@ func TestSteadyGCRetunesAfterACollection(t *testing.T) {
 		t.Fatalf("a read under a tight GC runs under %d after collections, want %d", got, tightGCPercent)
 	}
 	undo()
-	collectUntil(100)
+	retuned()
+}
+
+// A read under a tight GC runs on tightProcs Ps, and the last of two at
+// once ends puts back Go's default; a GOMAXPROCS the user set is kept.
+func TestTightGCNarrowsProcs(t *testing.T) {
+	defer debug.SetGCPercent(debug.SetGCPercent(100))
+	if runtime.NumCPU() <= tightProcs {
+		t.Skipf("%d CPUs: nothing to narrow", runtime.NumCPU())
+	}
+	if os.Getenv("GOMAXPROCS") != "" {
+		t.Skip("GOMAXPROCS is set for this run")
+	}
+	def := runtime.GOMAXPROCS(0)
+	first := tightenGC()
+	second := tightenGC()
+	if p := runtime.GOMAXPROCS(0); p != tightProcs {
+		t.Fatalf("two reads on %d Ps, want %d", p, tightProcs)
+	}
+	first()
+	if p := runtime.GOMAXPROCS(0); p != tightProcs {
+		t.Errorf("one read still in flight on %d Ps, want %d", p, tightProcs)
+	}
+	second()
+	if p := runtime.GOMAXPROCS(0); p != def {
+		t.Errorf("after both reads %d Ps, want Go's default %d", p, def)
+	}
+
+	t.Setenv("GOMAXPROCS", strconv.Itoa(def))
+	underTightGC(func() {
+		if p := runtime.GOMAXPROCS(0); p != def {
+			t.Errorf("the user's GOMAXPROCS=%d: read on %d Ps", def, p)
+		}
+	})
 }

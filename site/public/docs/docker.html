@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Docker · magpie docs</title>
+<title>Run magpie in Docker: an AI gateway on a server or NAS · magpie</title>
 <meta name="description" content="Run magpie in Docker on a server or a NAS: the ghcr.io/yetone/magpie image, its ports, volume and environment, the browser UI, signing in to subscriptions, sharing the gateway with gateway keys, and a Compose file.">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fafafa">
@@ -39,6 +39,54 @@
 <meta property="og:image" content="https://usemagpie.ai/img/og.png">
 <meta property="og:url" content="https://usemagpie.ai/docs/docker">
 <meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "TechArticle",
+   "headline": "magpie in Docker",
+   "description": "Run magpie in Docker on a server or a NAS: the ghcr.io/yetone/magpie image, its ports, volume and environment, the browser UI, signing in to subscriptions, sharing the gateway with gateway keys, and a Compose file.",
+   "inLanguage": "en",
+   "url": "https://usemagpie.ai/docs/docker",
+   "about": {
+    "@type": "SoftwareApplication",
+    "name": "magpie",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS, Windows, Linux"
+   },
+   "publisher": {
+    "@type": "Organization",
+    "name": "magpie",
+    "url": "https://usemagpie.ai/"
+   }
+  },
+  {
+   "@type": "BreadcrumbList",
+   "itemListElement": [
+    {
+     "@type": "ListItem",
+     "position": 1,
+     "name": "magpie",
+     "item": "https://usemagpie.ai/"
+    },
+    {
+     "@type": "ListItem",
+     "position": 2,
+     "name": "Docs",
+     "item": "https://usemagpie.ai/docs/start"
+    },
+    {
+     "@type": "ListItem",
+     "position": 3,
+     "name": "magpie in Docker",
+     "item": "https://usemagpie.ai/docs/docker"
+    }
+   ]
+  }
+ ]
+}
+</script>
 </head>
 <body>
 
@@ -55,6 +103,13 @@
     <a class="toc-only" href="/docs/masking">Privacy masking</a>
     <a class="toc-only" href="/docs/mcp-router">MCP router</a>
     <a class="toc-only" href="/docs/library">Library</a>
+    <a class="toc-only" href="/docs/claude-code-models">Models in Claude Code</a>
+    <a class="toc-only" href="/docs/codex-models">Models in Codex</a>
+    <a class="toc-only" href="/docs/gemini-cli-models">Models in Gemini CLI</a>
+    <a class="toc-only" href="/docs/subscriptions">Subscriptions in any agent</a>
+    <a class="toc-only" href="/docs/local-models">Local models</a>
+    <a class="toc-only" href="/docs/opencode-models">Models in OpenCode</a>
+    <a class="toc-only" href="/docs/alternatives">magpie vs CC Switch vs CCR</a>
     <a href="/docs/import">Add to magpie</a>
     <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie-releases/releases">Releases</a>
@@ -80,11 +135,14 @@
     <a href="#run">Run it</a>
     <a href="#web">The browser UI</a>
     <a href="#signin">Sign in to subscriptions</a>
+    <a href="#mcp">MCP servers</a>
+    <a href="#browser">Your own browser</a>
     <a href="#volume">What is kept</a>
     <a href="#env">Environment</a>
     <a href="#share">Gateway keys and other machines</a>
     <a href="#compose">Docker Compose on a NAS</a>
     <a href="#ops">Health, terminal, updates</a>
+    <a href="#k8s">Kubernetes</a>
   </aside>
 
   <article>
@@ -94,12 +152,12 @@
 
     <div class="table-wrap"><table>
       <tr><td><b>Image</b></td><td><code>ghcr.io/yetone/magpie</code>, for <code>linux/amd64</code> and <code>linux/arm64</code></td></tr>
-      <tr><td><b>Tags</b></td><td><code>latest</code> (the newest release), <code>stable</code> (the desktop app's Stable channel: a release a week, out three days first, or an urgent one at once), <code>0.1.1150</code> (one release), <code>0.1</code>, <code>edge</code> (every change on <code>main</code>)</td></tr>
+      <tr><td><b>Tags</b></td><td><code>latest</code> (the newest release), <code>daily</code> (the desktop app's Daily channel: once a day at 20:00 UTC, the newest release whose CI run passed, or an urgent one at once), <code>stable</code> (the desktop app's Stable channel: a release a week, out three days first, or an urgent one at once), <code>0.1.1150</code> (one release), <code>0.1</code>, <code>edge</code> (every change on <code>main</code>)</td></tr>
       <tr><td><b>Ports</b></td><td><code>3425</code> the gateway agents call; <code>3430</code> the browser UI, when the container runs <code>magpie web</code>; it answers the gateway’s <code>/v1</code> routes too, so a reverse proxy needs only this port</td></tr>
       <tr><td><b>Volume</b></td><td><code>/config</code>: providers, keys, sign-ins, plugins and usage</td></tr>
       <tr><td><b>User</b></td><td>nonroot (uid 65532)</td></tr>
     </table></div>
-    <p>The image holds magpie’s terminal-only build on Debian 12 slim, with bash for a terminal in the container and curl for the installers of the CLIs some subscriptions sign in with (Cursor, Devin, Grok Build). It runs <code>magpie serve</code> (the gateway alone) unless given another command. The container finds no agents to wire, so magpie in it is a gateway: the agents that use it run elsewhere.</p>
+    <p>The image holds magpie’s terminal-only build on Debian 13 slim, with bash for a terminal in the container and curl for the installers of the CLIs some subscriptions sign in with (Cursor, Devin, Grok Build). It runs <code>magpie serve</code> (the gateway alone) unless given another command. The container finds no agents to wire, so magpie in it is a gateway: the agents that use it run elsewhere.</p>
 
     <h2 id="run"><a class="anchor" href="#run">Run it</a></h2>
     <p>Run it with the browser UI, a key for that page you keep across restarts, and both ports on the host’s loopback only:</p>
@@ -128,8 +186,8 @@ docker logs magpie</pre>
     <p>Without <code>web --addr 0.0.0.0:3430 --no-open</code> the container runs the gateway alone, which you then set up from a terminal in it (<code>docker exec -it magpie magpie provider add …</code>). A folder bind-mounted at <code>/config</code> works in place of the named volume, if uid 65532 can write it: <code>sudo chown -R 65532:65532 /volume1/docker/magpie/config</code>.</p>
 
     <h2 id="web"><a class="anchor" href="#web">The browser UI</a></h2>
-    <p>Open the link from the log. The key in it is traded for a cookie and taken out of the address; a page opened without it is turned away (401). With <code>MAGPIE_WEB_KEY</code> set (16 or more letters, digits or <code>- . _ ~</code>; <code>openssl rand -hex 16</code> makes one) the key stays the same across restarts and the browser stays signed in for 400 days. Without it, every start makes a new key and the cookie lasts the browser session.</p>
-    <p>The page is in <b>gateway mode</b>: <span class="ui">Providers</span>, <span class="ui">Gateway</span>, <span class="ui">Routing</span>, <span class="ui">Usage</span>, <span class="ui">Sessions</span>, <span class="ui">Plugins</span> and <span class="ui">Settings</span>, with no Agents or Library, since there are no agents in the container. <span class="ui">Sessions</span> lists only the sessions of agents on other computers that came through this gateway, never this machine’s agents’ files. <span class="ui">Settings</span> → <span class="ui">General</span> → <span class="ui">Gateway mode</span> turns it off.</p>
+    <p>Open the link from the log. The key in it is traded for a cookie and taken out of the address; a page opened without it is turned away (401). With <code>MAGPIE_WEB_KEY</code> set (16 or more letters, digits or <code>- . _ ~</code>; <code>openssl rand -hex 16</code> makes one) the key stays the same across restarts, and a browser stays signed in for 400 days. Without it, every start makes a new key: a browser stays signed in, closed and opened again too, until magpie starts again, and then needs the new link.</p>
+    <p>The page is in <b>gateway mode</b>: <span class="ui">Providers</span>, <span class="ui">Gateway</span>, <span class="ui">Routing</span>, <span class="ui">Usage</span>, <span class="ui">Sessions</span>, <span class="ui">Plugins</span> and <span class="ui">Settings</span>, with no Agents, since there are no agents in the container. <span class="ui">Library</span> has its MCP servers, with the MCP router: other computers’ apps connect at the router’s address with a gateway key. Beside them are its <span class="ui">Skills</span> and <span class="ui">Instructions</span>: a magpie on another computer that adds this one as an <span class="ui">Another computer’s magpie</span> provider, with <span class="ui">Use its skills and prompts</span> on, takes them and gives them to its own agents, since a skill is a folder on the agent’s computer. <span class="ui">Sessions</span> lists only the sessions of agents on other computers that came through this gateway, never this machine’s agents’ files. <span class="ui">Settings</span> → <span class="ui">General</span> → <span class="ui">Gateway mode</span> turns it off.</p>
     <p>On a NAS or a server you reach over SSH, open the page through a tunnel rather than publishing 3430: <code>ssh -L 3430:127.0.0.1:3430 you@nas</code>, then the log’s link on your own computer.</p>
     <div class="callout"><b>Anyone with the link can change magpie and see its keys.</b> Keep 3430 on loopback or a VPN. Across the network, serve it over HTTPS: give magpie a certificate with <code>MAGPIE_TLS_CERT</code> and <code>MAGPIE_TLS_KEY</code>, or put it behind a reverse proxy with TLS, such as Caddy.</div>
 
@@ -150,6 +208,15 @@ docker logs magpie</pre>
     </div>
     <p>A Grok (SuperGrok) subscription signs in through xAI’s Grok Build CLI, which the image doesn’t have either. Its sign-in, in the browser UI or with <code>magpie plugin login grok</code>, installs it first, as xAI’s installer does: the stable version from <code>x.ai/cli</code>, kept in <code>/config/home/.grok</code>. To use a Grok Build binary you put on the volume yourself, set <code>GROK_BIN_DIR</code> to the folder holding it.</p>
 
+    <h2 id="mcp"><a class="anchor" href="#mcp">MCP servers</a></h2>
+    <p>The Library’s MCP servers run in the container, and the image has what they start with: <code>npx</code>, <code>node</code> and <code>npm</code> (Node 24), and <code>uvx</code>, <code>uv</code>, <code>python</code> and <code>python3</code>. A server started with <code>uvx</code> or <code>python</code> downloads its Python into the volume the first time, which takes a few seconds. A server started with <code>docker</code> doesn’t run: the container has no Docker of its own.</p>
+    <p>The image has no browser. Chrome DevTools’ and Playwright’s MCP servers start a Chrome of their own, so in the container their row in the Library says <span class="ui">no Chrome here</span>. Use <a href="#browser">Magpie Browser</a> instead, which acts in your own browser, or point the server at a Chrome it can reach: <code>--browserUrl http://host:9222</code> for Chrome DevTools, <code>--cdp-endpoint</code> for Playwright.</p>
+    <p>An app on the host or another machine reaches the <a href="/docs/mcp-router">MCP router</a> from outside the container. With a gateway key that has a model, account or spend limit, it is given only the Library’s URL servers, not the ones the container runs as programs (<code>npx</code>, <code>uvx</code> and the like). Give it a key with no such limit to get those too; the router tells the app which servers it left out and why (<a href="/docs/mcp-router#away">From another computer</a>).</p>
+
+    <h2 id="browser"><a class="anchor" href="#browser">Your own browser</a></h2>
+    <p>Magpie Browser lets agents act in your own browser, through its extension. The extension can’t be loaded from the container’s folders, so in the browser UI open <span class="ui">Library</span> → <span class="ui">Magpie Browser</span> and click <span class="ui">Download the extension</span>. The zip is pointed at the page’s own address, with a gateway key named <b>Magpie Browser</b> of its own. Unzip it, open <code>chrome://extensions</code>, turn on Developer mode and click <span class="ui">Load unpacked</span> on the unzipped folder. An extension already loaded takes the address (<code>http://localhost:3430</code>, or the gateway’s published port) and a gateway key in its popup.</p>
+    <p>The Magpie Browser key connects the extension and nothing else: it can’t use models, MCP servers or stats, so a copy of the zip left in Downloads spends nothing. The host’s browser reaches the container from Docker’s bridge, not from the container’s own computer, so it is that key’s alone and the container’s agents don’t use it yet (<a href="https://github.com/yetone/magpie/issues/5529">#5529</a>). To use it from an agent on the host, give that agent a gateway key of its own with full access, connect the extension with the same key in its popup, and call <code>/mcp/magpie/browser</code> with it. A browser given another key is that key’s alone, and it is let go once its key is turned off, removed or rotated.</p>
+
     <h2 id="volume"><a class="anchor" href="#volume">What is kept</a></h2>
     <p>Everything magpie writes is under <code>/config</code>, so a restart, or a new container on the same volume, keeps your providers, keys, sign-ins and plugins.</p>
     <div class="table-wrap"><table>
@@ -167,8 +234,10 @@ docker logs magpie</pre>
       <tr><td><code>MAGPIE_ADDR</code></td><td>where the gateway listens. The image sets <code>0.0.0.0:3425</code>, so the published port reaches it.</td></tr>
       <tr><td><code>MAGPIE_PUBLIC_URL</code></td><td>the address other machines reach the gateway at, such as <code>http://192.168.1.20:3425</code> (the host’s or the NAS’s, on the published port), or a reverse proxy’s base URL. In the container magpie sees only Docker’s own <code>172.17.x</code> address; with this set, the address it shows and prints is the one to use.</td></tr>
       <tr><td><code>MAGPIE_WEB_KEY</code></td><td>the browser UI’s key, kept across restarts (16+ characters)</td></tr>
+      <tr><td><code>MAGPIE_NAME</code></td><td>what this magpie is called: the browser tab’s title reads <code>&lt;name&gt; · magpie</code>, to tell several deployments apart. A name set on the page, in <span class="ui">Settings</span> → <span class="ui">Network and sharing</span> → <span class="ui">Advanced</span> → <span class="ui">Name</span>, comes first.</td></tr>
       <tr><td><code>MAGPIE_TLS_CERT</code>, <code>MAGPIE_TLS_KEY</code></td><td>a PEM certificate (its chain after it) and its key, mounted into the container: other machines then reach the gateway and the browser UI over <code>https://</code> only, and plain HTTP from them gets 400. The files are read again when they change, so a renewal needs no restart. One without the other, or files that don’t load, stop magpie from starting. Use <code>https://</code> in <code>MAGPIE_PUBLIC_URL</code> too.</td></tr>
       <tr><td><code>MAGPIE_ALLOW_IPS</code></td><td>the only addresses other machines may reach the gateway and the browser UI from, as IPs and CIDR ranges: <code>203.0.113.7,10.0.0.0/8,2001:db8::/32</code>. Any other address gets 403, even with a gateway key. Unset lets every address in, each with a key. See <a href="#allow">Allowed addresses</a>.</td></tr>
+      <tr><td><code>MAGPIE_DRAIN</code></td><td>how long a stop waits for the requests in flight, streams included: seconds (<code>300</code>) or a duration (<code>5m</code>); 20 seconds in Kubernetes and 7 elsewhere unless set (<code>docker stop</code> waits 10), <code>0</code> for 2. Past 10, give Docker as long: <code>docker stop -t</code>, Compose’s <code>stop_grace_period</code>. See <a href="#k8s">Kubernetes</a>.</td></tr>
       <tr><td><code>HOME</code>, <code>XDG_CONFIG_HOME</code>, <code>XDG_CACHE_HOME</code>, <code>XDG_DATA_HOME</code>, <code>XDG_STATE_HOME</code></td><td>set by the image to the folders under <code>/config</code> above; leave them</td></tr>
     </table></div>
 
@@ -211,9 +280,62 @@ docker logs magpie</pre>
     <ul>
       <li><b>Health.</b> The image has a <code>HEALTHCHECK</code>: <code>magpie healthcheck</code> exits 0 while the gateway answers, under <code>serve</code> and <code>web</code> alike, so <code>docker ps</code> shows the container as healthy and Compose can wait for it with <code>depends_on: condition: service_healthy</code>.</li>
       <li><b>Terminal.</b> <code>docker exec -it magpie bash</code>, or a NAS panel’s terminal, opens a shell with <code>magpie</code> on its PATH: <code>magpie providers</code>, <code>magpie models</code>, <code>magpie usage</code>, <code>magpie quota</code> and the rest of the <a href="https://github.com/yetone/magpie/blob/main/docs/reference.md">CLI</a>.</li>
-      <li><b>Updates.</b> Pull the new image and recreate the container on the same volume: <code>docker pull ghcr.io/yetone/magpie:latest</code>, then <code>docker rm -f magpie</code> and the same <code>docker run</code>, or <code>docker compose pull &amp;&amp; docker compose up -d</code>.</li>
+      <li><b>Updates.</b> Pull the new image and recreate the container on the same volume: <code>docker pull ghcr.io/yetone/magpie:latest</code>, then <code>docker rm -f magpie</code> and the same <code>docker run</code>, or <code>docker compose pull &amp;&amp; docker compose up -d</code>. magpie releases several times a day; for one update a day with Renovate or Watchtower, follow <code>daily</code> (with Renovate, pin its digest), or <code>stable</code> for one a week. When magpie finds an update, Settings › About names that version's own image (<code>docker pull ghcr.io/yetone/magpie:0.1.1150</code>): <code>latest</code> may hold a newer release than your update channel's; run the container from the tag you pulled.</li>
       <li><b>Build it yourself.</b> <code>docker build -t magpie .</code> in a checkout of <a href="https://github.com/yetone/magpie">the repository</a> makes the same image.</li>
     </ul>
+
+    <h2 id="k8s"><a class="anchor" href="#k8s">Kubernetes</a></h2>
+    <p>A restart cuts nothing in flight, with nothing to set. On <code>SIGTERM</code> (a rolling update, <code>kubectl delete pod</code>, <code>docker stop</code>), <code>magpie serve</code> and <code>magpie web</code> fail their readiness check at once, keep accepting for 5 seconds while the Service stops sending them requests, then stop accepting and let the requests in flight finish, streams included, for up to 20 seconds.</p>
+    <div class="code">
+      <span class="lang">deployment.yaml</span>
+      <button class="copy" data-copy="ex-k8s">Copy</button>
+      <pre id="ex-k8s">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: magpie
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1         <span class="c"># the new pod starts beside the old one</span>
+      maxUnavailable: 0   <span class="c"># the old one ends once the new one is ready</span>
+  selector:
+    matchLabels: {app: magpie}
+  template:
+    metadata:
+      labels: {app: magpie}
+    spec:
+      terminationGracePeriodSeconds: 30   <span class="c"># MAGPIE_DRAIN (20s) plus 10s to save</span>
+      securityContext:
+        fsGroup: 65532
+      affinity:
+        podAffinity:   <span class="c"># the new pod on the old one's node, where the ReadWriteOnce volume is</span>
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: magpie}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: magpie
+          image: ghcr.io/yetone/magpie:stable
+          ports:
+            - containerPort: 3425
+          readinessProbe:
+            exec:
+              command: [/magpie, healthcheck]
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: magpie-config   <span class="c"># ReadWriteOnce</span></pre>
+    </div>
+    <p><b>Readiness.</b> Probe with <code>exec</code> and <code>magpie healthcheck</code>, as above: it asks from inside the container, so it needs no key. An <code>httpGet</code> probe comes from outside the container and would need a gateway key.</p>
+    <p><b>Longer turns.</b> An agent’s turn can stream for minutes. Raise <code>MAGPIE_DRAIN</code> and <code>terminationGracePeriodSeconds</code> together, the second 10 seconds above the first: <code>MAGPIE_DRAIN: "300"</code> with <code>terminationGracePeriodSeconds: 310</code>.</p>
+    <p><b>Rolling updates.</b> The new pod serves beside the old one on the same <code>/config</code>, and the Service sends it requests once it is ready; the old pod then drains as above, so no request is dropped. Each sign-in renewal and each saved file is locked across the pods. What only one magpie may do (renewing the saved sign-ins in the background, check-ins, plugin updates) the old pod keeps doing until it ends, and the new pod takes it over within a second. A ReadWriteOnce volume mounts on one node only, so the <code>podAffinity</code> above starts the new pod on the old one's node; with a ReadWriteMany volume, leave it out.</p>
+    <p><b>Updating from a version before v0.1.4526.</b> The old pod doesn't take part in that handover, so the two would both renew sign-ins for the length of the update. Make that one update with <code>strategy: Recreate</code>, then switch to the rolling update above.</p>
 
     <p style="margin-top:48px">Questions or a setup worth sharing? Ask on <a href="https://discord.gg/vGSnD3ZKQF">Discord</a>. The <a href="https://github.com/yetone/magpie/blob/main/docs/reference.md#docker">reference</a> has the details.</p>
   </article>
@@ -232,6 +354,13 @@ docker logs magpie</pre>
     <a href="/docs/masking">Privacy masking</a>
     <a href="/docs/mcp-router">MCP router</a>
     <a href="/docs/library">Library</a>
+    <a href="/docs/claude-code-models">Models in Claude Code</a>
+    <a href="/docs/codex-models">Models in Codex</a>
+    <a href="/docs/gemini-cli-models">Models in Gemini CLI</a>
+    <a href="/docs/subscriptions">Subscriptions in any agent</a>
+    <a href="/docs/local-models">Local models</a>
+    <a href="/docs/opencode-models">Models in OpenCode</a>
+    <a href="/docs/alternatives">magpie vs CC Switch vs CCR</a>
     <a href="/docs/import">Add to magpie</a>
     <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>

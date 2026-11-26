@@ -34,7 +34,7 @@ const system = { en: "System", zh: "跟随系统", "zh-TW": "跟隨系統", ja: 
 // the rows whose name says enough, found by the control they hold
 const bare = ["#themeSegs", "#colorblindSegs", "#reduceMotionSegs", "#birdSegs", "#langPick", "#textSizeSegs", "#traySegs", "#plainNamesSegs", "#loginSegs", "#dockSegs"];
 // the rows that keep a line, one each
-const kept = ["#lightweightSegs", "#keepAwakeSegs", "#quitAskSegs", "#sessionTerminalRow .sess-pick"];
+const kept = ["#lightweightSegs", "#keepAwakeSegs", "#gatewayPauseSegs", "#quitAskSegs", "#sessionTerminalRow .sess-pick"];
 
 function serve(lang, posted, st) {
   const settings = () => ({ lang, theme: "light", searchVendors: [], searchAPIs: [], ...st });
@@ -104,7 +104,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       for (const [sel, subs] of rows.bare) assert.deepEqual(subs, [], `${sel}'s row says its name alone`);
       // Long conversations stays here with no Codex or Claude Code, as in
       // this fixture (agent-prefs.test.cjs)
-      assert.equal(await page.locator("#view-settings :is(#codexAgentsV1Row, #codexAsyncRow, #codexTitlesRow, #codexDescriptionsRow, #codexPredictionsRow, #codexAutoReviewRow, #codexMemoriesRow)").count(), 0, "an agent's own settings are on its row");
+      assert.equal(await page.locator("#view-settings :is(#codexAgentsV1Row, #codexAsyncRow, #codexTitlesRow, #codexDescriptionsRow, #codexPredictionsRow, #codexSuggestionsRow, #codexAutoReviewRow, #codexMemoriesRow)").count(), 0, "an agent's own settings are on its row");
       for (const [sel, sub] of rows.kept) {
         assert.equal(typeof sub, "object", `${sel}: ${sub}`);
         assert.ok(sub.text.trim(), `${sel}: ${JSON.stringify(sub)}`);

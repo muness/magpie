@@ -3,10 +3,11 @@ package provider
 import (
 	"context"
 	"errors"
-	"regexp"
+	"fmt"
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -38,7 +39,9 @@ func StartPluginSignInWith(id string, method int, inputs map[string]string, o Si
 	var installing context.Context
 	if install {
 		s.st.State, s.st.Installing = "installing", cli.Name
-		installing, s.stop = context.WithCancel(context.Background())
+		// through the proxy the sign-in takes: a plugin's own installer
+		// downloads with the plugin's fetch (plugin.InstallCLI)
+		installing, s.stop = context.WithCancel(s.via(context.Background()))
 	} else if err := s.pluginBegin(id, method, inputs); err != nil {
 		return SignInState{}, err
 	}
@@ -74,8 +77,10 @@ func StartPluginSignInWith(id string, method int, inputs map[string]string, o Si
 var pluginRunsCLI = map[string]bool{"grok": true}
 
 // pluginCLI is the vendor CLI a plugin's sign-in (OpenCode's id) runs
-// through and this machine lacks: a moved built-in's, or one in
-// pluginRunsCLI.
+// through and this machine lacks: a moved built-in's, one in
+// pluginRunsCLI, or one the plugin says it installs itself (auth.cli,
+// plugin.CLI). The last is how agy-cli has agy installed in a container,
+// as Claude's sign-in downloads Claude Code there (niuniu_8964 on X).
 func pluginCLI(id string) (agentCLI, bool) {
 	if PluginServes(PluginID(id)) {
 		return missingCLI(PluginID(id))
@@ -83,7 +88,33 @@ func pluginCLI(id string) (agentCLI, bool) {
 	if pluginRunsCLI[id] {
 		return missingCLI(id)
 	}
+	if pp, ok := PluginOf(PluginID(id)); ok && pp.CLI != nil {
+		c := ownCLI(id, *pp.CLI)
+		if c.find() == "" {
+			return c, true
+		}
+	}
 	return agentCLI{}, false
+}
+
+// ownCLI is the CLI a plugin installs itself, as an agentCLI: found when
+// the plugin says it is installed, installed by the plugin. A plugin that
+// can't be asked counts it as there: its authorize says what is missing,
+// as it did before it could install anything.
+func ownCLI(id string, c plugin.CLI) agentCLI {
+	return agentCLI{
+		Name: c.Name,
+		find: func() string {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if in, err := plugin.CLIInstalled(ctx, id); err == nil && !in {
+				return ""
+			}
+			return c.Name
+		},
+		native: func(ctx context.Context) error { return plugin.InstallCLI(ctx, id) },
+		manual: c.Manual,
+	}
 }
 
 // PluginCLIMissing is the name of the vendor CLI a plugin's sign-in runs
@@ -164,7 +195,7 @@ func (s *signInFlow) pluginBegin(id string, method int, inputs map[string]string
 
 // deviceCode is the code a device sign-in's instructions ask to check on
 // the vendor's page ("Confirm the code ABCD-EFGH on Factory's page").
-var deviceCode = regexp.MustCompile(`(?i:\bcode):?\s+([A-Z0-9]+(?:-[A-Z0-9]+)+|[A-Z0-9]{6,})\b`)
+var deviceCode = lazyre.New(`(?i:\bcode):?\s+([A-Z0-9]+(?:-[A-Z0-9]+)+|[A-Z0-9]{6,})\b`)
 
 // codeIn is that code, shown to copy as the built-in's was.
 func codeIn(instructions string) string {
@@ -224,7 +255,7 @@ func PluginAPIKey(ctx context.Context, id string, method int, inputs map[string]
 	}
 	if strings.TrimSpace(key) == "" {
 		pp, ok := PluginOf(PluginID(id))
-		if !ok || method < 0 || method >= len(pp.Methods) || pp.Methods[method].Type != "api" || !pp.Methods[method].Keyless {
+		if !ok || method < 0 || method >= len(pp.Methods) || pp.Methods[method].Type != "api" || !pp.Methods[method].NoKey() {
 			return "", errors.New("enter the key")
 		}
 	}
@@ -234,6 +265,53 @@ func PluginAPIKey(ctx context.Context, id string, method int, inputs map[string]
 		return "", err
 	}
 	return PluginSignedIn(saved), nil
+}
+
+// PluginImportable is whether the subscription id (a magpie id) is a
+// plugin's that takes accounts from a file (auth.import). Factory's
+// plugin has its own importer here (ImportFactoryKeys), which goes first.
+func PluginImportable(id string) bool {
+	pp, ok := PluginOf(id)
+	return ok && pp.Importable
+}
+
+// ImportPluginFiles brings in the accounts the files' texts hold for the
+// plugin's subscription id (a magpie id): the plugin reads them, checks
+// each with its vendor as a sign-in does, and keeps the ones it takes,
+// through the proxy the subscription's requests go through (#1663).
+func ImportPluginFiles(ctx context.Context, id string, texts []string) ([]ImportedAccount, error) {
+	if settings.AccountDiscoveryOff() {
+		return nil, errAccountDiscoveryOff
+	}
+	pp, ok := PluginOf(id)
+	if !ok || !pp.Importable {
+		return nil, errors.New("this subscription takes no accounts from a file")
+	}
+	if len(texts) > maxGoogleImport {
+		return nil, fmt.Errorf("%d files; at most %d at a time", len(texts), maxGoogleImport)
+	}
+	got, err := plugin.ImportFiles(Via(ctx, id), pp.ID, texts)
+	if err != nil {
+		return nil, err
+	}
+	if len(got) == 0 {
+		return nil, errors.New("no account to import was found in it")
+	}
+	out := make([]ImportedAccount, 0, len(got))
+	for i, r := range got {
+		user := r.User
+		if user == "" {
+			user = fmt.Sprintf("#%d", i+1)
+		}
+		if r.Status == "failed" {
+			out = append(out, ImportedAccount{User: user, Status: "failed", Error: r.Error})
+			continue
+		}
+		PluginSignedIn(plugin.Saved{Provider: r.Provider, Account: r.Account})
+		out = append(out, ImportedAccount{User: user, Status: r.Status})
+	}
+	forgetAccountCaches()
+	return out, nil
 }
 
 // PluginSignedIn finishes a sign-in to a plugin's provider that magpie

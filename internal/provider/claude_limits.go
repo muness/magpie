@@ -62,13 +62,51 @@ func claudeWithUnstarted(ws []QuotaWindow) []QuotaWindow {
 	return out
 }
 
+// claudeNoFiveHour says whether the whole reading ws of an account, read at
+// now, is of one the vendor sends no 5-hour window for, so claudeWithUnstarted
+// must not make one up. Anthropic leaves a window out (null) while it hasn't
+// started, which is all an idle account's reading says, so it is the use
+// that tells: an account whose week rose since prev, read at prevAt less than
+// five hours ago, was used inside five hours, and one used so has a 5-hour
+// window running where its plan has one. prev with no 5-hour window at all
+// (the made-up one has no reset) stays so, as does the card kept on disk, until
+// a reading tells one (shangyuan0818 on X: a verified Ultra account has none).
+func claudeNoFiveHour(prev []QuotaWindow, prevAt time.Time, ws []QuotaWindow, now time.Time) bool {
+	has := func(l []QuotaWindow) bool {
+		return slices.ContainsFunc(l, func(w QuotaWindow) bool { return w.Name == "5 hours" })
+	}
+	if has(ws) || len(prev) == 0 {
+		return false
+	}
+	if !has(prev) {
+		return true // seen without one, and nothing since says it started
+	}
+	if prevAt.IsZero() || now.Sub(prevAt) >= 5*time.Hour {
+		return false
+	}
+	week := func(l []QuotaWindow) (QuotaWindow, bool) {
+		for _, w := range l {
+			if w.Name == "7 days" && w.ResetsAt != nil {
+				return w, true
+			}
+		}
+		return QuotaWindow{}, false
+	}
+	a, ok1 := week(prev)
+	b, ok2 := week(ws)
+	return ok1 && ok2 && b.Used > a.Used && b.ResetsAt.Sub(*a.ResetsAt).Abs() < time.Hour
+}
+
 // claudeHeard is how long what Claude Code said as it answered stands in
 // for the usage endpoint when that fails.
 const claudeHeard = time.Hour
 
 // NoteClaudeLimits keeps what Claude Code said of user's allowance as it
 // answered, in place of the windows of the same names last read, and has
-// routing weigh the account by it.
+// routing weigh the account by it. An answer tells only some windows (a
+// rate_limit_event often names five_hour alone): the others stand as last
+// read, after a restart as kept on disk (quotas.json), so the week isn't
+// lost to an answer that didn't name it (ifccod7391564 on X).
 func NoteClaudeLimits(user string, ls []ClaudeLimit) {
 	var heard []QuotaWindow
 	for _, l := range ls {
@@ -93,14 +131,19 @@ func NoteClaudeLimits(user string, ls []ClaudeLimit) {
 		return
 	}
 	key := strings.ToLower(user)
+	onDisk := keptClaudeWindows(key) // read before claudeUsage is held: lastQuotas has its own lock
 	c := &claudeUsage
 	c.Lock()
 	if c.m == nil {
 		c.m = map[string]claudeUsageEntry{}
 	}
 	e := c.m[key]
+	kept := e.ws
+	if len(kept) == 0 {
+		kept = onDisk
+	}
 	ws := []QuotaWindow{}
-	for _, w := range e.ws {
+	for _, w := range kept {
 		if !slices.ContainsFunc(heard, func(h QuotaWindow) bool { return h.Name == w.Name }) {
 			ws = append(ws, w)
 		}
@@ -139,4 +182,41 @@ func KeptClaudeLimits(user string) []ClaudeLimit {
 		}
 	}
 	return out
+}
+
+// keptClaudeWindows are the windows of Claude account key (lower case)
+// kept on disk (quotas.json) that haven't renewed since: what a cold start
+// knows of it before /usage or an answer tells it again.
+func keptClaudeWindows(key string) []QuotaWindow {
+	q, ok := lastReading("claude/" + key)
+	if !ok {
+		return nil
+	}
+	var out []QuotaWindow
+	for _, w := range q.Windows {
+		if w.ResetsAt != nil { // renewed since (elapsed) or never said: unknown now
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// ClaudeAllowanceForTest is the allowance routing weighs for limits as
+// Claude Code told them, for the gateway's tests.
+func ClaudeAllowanceForTest(ls []ClaudeLimit, now time.Time) Allowance {
+	var ws []QuotaWindow
+	for _, l := range ls {
+		for _, k := range claudeKinds {
+			if k.kind != l.Kind {
+				continue
+			}
+			w := QuotaWindow{Name: k.name, Used: l.Used * 100, Span: k.span, Model: k.model}
+			if l.ResetsAt > 0 {
+				t := time.Unix(l.ResetsAt, 0)
+				w.ResetsAt = &t
+			}
+			ws = append(ws, w)
+		}
+	}
+	return allowanceOf(ws, now)
 }

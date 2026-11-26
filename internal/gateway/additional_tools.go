@@ -49,7 +49,7 @@ func fromLite(body []byte) []byte {
 // to be one.
 func withoutLiteMetadata(body []byte) []byte {
 	const marker = "ws_request_header_x_openai_internal_codex_responses_lite"
-	if !bytes.Contains(body, []byte(marker)) {
+	if !bodyHas(body, marker) {
 		return body
 	}
 	r, found, ok := topMember(body, "client_metadata")
@@ -74,7 +74,7 @@ func withoutLiteMetadata(body []byte) []byte {
 // withoutReasoningContext is body without reasoning.context, the rest of
 // reasoning and every other member byte for byte as they were.
 func withoutReasoningContext(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`"context"`)) {
+	if !bodyHas(body, `"context"`) {
 		return body
 	}
 	r, found, ok := topMember(body, "reasoning")
@@ -106,7 +106,7 @@ func liteKept(p provider.Provider, to provider.Protocol, codex bool, model strin
 		return false
 	}
 	return p.Account != nil && p.Account.Agent == "codex" ||
-		strings.HasSuffix(p.Host(), "openai.com") ||
+		strings.HasSuffix(p.VendorHost(), "openai.com") ||
 		p.CodexAsSent && p.Account == nil && codex ||
 		p.IsRemoteMagpie() && codexModel(model)
 }
@@ -138,7 +138,7 @@ const liteNamespace = "functions"
 // 4 MB conversation, held at once by each request in flight, so a few
 // subagents at once took the app toward 2 GB (XiaoYin_OK on X).
 func liftAdditionalTools(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`"additional_tools"`)) {
+	if !bodyHas(body, `"additional_tools"`) {
 		return body
 	}
 	in, found, ok := topMember(body, "input")

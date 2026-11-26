@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +15,8 @@ import (
 	"net/url"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/lazyre"
+	"github.com/yetone/magpie/internal/provider"
 )
 
 // Cursor's CLI (cursor-agent) keeps a chat in a folder of its own under its
@@ -66,7 +67,7 @@ func cursorDataDir() string {
 	return filepath.Join(home, ".cursor")
 }
 
-var cursorSlugBad = regexp.MustCompile(`[^a-zA-Z0-9]+`)
+var cursorSlugBad = lazyre.New(`[^a-zA-Z0-9]+`)
 
 // cursorTranscripts are the transcripts Cursor writes of a chat, from its
 // store, under projects/<the cwd made a slug>/agent-transcripts/: <id>/
@@ -152,7 +153,7 @@ func cursorParentOf(f file) string {
 	}
 	cursorParents.Lock()
 	defer cursorParents.Unlock()
-	if p, ok := cursorParents.m[f.path]; ok && p.size == f.size && p.mod.Equal(f.mod) {
+	if p, ok := cursorParents.m[f.path]; ok && p.size == f.size && p.mod.Equal(f.mod.Time()) {
 		return p.of
 	}
 	of := ""
@@ -168,7 +169,7 @@ func cursorParentOf(f file) string {
 	if cursorParents.m == nil {
 		cursorParents.m = map[string]cursorParent{}
 	}
-	cursorParents.m[f.path] = cursorParent{f.size, f.mod, of}
+	cursorParents.m[f.path] = cursorParent{f.size, f.mod.Time(), of}
 	return of
 }
 
@@ -208,6 +209,30 @@ func OpenUntouched(path string) (db *sql.DB, closeDB func(), err error) {
 		return nil, nil, err
 	}
 	return db, func() { db.Close(); os.RemoveAll(tmp) }, nil
+}
+
+// openAppStore opens another app's SQLite database at path to read it:
+// read only, in place; or, in a WSL distro read through \\wsl.localhost
+// (or \\wsl$), as OpenUntouched does. SQLite can't take the locks a WAL
+// database needs over that share, so an open in place there answers
+// SQLITE_BUSY, every time, after its busy_timeout (the Antigravity app
+// connected to WSL, @guyng35955 on X; tried on Windows 11). done closes it.
+func openAppStore(path string) (db *sql.DB, done func(), err error) {
+	if onWSLShare(path) {
+		return OpenUntouched(path)
+	}
+	db, err = provider.OpenReadOnly(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return db, func() { db.Close() }, nil
+}
+
+// onWSLShare is whether path is in a WSL distro, read through Windows'
+// share of it.
+func onWSLShare(path string) bool {
+	p := strings.ToLower(strings.ReplaceAll(path, `\`, "/"))
+	return strings.HasPrefix(p, "//wsl.localhost/") || strings.HasPrefix(p, "//wsl$/")
 }
 
 // openSQLite opens the SQLite database at p, with query as its URI's.
@@ -390,9 +415,9 @@ func cursorStarted(db *sql.DB, root string) time.Time {
 }
 
 var (
-	cursorQuery = regexp.MustCompile(`(?s)<user_query>(.*?)</user_query>`)
+	cursorQuery = lazyre.New(`(?s)<user_query>(.*?)</user_query>`)
 	// the context Cursor puts in a user message beside what was typed
-	cursorContext = regexp.MustCompile(`(?s)<(user_info|project_layout|rules|always_applied_workspace_rules|agent_requestable_workspace_rules|user_rules|agent_skills|available_skills|open_and_recently_viewed_files|system_reminder|system-reminder|instructions_update|mcp_instructions|mcp_file_system|mcp_file_system_servers|git_status|agent_transcripts|cursor_rules_context|attached_files|system_notification|task_notification|agent_notification)(?:\s[^>]*)?>.*?</(user_info|project_layout|rules|always_applied_workspace_rules|agent_requestable_workspace_rules|user_rules|agent_skills|available_skills|open_and_recently_viewed_files|system_reminder|system-reminder|instructions_update|mcp_instructions|mcp_file_system|mcp_file_system_servers|git_status|agent_transcripts|cursor_rules_context|attached_files|system_notification|task_notification|agent_notification)>`)
+	cursorContext = lazyre.New(`(?s)<(user_info|project_layout|rules|always_applied_workspace_rules|agent_requestable_workspace_rules|user_rules|agent_skills|available_skills|open_and_recently_viewed_files|system_reminder|system-reminder|instructions_update|mcp_instructions|mcp_file_system|mcp_file_system_servers|git_status|agent_transcripts|cursor_rules_context|attached_files|system_notification|task_notification|agent_notification)(?:\s[^>]*)?>.*?</(user_info|project_layout|rules|always_applied_workspace_rules|agent_requestable_workspace_rules|user_rules|agent_skills|available_skills|open_and_recently_viewed_files|system_reminder|system-reminder|instructions_update|mcp_instructions|mcp_file_system|mcp_file_system_servers|git_status|agent_transcripts|cursor_rules_context|attached_files|system_notification|task_notification|agent_notification)>`)
 )
 
 // cursorParts are a message's content as parts: words are one text part.
@@ -441,31 +466,31 @@ func parseCursor(f file) *state {
 	if m, ok := readCursorMetaFile(dir); ok {
 		s.Cwd = m.Cwd
 		if f.main {
-			s.Named = cursorTitle(m.Title)
+			s.own().Named = cursorTitle(m.Title)
 		}
 		s.saw(ms(m.Created), f.main)
 		if u := ms(m.Updated); !u.IsZero() {
-			last = u
+			last = modOf(u)
 		}
 	}
 	db, done, err := openCursorStore(f.path)
 	if err != nil {
-		s.saw(last, f.main)
+		s.saw(last.Time(), f.main)
 		return s
 	}
 	defer done()
 	meta, ok := readCursorMeta(db)
 	if !ok {
-		s.saw(last, f.main)
+		s.saw(last.Time(), f.main)
 		return s
 	}
 	s.ID = filepath.Base(dir)
-	if s.Named == "" && f.main {
-		s.Named = cursorTitle(meta.Name)
+	if s.more().Named == "" && f.main {
+		s.own().Named = cursorTitle(meta.Name)
 	}
 	s.saw(ms(meta.CreatedAt), f.main)
 	s.saw(cursorStarted(db, meta.Root), f.main)
-	s.saw(last, f.main)
+	s.saw(last.Time(), f.main)
 	// the messages carry no time of their own: they count on the day the
 	// chat was last at work
 	date := dateOf(s.Last)
@@ -475,8 +500,8 @@ func parseCursor(f file) *state {
 		case "user":
 			typed, other := cursorTyped(parts)
 			if typed == "" {
-				if f.main && s.Title == "" && s.First == "" && other != "" {
-					s.First = untagged(other)
+				if f.main && s.Title == "" && s.more().First == "" && other != "" {
+					s.own().First = untagged(other)
 				}
 				continue
 			}

@@ -58,7 +58,7 @@ func DetectBase(base string, proto Protocol) string {
 		if pu, err := url.Parse(u); err == nil && pu.Host != "" && strings.Trim(pu.Path, "/") == "v1" {
 			return u + "beta"
 		}
-		return GeminiBase(u)
+		return geminiVersioned(u)
 	}
 	if pu, err := url.Parse(u); err == nil && strings.Trim(pu.Path, "/") == "" {
 		return u + "/v1"
@@ -116,6 +116,13 @@ func (p Provider) Detect(ctx context.Context, base, model string, picked ...stri
 		}()
 	}
 	wg.Wait()
+	for i := range out {
+		if out[i].V1 != "" {
+			// answered under the /v1 the URL was typed without: the
+			// base the editor keeps for it is that one
+			out[i].Base = out[i].V1
+		}
+	}
 	return out, nil
 }
 
@@ -165,14 +172,30 @@ func (q Provider) detectOne(proto Protocol, m string, wait time.Duration) (Detec
 		d.Error = "no model to try: type one the vendor serves"
 		return d, nil
 	}
-	k, ok := q.keyFor(proto)
+	// the key a request for m goes to (keySeeing, #4992): a relay whose
+	// keys are each kept for some models is asked m with one that serves it
+	k, ok := q.keySeeing(proto, m)
 	if !ok {
 		d.Error = "no key is on for this endpoint"
+		if _, any := q.keyFor(proto); any {
+			d.Error = "no key that's on for this endpoint serves this model"
+		}
 		return d, nil
+	}
+	if proto != Chat {
+		// served by OpenAI's base alone, at /embeddings or /rerank
+		switch retrievalOf(m) {
+		case catalog.ServesEmbedding:
+			d.Error = "an embedding model: asked at OpenAI's URL, on /embeddings"
+			return d, nil
+		case catalog.ServesRerank:
+			d.Error = "a rerank model: asked at OpenAI's URL, on /rerank"
+			return d, nil
+		}
 	}
 	return d, func(ctx context.Context) Result {
 		u, body := tiny(k, proto, UpstreamName(q, m))
-		ctx, b := k.tested(ctx, body)
+		ctx, b := k.tested(ctx, u, body)
 		return probe(ctx, k, proto, u, b, m, wait)
 	}
 }
@@ -182,9 +205,7 @@ func (q Provider) detectOne(proto Protocol, m string, wait time.Duration) (Detec
 // the one p is asked with when none is given, and says how it answered.
 func (p Provider) DetectDecide(ctx context.Context, model string) Detection {
 	p.Decide = strings.TrimSuffix(strings.TrimRight(strings.TrimSpace(p.Decide), "/"), "/systemone")
-	if p.Decide != "" && !strings.Contains(p.Decide, "://") {
-		p.Decide = "https://" + p.Decide
-	}
+	p.Decide = WithScheme(p.Decide, "https")
 	if model = strings.TrimSpace(model); model == "" {
 		model = p.Jev()
 	}
@@ -322,7 +343,8 @@ func (p Provider) detectModels(ctx context.Context) []string {
 
 // detectModel is the model of ids to ask proto for: one made for it — a
 // Claude model on Anthropic's, an OpenAI one on Responses, a Gemini one on
-// Gemini's, any other on Chat — else the first that chats.
+// Gemini's, any other on Chat — else the first that chats, else, on Chat,
+// an embedding or rerank model.
 func detectModel(ids []string, proto Protocol) string {
 	made := func(id string) bool {
 		switch proto {
@@ -335,9 +357,15 @@ func detectModel(ids []string, proto Protocol) string {
 		}
 		return !isClaude(id)
 	}
-	for _, want := range []func(string) bool{made, func(string) bool { return true }} {
+	chats := func(id string) bool { return !catalog.ImagesAPI(id) && retrievalOf(id) == "" }
+	for _, want := range []func(string) bool{
+		func(id string) bool { return made(id) && chats(id) }, chats,
+		// none chats: an embedding or rerank model, which OpenAI's base
+		// is asked for at /embeddings or /rerank (tiny)
+		func(id string) bool { return proto == Chat && retrievalOf(id) != "" },
+	} {
 		for _, id := range ids {
-			if want(id) && !catalog.ImagesAPI(id) {
+			if want(id) {
 				return id
 			}
 		}

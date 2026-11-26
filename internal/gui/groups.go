@@ -7,10 +7,13 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/middleware"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -58,6 +61,48 @@ type groupsJSON struct {
 	// to (Group.Accounts), as a gateway key's list has them (#905): each
 	// provider with more than one, or one a group names already
 	Accounts map[string][]keyModelJSON `json:"accounts"`
+	// GatewayKeys: the gateway keys a group may be bound to (Group.Keys),
+	// each a key of the user's that may ask for models: one issued under
+	// another follows its issuer, and a read-only or browser key asks for
+	// none
+	GatewayKeys []groupKeyJSON `json:"gatewayKeys"`
+	// Defaults: what every group follows when it sets no value of its own
+	// (settings.GroupSink, GroupFirstToken, GroupPatience)
+	Defaults groupDefaultsJSON `json:"defaults"`
+	// JSRoutings: the routings JS gateway plugins serve now, as in the
+	// state, read again each time the page is shown: one installed since
+	// the state was read is offered at once (guhailin3 on X)
+	JSRoutings []middleware.Routing `json:"jsRoutings"`
+}
+
+type groupKeyJSON struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Masked string `json:"masked,omitempty"`
+	Off    bool   `json:"off,omitempty"`
+}
+
+// groupKeys is groupsJSON's GatewayKeys: nil (null) when the keys can't
+// be read, so the page doesn't take a bound key for one deleted.
+func groupKeys() []groupKeyJSON {
+	keys, err := access.List()
+	if err != nil {
+		return nil
+	}
+	out := []groupKeyJSON{}
+	for _, k := range keys {
+		if k.Issuer != "" || k.Browser || k.ReadOnly {
+			continue
+		}
+		out = append(out, groupKeyJSON{ID: k.ID, Name: k.Name, Masked: k.Masked, Off: k.Off})
+	}
+	return out
+}
+
+type groupDefaultsJSON struct {
+	Sink       bool `json:"sink"`
+	FirstToken int  `json:"firstToken"`
+	Patience   int  `json:"patience"`
 }
 
 type skippableJSON struct {
@@ -118,10 +163,21 @@ type memberJSON struct {
 	// Effort that effort ("provider/model:low"); "" for one without
 	Of     string `json:"of,omitempty"`
 	Effort string `json:"effort,omitempty"`
+	// Account is the one account or key the member is sent on,
+	// "<provider>/<id>" as Accounts has them ("provider/model#<id>",
+	// EastonXvii on X); "" for every one the group allows
+	Account string `json:"account,omitempty"`
+	// Billing is how its provider bills: plan, payg or mixed, "" when
+	// unknown (provider.BillingKind; EV_John_Liu on X)
+	Billing string `json:"billing,omitempty"`
 	// Fast: the group sends it in its vendor's fast mode; CanFast: its
 	// model has one (provider.CanFast)
 	Fast    bool `json:"fast,omitempty"`
 	CanFast bool `json:"canFast,omitempty"`
+	// Ultra: it is sent in the faster mode still; UltraOK: an account
+	// offers one (provider.UltraOn, kdajenks on X)
+	Ultra   bool `json:"ultra,omitempty"`
+	UltraOK bool `json:"ultraOK,omitempty"`
 	// OwnFast: that fast mode is asked of a provider the user added by its
 	// address, which may or may not serve it (provider.OwnFast, #1615)
 	OwnFast bool `json:"ownFast,omitempty"`
@@ -159,6 +215,9 @@ type modelRef struct {
 	// CanFast: a group's member of it may be sent in its vendor's fast
 	// mode (provider.CanFast)
 	CanFast bool `json:"canFast,omitempty"`
+	// UltraOK: an account serves it Ultrafast (provider.UltraOn), so a
+	// member of it may be sent so
+	UltraOK bool `json:"ultraOK,omitempty"`
 	// OwnFast: asked of a provider the user added by its address, which may
 	// or may not serve it (provider.OwnFast, #1615)
 	OwnFast bool `json:"ownFast,omitempty"`
@@ -185,7 +244,7 @@ type modelRef struct {
 
 // servedRef is a served model as the Routing page lists it
 func servedRef(e provider.Entry, s settings.Settings) modelRef {
-	return modelRef{Free: e.Free, Zero: !e.Free && e.Provider.PricedFree(s, e.Model), ID: e.ID, Name: e.Name, Provider: e.Provider.ID, PName: e.Provider.Name, Icon: e.Provider.Icon, Context: e.Context, Efforts: e.Efforts, CanFast: provider.CanFast(e.Provider, e.Model), OwnFast: provider.OwnFast(e.Provider, e.Model), Images: seesImages(e), ImagesUnknown: imagesUnknown(e), Sub: e.Provider.Account != nil}
+	return modelRef{Free: e.Free, Zero: !e.Free && e.Provider.PricedFree(s, e.Model), ID: e.ID, Name: e.Name, Provider: e.Provider.ID, PName: e.Provider.Name, Icon: e.Provider.Icon, Context: e.Context, Efforts: e.Efforts, CanFast: provider.CanFast(*e.Provider, e.Model), OwnFast: provider.OwnFast(*e.Provider, e.Model), Images: seesImages(e), ImagesUnknown: imagesUnknown(e), Sub: e.Provider.Account != nil}
 }
 
 type poolJSON struct {
@@ -275,6 +334,14 @@ func groupAccounts(gs []provider.Group) map[string][]keyModelJSON {
 				named[strings.ToLower(pid)] = true
 			}
 		}
+		for _, m := range g.Members {
+			// a member on an account of its own (EastonXvii on X)
+			if _, acct := provider.MemberAccount(m); acct != "" {
+				if pid, _, ok := strings.Cut(m, "/"); ok {
+					named[strings.ToLower(pid)] = true
+				}
+			}
+		}
 	}
 	out := map[string][]keyModelJSON{}
 	for _, p := range provider.All() {
@@ -294,6 +361,9 @@ func groupsState() groupsJSON {
 	_, offset := time.Now().Zone()
 	out := groupsJSON{Groups: []groupJSON{}, Models: []modelRef{}, Pools: []poolJSON{}, Deciders: []modelRef{}, Drawers: []modelRef{}, Found: provider.AutoGroupsOn(), Templates: provider.Templates(),
 		Clock: clockJSON{Zone: provider.LocalZone(), Offset: offset}}
+	out.JSRoutings = middleware.Routings()
+	def := settings.Load()
+	out.Defaults = groupDefaultsJSON{Sink: def.GroupSink, FirstToken: def.GroupFirstToken, Patience: def.GroupPatience}
 	for i := range out.Templates {
 		if out.Templates[i].Group.Members == nil {
 			out.Templates[i].Group.Members = []string{} // one that can't be made has none
@@ -307,22 +377,28 @@ func groupsState() groupsJSON {
 		for _, m := range g.Members {
 			named[m] = true
 		}
-		named[g.Classifier] = true
+		for _, c := range g.Classifiers() {
+			named[c] = true
+		}
 	}
 	for _, e := range provider.OfferedDeciders(func(id string) bool { return named[id] }) {
 		out.Deciders = append(out.Deciders, modelRef{ID: e.ID, Name: e.Name, Provider: e.Provider.ID, PName: e.Provider.Name, Icon: e.Provider.Icon, Sub: e.Provider.Account != nil})
 	}
 	out.Accounts = groupAccounts(all)
+	out.GatewayKeys = groupKeys()
 	served := provider.Served()
 	chat := map[string]bool{}
 	set := settings.Shared() // the prices the user set, for each model's free tag
+	ultra := sync.OnceValue(provider.UltraModels)
 	for _, e := range served {
 		if e.Group == "" {
 			chat[e.ID] = true
-			out.Models = append(out.Models, servedRef(e, set))
+			ref := servedRef(e, set)
+			ref.UltraOK = ref.CanFast && provider.UltraOn(*e.Provider, e.Model, ultra())
+			out.Models = append(out.Models, ref)
 		}
 	}
-	// the image models, as Settings › Images lists them: each provider's
+	// the image models, as Settings › Models › Images lists them: each provider's
 	// Drawers less those unticked in its editor, but one a group names
 	// already, so its card still reads it. draws: every one, an unticked
 	// one included, which draws all the same
@@ -355,7 +431,7 @@ func groupsState() groupsJSON {
 		gj.Decides = g.Decides()
 		gj.Ref = g.Ref()
 		if g.Classifier != "" {
-			if why, at, ok := classifierFailure(g.ID, g.Classifier); ok {
+			if why, at, ok := classifierFailure(g.ID, gateway.ClassifiersKey(g.Classifiers())); ok {
 				gj.ClassifierFailed = &classifierFailedJSON{Error: why, At: at}
 			}
 		}
@@ -374,6 +450,7 @@ func groupsState() groupsJSON {
 				}
 			}
 		}
+		ultraModels := sync.OnceValue(provider.UltraModels)
 		for _, id := range g.Members {
 			m := memberJSON{ID: id}
 			if gid, ok := strings.CutPrefix(id, provider.GroupPrefix); ok {
@@ -399,13 +476,24 @@ func groupsState() groupsJSON {
 			}
 			of, effort := provider.MemberEffort(id)
 			m.Of, m.Effort = of, effort
+			if _, acct := provider.MemberAccount(id); acct != "" {
+				if pid, _, ok := strings.Cut(of, "/"); ok {
+					m.Account = pid + "/" + acct
+				}
+			}
 			if p, model, ok := provider.ResolveRoute(of); ok {
 				_, who := onOf(p)
 				m.Ready, m.Provider, m.Name, m.Icon, m.Model, m.On = true, p.ID, p.Name, p.Icon, model, max(len(who), 1)
+				if m.Account != "" {
+					m.On = 1 // its own account alone
+				}
 				m.CanFast = provider.CanFast(p, model)
 				m.OwnFast = m.CanFast && provider.OwnFast(p, model)
 				m.Fast = m.CanFast && g.IsFast(id)
+				m.UltraOK = m.CanFast && provider.UltraOn(p, model, ultraModels())
+				m.Ultra = m.Fast && m.UltraOK && g.IsUltra(id)
 				m.Free = p.FreeModel(model)
+				m.Billing = p.BillingKind()
 				for _, e := range served {
 					if e.Group == "" && e.Provider.ID == p.ID && e.Model == model {
 						m.Context, m.Images, m.ImagesUnknown = e.Context, seesImages(e), imagesUnknown(e)
@@ -535,7 +623,9 @@ func groupRoutes(mux *http.ServeMux) {
 			}
 		case "delete":
 			if len(body.IDs) > 0 {
-				err = provider.DeleteGroups(body.IDs)
+				// the last found group going turns found groups off, which
+				// moves an agent set to one to its model
+				moved, err = agent.Reseat(func() error { return provider.DeleteGroups(body.IDs) })
 			} else {
 				err = provider.DeleteGroup(in.ID)
 			}
@@ -563,6 +653,10 @@ func groupRoutes(mux *http.ServeMux) {
 			err = provider.SwitchGroup(in.ID, body.On)
 		case "arrange":
 			err = provider.SetGroupOrder(body.Order)
+		case "defaults":
+			// what every group follows when it sets no value of its own
+			// (jiezhengj on Discord: set once, not in each group)
+			err = settings.SetGroupDefaults(in.Sink, in.FirstToken, in.Patience)
 		case "pick":
 			// a Manual group's member every request goes to, and nothing
 			// else of it (#2489: the tray panel switches it)

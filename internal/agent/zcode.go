@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/gateway"
 )
@@ -132,15 +133,13 @@ func zcode(home string) *Agent {
 func zcodeProviderJSON(path string, keep bool) any {
 	was, own := zcodeDefaultLevels(path), zcodeLevelOptions(path)
 	ms := map[string]any{}
+	format := zcodeFormat(filepath.Dir(path))
 	for _, m := range sharedModels("zcode") {
 		window := m.Context
 		if window == 0 {
-			window = 200000
+			window = unknownWindow(200000)
 		}
-		in := []string{"text"}
-		if m.Images {
-			in = append(in, "image")
-		}
+		in := zcodeInputs(m, format)
 		limit := map[string]any{"context": window}
 		// without it ZCode caps every reply at 32000 tokens
 		if out := outputOr(m, zcodeOutput(maxTokens(m))); out > 0 {
@@ -155,6 +154,7 @@ func zcodeProviderJSON(path string, keep bool) any {
 		}
 		ms[m.ID] = e
 	}
+	zcodeOutputsKept(path, ms)
 	on := true
 	if v, ok := edit.GetJSON(path, "provider."+magpieID+".enabled"); ok && v == "false" {
 		on = false
@@ -163,8 +163,64 @@ func zcodeProviderJSON(path string, keep bool) any {
 	if keep {
 		base, token = zcodeKept(filepath.Dir(path))
 	}
-	return map[string]any{"name": "magpie", "kind": zcodeKinds[zcodeFormat(filepath.Dir(path))], "enabled": on, "source": "custom",
+	return map[string]any{"name": "magpie", "kind": zcodeKinds[format], "enabled": on, "source": "custom",
 		"options": map[string]any{"apiKey": token, "baseURL": base}, "models": ms}
+}
+
+// zcodeInputs are the kinds ZCode is told model m takes on format: text,
+// an image when it takes one, and a video when its source lists one and
+// format is Messages or Chat. ZCode attaches a video only to a model whose
+// rule says supportsVideo (its own built-in rules say it per model), and
+// sends it as a Messages video block or a Chat video_url, both of which the
+// gateway carries on (video_input.go); on Responses ZCode refuses a video
+// before asking. A PDF is not offered: a translated request still loses one
+// (#5452). Flandern1211 on X, #5098.
+func zcodeInputs(m catalog.Model, format string) []string {
+	in := []string{"text"}
+	if m.Images {
+		in = append(in, "image")
+	}
+	if (format == "anthropic-messages" || format == "openai-chat-completions") && slices.Contains(m.InputModalities, "video") {
+		in = append(in, "video")
+	}
+	return in
+}
+
+// zcodeOutputsKept keeps a limit.output the user typed into one of
+// magpie's models in config.json at path, in ms, the models magpie writes
+// (outputsKept).
+func zcodeOutputsKept(path string, ms map[string]any) {
+	want := map[string]int{}
+	for id, e := range ms {
+		m, _ := e.(map[string]any)
+		l, _ := m["limit"].(map[string]any)
+		if n := numberOf(l["output"]); n > 0 {
+			want[id] = n
+		}
+	}
+	if len(want) == 0 {
+		return
+	}
+	have := map[string]int{}
+	if raw, ok := edit.GetJSON(path, "provider."+magpieID+".models"); ok {
+		var cur map[string]struct {
+			Limit struct {
+				Output int `json:"output"`
+			} `json:"limit"`
+		}
+		if json.Unmarshal([]byte(raw), &cur) == nil {
+			for id, c := range cur {
+				have[id] = c.Limit.Output
+			}
+		}
+	}
+	kept := outputsKept(path, want, have)
+	for id, e := range ms {
+		m, _ := e.(map[string]any)
+		if l, _ := m["limit"].(map[string]any); l != nil && kept[id] > 0 {
+			l["output"] = kept[id]
+		}
+	}
 }
 
 // zcodeDefaultLevels is the default level each of magpie's models has in
@@ -317,6 +373,9 @@ func zcodeRuleFormat(dir string) string {
 // onAnotherMachine says base is an http(s) address whose host isn't this
 // machine's loopback.
 func onAnotherMachine(base string) bool {
+	if loopbackAuthority(base) {
+		return false
+	}
 	u, err := url.Parse(base)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
 		return false
@@ -327,6 +386,36 @@ func onAnotherMachine(base string) bool {
 	}
 	ip := net.ParseIP(h)
 	return ip == nil || !ip.IsLoopback() && !ip.IsUnspecified()
+}
+
+// loopbackAuthority is the common case of onAnotherMachine without
+// url.Parse: an http(s) base on localhost, 127.0.0.1 or [::1], no user
+// info, which a state poll asks of each agent's gateway base several
+// hundred times. Anything else is left to url.Parse.
+func loopbackAuthority(base string) bool {
+	rest, ok := strings.CutPrefix(base, "http://")
+	if !ok {
+		if rest, ok = strings.CutPrefix(base, "https://"); !ok {
+			return false
+		}
+	}
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	host := rest
+	if i := strings.LastIndexByte(rest, ':'); i >= 0 && !strings.HasSuffix(rest, "]") {
+		host = rest[:i]
+		for _, c := range rest[i+1:] {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	switch host {
+	case "localhost", "127.0.0.1", "[::1]":
+		return true
+	}
+	return false
 }
 
 // zcodeMaxOutput caps a model's output limit: some vendors report their
@@ -411,6 +500,74 @@ func zcodeDefaultLevel(levels []string) string {
 		return levels[0]
 	}
 	return on[len(on)/2]
+}
+
+// zcodePart is what ZCode reads of magpie's provider when it starts: the
+// provider in config.json and magpie's rules in provider_config.json, not
+// the key (AppBehind).
+func zcodePart(path, rules string) string {
+	var b strings.Builder
+	if raw, ok := edit.GetJSONRaw(path, "provider."+magpieID); ok {
+		var prov map[string]any
+		if json.Unmarshal([]byte(raw), &prov) == nil {
+			if opts, _ := prov["options"].(map[string]any); opts != nil {
+				delete(opts, "apiKey")
+			}
+			if v, err := json.Marshal(prov); err == nil {
+				b.Write(v)
+			}
+		}
+	}
+	b.WriteByte('\n')
+	b.WriteString(zcodeRulesPart(rules))
+	return b.String()
+}
+
+// zcodeRulesPart is magpie's provider rule and model rules in
+// provider_config.json at path, as ZCode reads them at start. A rule of
+// another provider is left out, so ZCode's own writes to one are no change
+// of magpie's.
+func zcodeRulesPart(path string) string {
+	var c struct {
+		Config struct {
+			ProviderConfigRules struct {
+				ProviderRules []json.RawMessage `json:"providerRules"`
+			} `json:"providerConfigRules"`
+			ModelConfigRules struct {
+				ProviderModelRules       []json.RawMessage `json:"providerModelRules"`
+				ManualProviderModelRules []json.RawMessage `json:"manualProviderModelRules"`
+			} `json:"modelConfigRules"`
+		} `json:"config"`
+	}
+	b, _ := os.ReadFile(path)
+	if json.Unmarshal(b, &c) != nil {
+		return ""
+	}
+	var out strings.Builder
+	for _, rs := range [][]json.RawMessage{
+		c.Config.ProviderConfigRules.ProviderRules,
+		c.Config.ModelConfigRules.ProviderModelRules,
+		c.Config.ModelConfigRules.ManualProviderModelRules,
+	} {
+		for _, r := range rs {
+			var m map[string]any
+			if json.Unmarshal(r, &m) != nil || m["providerId"] != magpieID {
+				continue
+			}
+			// the key is not what ZCode's picker reads, and a rotation of
+			// it is no change of the list
+			if cfg, _ := m["config"].(map[string]any); cfg != nil {
+				if access, _ := cfg["access"].(map[string]any); access != nil {
+					delete(access, "apiKey")
+				}
+			}
+			if v, err := json.Marshal(m); err == nil {
+				out.Write(v)
+				out.WriteByte('\n')
+			}
+		}
+	}
+	return out.String()
 }
 
 // zcodeRuled reports whether provider_config.json has magpie's provider.
@@ -500,6 +657,21 @@ func zcodeRules(path string, on, keep bool) error {
 		format := zcodeFormat(filepath.Dir(path))
 		searched, known := zcodeSearched()
 		var ids []string
+		// a maxOutputTokens typed into a model's rule in ZCode's settings
+		// stays; magpie's is put where the user set none (outputsKept)
+		wantOut, haveOut := map[string]int{}, map[string]int{}
+		for _, m := range sharedModels("zcode") {
+			if n := outputOr(m, zcodeOutput(maxTokens(m))); n > 0 && !byHand[m.ID] {
+				wantOut[m.ID] = n
+			}
+			if r := ours[m.ID]; r != nil {
+				c, _ := r["config"].(map[string]any)
+				s, _ := c["optionSpecs"].(map[string]any)
+				o, _ := s["maxOutputTokens"].(map[string]any)
+				haveOut[m.ID] = numberOf(o["max"])
+			}
+		}
+		keptOut := outputsKept(path, wantOut, haveOut)
 		for _, m := range sharedModels("zcode") {
 			ids = append(ids, m.ID)
 			if byHand[m.ID] {
@@ -508,7 +680,11 @@ func zcodeRules(path string, on, keep bool) error {
 				delete(searched, m.ID)
 				continue
 			}
-			props := map[string]any{"inputFormat": map[string]any{"supportsImage": m.Images}}
+			inputFormat := map[string]any{"supportsImage": m.Images}
+			if slices.Contains(zcodeInputs(m, format), "video") {
+				inputFormat["supportsVideo"] = true
+			}
+			props := map[string]any{"inputFormat": inputFormat}
 			if m.Context > 0 {
 				props["contextWindow"] = m.Context
 			}
@@ -519,7 +695,7 @@ func zcodeRules(path string, on, keep bool) error {
 			// ZCode's own rules give a model it doesn't know 32000 tokens
 			// out and thinking only on or off
 			specs := map[string]any{}
-			if out := outputOr(m, zcodeOutput(maxTokens(m))); out > 0 {
+			if out := keptOut[m.ID]; out > 0 {
 				specs["maxOutputTokens"] = map[string]any{"max": out}
 			}
 			if levels := zcodeLevels(m.Efforts); levels != nil {

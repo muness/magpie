@@ -103,6 +103,9 @@ const (
 func (n *notifier) send(title, body string) { n.sendAs("magpie-alert-", title, body) }
 
 func (n *notifier) sendAs(kind, title, body string) {
+	// every alert goes to Bark too, when it is set, whether or not the
+	// system lets this computer notify (EV_John_Liu on X)
+	barkPush(title, body)
 	if !n.allowed() {
 		return
 	}
@@ -140,7 +143,7 @@ func notice(goos, id, title, body string) notifications.NotificationOptions {
 
 // clickView is the page a response to a notification opens, "" for none.
 // A click on an alert opens Usage; on a value masked, the 脱敏 page at the
-// request that masked it. On a turn's end, where the user goes is their
+// request that masked it; on a sign-in alert, its provider's accounts. On a turn's end, where the user goes is their
 // agent, not magpie. On Linux only a click (linuxClick) is one: an alert
 // dismissed there opened the main window, maximised if it was left so,
 // over the desktop with the focus (#2513).
@@ -154,6 +157,9 @@ func clickView(goos string, r notifications.NotificationResponse) string {
 			return "masking"
 		}
 		return "masking&key=" + key
+	}
+	if rest, ok := strings.CutPrefix(r.ID, signInNotice); ok {
+		return signInView(rest)
 	}
 	return "usage"
 }
@@ -180,16 +186,24 @@ func (h *host) watchAlerts() {
 			go n.allowed()
 		}
 		// a value masked for the first time (Must2333 on X)
-		masks := newMaskAlerts(func() bool { return settings.Load().MaskAlert }, func(m maskNote) {
-			title, body := maskAlertText(trayLang(settings.Load().Lang, systemLang), m, agentName)
+		masks := newMaskAlerts(func() bool { return settings.Shared().MaskAlert }, func(m maskNote) {
+			title, body := maskAlertText(trayLang(settings.Shared().Lang, systemLang), m, agentName)
 			n.sendAs(fmt.Sprintf("%s%d-", maskNotice, m.Key), title, body)
 		})
 		gateway.OnMasked = masks.add
 		// an agent's turn done, past the length set (itieniu on X)
 		gateway.TurnDone = func(t gateway.TurnEnd) {
-			title, body := turnDoneText(trayLang(settings.Load().Lang, systemLang), agentName(t.Agent), t)
+			title, body := turnDoneText(trayLang(settings.Shared().Lang, systemLang), agentName(t.Agent), t)
 			n.sendAs(turnNotice, title, body)
 		}
+		// an account in use signed out, or a Claude sign-in about to end
+		// (steven_4422 on Discord): always on, as the account's Sign in
+		// again is
+		go watchBarkDaily(backendCtx)
+		go provider.WatchSignIns(backendCtx, func(a provider.SignInAlert) {
+			title, body := signInText(trayLang(settings.Shared().Lang, systemLang), a, time.Now())
+			n.sendAs(signInKind(a.Provider), title, body)
+		})
 		// until this one has handed the gateway to the new version,
 		// which alerts from then on (#4938)
 		provider.WatchQuotas(backendCtx, wake, func(a provider.QuotaAlert) {

@@ -7,8 +7,10 @@ package gateway
 // meanwhile.
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -16,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -72,6 +75,13 @@ type RuleHit struct {
 	Small   []string `json:"small,omitempty"`
 	// Bare: the group has no rules, only its effort picked
 	Bare bool `json:"bare,omitempty"`
+	// Ended: the rule (from 1) that sent the conversation's last turn to
+	// its member held by hours that are over now (MinglunZhu on X: a
+	// cheaper provider at night, the usual one by day). No rule puts a
+	// member first this turn, and the vendor's cache of the night's member
+	// doesn't keep the conversation there (affine's "hours"): it goes
+	// where the group routes it, as a new conversation would
+	Ended int `json:"ended,omitempty"`
 	// UseEffort: the reasoning the rule asks the member it names for
 	// (provider.Rule.UseEffort, #2633), in place of the agent's
 	UseEffort string `json:"useEffort,omitempty"`
@@ -82,9 +92,13 @@ type RuleHit struct {
 
 // Classified is what the classifier was asked as a turn began, and said.
 type Classified struct {
-	By      string   `json:"by"`               // the classifier model
-	Intents []string `json:"intents"`          // what it chose among
-	Intent  string   `json:"intent,omitempty"` // what it said the message is; "" for none
+	By string `json:"by"` // the classifier model: the one that answered, or the last asked
+	// Tried: the group's classifiers asked before By that couldn't say,
+	// in order, each with why (Group.Classifiers): the next is asked when
+	// one fails (qinzhidaoa on X)
+	Tried   []ClassifierTry `json:"tried,omitempty"`
+	Intents []string        `json:"intents"`          // what it chose among
+	Intent  string          `json:"intent,omitempty"` // what it said the message is; "" for none
 	// Said: the answer as it said it — the number a chat model answered
 	// with (0 for none), or the choice a decision model named, its own
 	// "none of these" included — kept when no intent came of it, so
@@ -97,6 +111,10 @@ type Classified struct {
 	Cached bool    `json:"cached,omitempty"` // said before, for the same message
 	Ms     int     `json:"ms,omitempty"`     // how long asking it took
 	Error  string  `json:"error,omitempty"`  // why it couldn't say: no intent matches then, unless Fallback
+	// EffortError: why it couldn't say how hard the turn is, asked apart
+	// from its intent, which still holds: the turn reasons as the agent
+	// asked
+	EffortError string `json:"effortError,omitempty"`
 	// Above: the reasoning a group above this one picked for the turn, so
 	// this one's classifier wasn't asked for it (#4358): the turn reasons
 	// at that, not as the agent asked
@@ -107,6 +125,21 @@ type Classified struct {
 
 	// AfterEffort: the reasoning picked for the turn before, which it was told
 	AfterEffort string `json:"afterEffort,omitempty"`
+}
+
+// ClassifierTry is a classifier asked that couldn't say, and why.
+type ClassifierTry struct {
+	By    string `json:"by"`
+	Error string `json:"error"`
+}
+
+// failsOver reports whether err, a classifier's, has the group ask its
+// next one: it is down, refused, rested or out of time. Not an answer
+// that wasn't a number (answerError): it is up, and its next answer is
+// as likely to be one, so a second paid ask buys nothing; and not an
+// intent said with its effort lost (effortFailed), which holds.
+func failsOver(err error) bool {
+	return err != nil && !errors.As(err, new(answerError)) && !errors.As(err, new(effortFailed))
 }
 
 type turnRule struct {
@@ -139,7 +172,7 @@ var turnRules = struct {
 // ruleKey is the conversation a group's rules keep a turn's decision for:
 // the agent's session and the conversation's first words (firstWords).
 func ruleKey(g provider.Group, in http.Header, req *Request) string {
-	return provider.GroupPrefix + g.ID + "|" + conversationID(in, nil) + "|" + firstWords(req)
+	return provider.GroupPrefix + g.ID + "|" + affinityID(in, nil) + "|" + firstWords(req)
 }
 
 // firstWords tells an agent's subagents from it: they share its session
@@ -195,7 +228,16 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 	turn, within := turnIn(req)
 	now := ruleClock()
 	size := estimate(req)
-	q := provider.RuleRequest{Tokens: size, Thinking: req.Thinking, Effort: req.Effort, Agent: agent, At: now}
+	q := provider.RuleRequest{Tokens: size, Thinking: req.Thinking, Effort: req.Effort, Off: req.ThinkOff, Agent: agent, At: now, Subagent: req.subagent}
+	if provider.RulesRead(g.Rules, "message") {
+		_, q.Message = lastSaid(req, len(req.Messages)) // the user's own words, as the turn began
+	}
+	if provider.RulesRead(g.Rules, "system") {
+		q.System = req.systemTexts()
+	}
+	if provider.RulesRead(g.Rules, "last") {
+		q.Last = lastUserTexts(req)
+	}
 	for _, m := range req.Messages {
 		if slices.ContainsFunc(m.Parts, func(p Part) bool { return p.Kind == Image }) {
 			q.Images = true
@@ -317,7 +359,7 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 		if had && slices.Contains(intents, tr.intent) {
 			c.After = tr.intent // a message that only carries on is of its kind
 		}
-		prev := before{Intent: c.After}
+		prev := before{Intent: c.After, Prompt: g.ClassifyPrompt} // the group's own instructions, when it has them
 		if had && effort {
 			prev.Effort = tr.effort // and needs the reasoning it had
 			c.AfterEffort = tr.effort
@@ -327,7 +369,7 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 		// its own (@HirotaNagai on X): from the same parsed, masked request
 		prev.User, prev.Reply = turnBefore(req)
 		switch {
-		case g.Classifier == "":
+		case len(g.Classifiers()) == 0:
 			c.Error = "the group has no classifier"
 		case ask == nil:
 			c.Error = "nothing to ask the classifier with: this is a classifier's own call, or Claude Desktop's connection check"
@@ -335,8 +377,24 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 			c.Error = "the message has no words to classify"
 		default:
 			t0 := time.Now()
-			v, cached, err := classify(ask, g.Classifier, intents, prev, effort, text)
-			classifiedFor(g.ID, g.Classifier, err)
+			// each in turn until one says (failsOver)
+			list := g.Classifiers()
+			var v verdict
+			var cached bool
+			var err error
+			for i, cl := range list {
+				if i > 0 {
+					c.Tried = append(c.Tried, ClassifierTry{By: c.By, Error: err.Error()})
+				}
+				prev.Then = len(list) - 1 - i
+				c.By = cl
+				if v, cached, err = classify(ask, classifierHeld(g, ms, cl), cl, intents, prev, effort, text); !failsOver(err) {
+					break
+				}
+			}
+			prev.Then = 0
+			classifiedFor(g.ID, list, err)
+			v.Intent = intentOf(v, g) // the group's own sure of an intent (#5101)
 			c.Intent, c.Said, c.Cached, c.Ms = v.Intent, v.Said, cached, int(time.Since(t0).Milliseconds())
 			if effort {
 				c.Effort, c.Score = v.Effort, v.Score
@@ -344,7 +402,9 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 			if len(intents) > 0 {
 				c.Sure = v.Sure
 			}
-			if err != nil {
+			if errors.As(err, new(effortFailed)) {
+				c.EffortError = err.Error()
+			} else if err != nil {
 				c.Error = err.Error()
 				if c.After != "" {
 					// timed out, failed or resting: the intent the turn
@@ -363,6 +423,11 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 	}
 	if i := provider.MatchRule(g.Rules, q); i >= 0 {
 		hit.N, hit.Use, hit.More, hit.When = i+1, g.Rules[i].Use, g.Rules[i].More, g.Rules[i].Conditions()
+	}
+	if had && hit.Use == "" && tr.use != "" && tr.n >= 1 && tr.n <= len(g.Rules) {
+		if r := g.Rules[tr.n-1]; r.Use == tr.use && r.Time != nil && !r.Time.Holds(now) {
+			hit.Ended = tr.n
+		}
 	}
 	turnRules.Lock()
 	defer turnRules.Unlock()
@@ -837,7 +902,7 @@ func ruleEffort(c candidate, hit *RuleHit, nested []NestedRule, ms []provider.Me
 func homeCands(cs []candidate, ms []provider.Member) {
 	for i := range cs {
 		if j := slices.IndexFunc(ms, func(m provider.Member) bool { return ofMember(cs[i], m) }); j >= 0 {
-			cs[i].fast, cs[i].firstToken = ms[j].Fast, innerFirstToken(ms[j])
+			cs[i].fast, cs[i].ultra, cs[i].firstToken = ms[j].Fast, ms[j].Ultra, innerFirstToken(ms[j])
 		}
 	}
 }
@@ -926,4 +991,37 @@ func pausedError(asked string, paused []provider.Paused) string {
 		bits = append(bits, fmt.Sprintf("%s (%s: %s)", p.Member, by, strings.Join(p.When, " · ")))
 	}
 	return fmt.Sprintf("every model of %s is paused now by its rules: %s; change the rules on Magpie's Routing page, or ask again when they end", asked, strings.Join(bits, ", "))
+}
+
+// classifierHeld is the accounts g holds its classifier's calls to: its
+// own (Group.Accounts), and, when the classifier is one of its members
+// that names its account (Member.Account), that account — every one of
+// them, when the model is a member once for each of several. The
+// classifier's questions are the group's spend as much as its turns are
+// (AWilsonPeng on X: GPT-6 Luna held to one of two ChatGPT accounts, its
+// classifier its own member GPT-6-Luna · Codex, which asked on both). A
+// group, as the classifier, holds itself to its own when it is asked.
+//
+// cl is the classifier asked, one of the group's (Group.Classifiers).
+func classifierHeld(g provider.Group, ms []provider.Member, cl string) access.Identity {
+	name := cmp.Or(g.Name, g.ID)
+	who := access.Identity{}.HeldToGroup(name, g.Accounts)
+	if provider.IsGroupRef(cl) {
+		return who
+	}
+	p, model, ok := provider.Resolve(cl)
+	if !ok {
+		return who
+	}
+	var pinned []string
+	for _, m := range ms {
+		if m.Provider.ID != p.ID || m.Model != model {
+			continue
+		}
+		if m.Account == "" {
+			return who // on any account the group allows
+		}
+		pinned = append(pinned, m.Account)
+	}
+	return who.HeldToGroup(name, pinned)
 }

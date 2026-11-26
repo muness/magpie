@@ -75,15 +75,56 @@ function renderGatewayView() {
   page.removeAttribute("aria-busy");
   renderGateway();
   renderGatewayLan();
-  $("#gatewayKeysBlock").hidden = !providers.gateway.lan;
-  // not shared, the keys are left out; this line says where they come from,
-  // as a tunnel to loopback is refused until sharing is on (DD on Discord)
-  $("#gatewayKeysOff").hidden = !!providers.gateway.lan;
-  if (!providers.gateway.lan) gatewayKeyDraft = null;
+  renderGatewayOwn();
+  const shown = gwKeysShown();
+  $("#gatewayKeysBlock").hidden = !shown;
+  // with no use for them, the keys are left out; this line says where
+  // they come from, as a tunnel to loopback is refused until sharing is
+  // on (DD on Discord)
+  $("#gatewayKeysOff").hidden = shown;
+  if (!shown) gatewayKeyDraft = null;
   if (gatewayKeyDraft === null && gatewayLimit === null && !$("#gatewayKeys .rename-in")) renderGatewayKeys();
   renderConnect();
   renderGatewayModels();
   renderActivity();
+}
+
+// Gateway keys are wanted while shared, and by a web page listed in
+// Settings, which is refused without one, shared or not: such a page's
+// user was sent here for a key and found none
+function gwKeysShown() {
+  return !!(providers?.gateway.lan || prefs?.corsOrigins?.length);
+}
+
+// The page's own settings, under the calls they are about (Recent calls at
+// a time, drawn from the plugin's schema), and where the gateway's port,
+// allow list and model ids are set: the switch, settings and page of one
+// feature lead to each other (netube99 on X)
+function renderGatewayOwn() {
+  const box = $("#gwOwn");
+  if (!box) return; // the page isn't drawn (yet, or any more)
+  const f = prefs?.builtins?.find((x) => x.id === "gateway");
+  // a section of its own, not a second card against the calls' (the
+  // owner, 11-09)
+  $("#gwOwnHead").hidden = !f;
+  if (!f) {
+    box.replaceChildren();
+    if (!prefs) loadSettings().then(() => view === "gateway" && providers && box.isConnected && renderGatewayView(), () => {});
+    return;
+  }
+  const rows = f.schema ? magpie.ui.form(f.schema, f.config, async (change) => {
+    try {
+      applyFeatures(prefs.builtins = state.settings.builtins = await api("plugins/builtin", { id: "gateway", config: change }));
+      status(t("Saved"), "ok", 1500);
+    } catch (err) { status(t(err.message), "err"); }
+    renderGatewayOwn();
+  }) : [];
+  const r = el("div", "row pref"), who = el("div", "who"), go = el("button", "text", t("Settings") + " › " + $("#setTab-network").textContent);
+  who.append(el("div", "name", t("Port, allowed addresses and model ids")));
+  go.type = "button";
+  go.onclick = (e) => openSettingsAt(e, "network", "#portList .row");
+  r.append(who, go);
+  box.replaceChildren(...rows, r);
 }
 
 // The status card's button (leslie_luo on Discord: told to quit the older
@@ -96,6 +137,19 @@ function renderGatewayView() {
 let gatewayFix = { busy: false, err: "", when: "" };
 const gatewayFixWhen = (g) => [g.running, g.mine, g.version || ""].join("|");
 function gatewayFixButton(g, older) {
+  // paused (gatewaypause.go): resumed, its agents connected again
+  if (g.paused) {
+    const b = el("button", "text action gw-fix", t("Resume gateway"));
+    b.disabled = gatewayFix.busy;
+    b.onclick = async () => {
+      gatewayFix = { busy: true, err: "", when: gatewayFixWhen(g) };
+      b.disabled = true;
+      await setGatewayPaused(false);
+      gatewayFix = { busy: false, err: "", when: "" };
+      renderGateway();
+    };
+    return b;
+  }
   if (g.running && !g.mine && !older) return null;
   // bordered: a plain text button read as words on the card in dark mode
   const b = el("button", "text action gw-fix");
@@ -118,7 +172,7 @@ function gatewayFixButton(g, older) {
 // gatewayFixSays is why a take-over or a restart didn't go, in the page's
 // language, naming the process it was
 function gatewayFixSays(o) {
-  const p = { port: o.port || "", pid: o.pid || "", path: o.path || "", v: o.version || "", error: o.error || "" };
+  const p = { port: o.port || "", pid: o.pid || "", path: o.path || "", v: o.version || "", error: o.error || "", name: o.name || "", alt: o.alt || "8443" };
   switch (o.reason) {
     case "not-magpie": return t("Port {port} is held by {path} (pid {pid}), which isn't magpie, so magpie leaves it alone. Quit it yourself, or move the gateway to another port in Settings.", p);
     // leslie_luo on Discord: an old magpie in OrbStack, its helper named
@@ -128,7 +182,13 @@ function gatewayFixSays(o) {
     case "denied": return t("magpie {v} (pid {pid}, {path}) runs as another user or as administrator, so this magpie can't quit it. Quit it there.", p);
     case "stuck": return t("magpie {v} (pid {pid}) didn't quit. End it in your system's process list (Activity Monitor, Task Manager).", p);
     case "respawned": return t("Something started magpie on port {port} again at once ({path}, pid {pid}): a login item or a service keeps it running (a LaunchAgent, a systemd unit, a scheduled task). Remove that, then try again.", p);
-    case "taken": return p.pid
+    // pluoki on X: Tailscale's serve on the gateway's port number, found
+    // only by trial and error; the program is named when it can be read
+    case "taken": return o.tailscale
+      ? t("Tailscale's serve or funnel has port {port}. Point it at magpie from another port: tailscale serve --https={alt} http://127.0.0.1:{port} (or move the gateway to another port in Settings).", p)
+      : p.name && !p.path
+      ? t("Port {port} is in use by {name} (pid {pid}): quit it, or move the gateway to another port in Settings.", p)
+      : p.pid
       ? t("Port {port} is in use by {path} (pid {pid}): quit it, or move the gateway to another port in Settings.", p)
       : t("Port {port} is in use by another program: quit it, or move the gateway to another port in Settings.", p);
     case "other": return t("magpie {v} serves the gateway, and it isn't older than this one: quit it there to serve the gateway here.", p);
@@ -222,19 +282,40 @@ function renderGateway() {
   const name = el("div", "name", t("Gateway"));
   name.append(el("span", "state", older
     ? t("running · served by magpie {v}, older than this one", { v: g.version })
+    : g.paused ? t("paused")
     : t(g.running ? (g.mine ? "running" : "running · served by another magpie") : "not running")));
   const routed = new Set();
   for (const p of providers.providers) for (const a of p.agents) if (a.current) routed.add(a.id);
   const n = routed.size;
   if (older) {
     who.append(name, el("div", "sub old", t("Agents' requests go through magpie {v} and are sent as it sends them, without this version's fixes. Quit it here and this one serves the gateway at once.", { v: g.version })));
+  } else if (g.paused) {
+    who.append(name, el("div", "sub", t("Paused, agents are disconnected and use their own settings")));
+  } else if (!g.running && state.gatewayHeld?.own) {
+    // magpie's own service (magpie daemon), starting after an update or a
+    // restart: it serves the gateway in a moment, nothing to quit or move
+    who.append(name, el("div", "sub", t("Starting the gateway…")));
+  } else if (!g.running && state.gatewayHeld) {
+    // the gateway couldn't listen: what has the port, as far as it is read
+    who.append(name, el("div", "sub old err", gatewayFixSays({ reason: "taken", ...state.gatewayHeld })));
   } else who.append(name, el("div", "sub", g.running
     ? [t(g.models === 1 ? "{n} model" : "{n} models", { n: g.models }), n ? t(n === 1 ? "{n} agent routed through it" : "{n} agents routed through it", { n }) : t("no agent routed through it yet"), t("five APIs, one URL")].join(" · ")
     : t("start it with magpie serve, or open magpie at login")));
   if (gatewayFix.err && gatewayFix.when === gatewayFixWhen(g)) who.append(el("div", "sub old err", gatewayFix.err));
   box.append(mark, who);
+  // DeepSeek's chat page, served by the gateway with its models, search
+  // and link reading (chatpage.go)
   const fix = gatewayFixButton(g, older);
-  if (fix) box.append(fix);
+  if (g.running && !older && !g.paused) {
+    const chat = el("button", "text action gw-chat", t("Chat page"));
+    const url = (web && g.publicURL || g.url) + "/deepseek-chat/";
+    chat.onclick = () => api("open", { url }).catch(statusErr);
+    // the two together, so a narrow card wraps them as one
+    const acts = el("span", "gw-acts");
+    acts.append(chat);
+    if (fix) acts.append(fix);
+    box.append(acts);
+  } else if (fix) box.append(fix);
 }
 
 // Share on local network, set on the page that hands out its keys (the
@@ -276,17 +357,17 @@ function renderGatewayLan() {
   // the one they reach, MAGPIE_PUBLIC_URL's, not this computer's loopback
   // (#1551)
   const shown = web && g.publicURL || g.url;
-  line(t(shown === g.url ? "This computer" : "Public address"), shown);
+  const { urls, others, sub } = gwLAN(g);
+  line(addrWho(g, shown, others), shown);
   if (g.lan) {
-    const { urls, others, sub } = gwLAN(g);
-    // an internet address on an interface (an ISP's static one) is said
-    // to be one, not listed as this network's, and the one other
-    // containers on this host use (the host's Docker bridge address) is
-    // said to be theirs
-    const far = new Set(g.lanPublic || []), rest = urls.filter((u) => u !== shown);
-    rest.filter((u) => !far.has(u) && !others.includes(u)).forEach((u, i) => line(i ? "" : t("Local network"), u));
-    rest.filter((u) => others.includes(u)).forEach((u, i) => line(i ? "" : t("Other containers on this host"), u));
-    rest.filter((u) => far.has(u) && !others.includes(u)).forEach((u, i) => line(i ? "" : t("On the internet"), u));
+    // each address named as Connect's menu names it (addrWho): this
+    // network's first, then the one other containers on this host use
+    // (the host's Docker bridge address), then one on the internet (an
+    // ISP's static one); a name said once for the lines it heads
+    const said = [addrWho(g, shown, others)], rest = urls.filter((u) => u !== shown);
+    const order = [t("Local network"), t("Public address"), t("LazyCat client"), t("Other containers on this host"), t("On the internet")];
+    rest.map((u) => [addrWho(g, u, others), u]).sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]))
+      .forEach(([who, u]) => { line(said.at(-1) === who ? "" : who, u); said.push(who); });
     if (!urls.length) list.append(el("div", "gw-url-none", t("This computer has no local network address right now")));
     if (sub) list.append(el("div", "gw-url-none", sub));
   }
@@ -464,6 +545,27 @@ function envSnippet(vars) {
   return vars.map(([k, v]) => (snipWin() ? `$env:${k}=${psHeader(v)}` : `export ${k}=${shQuote(v)}`)).join("\n");
 }
 
+// The row's chips (modelInfo) with video and audio after the image one,
+// when its source listed them (pingqipai3 on X); a group's are any one of
+// its models', as its images are. Their tooltip lines follow the images'
+// one, the second of modelInfo's.
+const MEDIA_GLYPH = { video: "M2 4.5h8.5v7H2zM10.5 7l3.5-2v6l-3.5-2", audio: "M3 6.5v3M5.5 4.5v7M8 2.5v11M10.5 4.5v7M13 6.5v3" };
+function mediaInfo(m) {
+  const box = modelInfo(m);
+  const kinds = ["video", "audio"].filter((k) => m.inputs?.includes(k));
+  if (!kinds.length) return box;
+  const ctx = box.querySelector(".mi-ctx");
+  const lines = box.title.split("\n");
+  for (const k of kinds) {
+    const c = el("span", "badge mi-media mi-" + k);
+    c.append(svg(MEDIA_GLYPH[k], 11, 1.4));
+    box.insertBefore(c, ctx);
+  }
+  lines.splice(2, 0, ...kinds.map((k) => t(k === "video" ? (m.group ? "Accepts video (one of its models does)" : "Accepts video") : m.group ? "Accepts audio (one of its models does)" : "Accepts audio")));
+  box.title = lines.join("\n");
+  return box;
+}
+
 // every exposed model, as the ids agents use
 function gatewayModels() {
   // the routing groups first, as the agents' pickers list them
@@ -471,7 +573,7 @@ function gatewayModels() {
   // every model off the list
   const out = (providers.gateway.groups || []).filter((g) => g && typeof g.id === "string").map((g) => ({ id: g.id, name: g.name || g.id, icons: g.icons || [], group: true,
     provider: { name: [t("routing group"), (g.providers || []).join(", ")].filter(Boolean).join(" · ") },
-    efforts: g.efforts || [], images: !!g.images, context: g.context, output: g.output, members: g.members || [] }));
+    efforts: g.efforts || [], images: !!g.images, inputs: g.inputs || [], context: g.context, output: g.output, members: g.members || [] }));
   // a provider switched off is skipped: the gateway refuses its models, so
   // they are not ids an agent can use, and listing them here would show a
   // model the picker's own list, the Gateway count and the Connect example
@@ -481,7 +583,7 @@ function gatewayModels() {
   // levels aren't known (given) offers only those it was given; one sent
   // no reasoning field (reasonless) offers none
   const offered = (m) => m.reasonless ? [] : m.kept?.length || m.given ? m.kept || [] : m.efforts || [];
-  for (const p of providers.providers) { if (p.off) continue; for (const m of p.models) if (m.on) out.push({ id: `${p.id}/${m.id}`, name: m.name, provider: p, context: m.context, output: m.output, efforts: offered(m), images: !!m.images }); }
+  for (const p of providers.providers) { if (p.off) continue; for (const m of p.models) if (m.on) out.push({ id: `${p.id}/${m.id}`, name: m.name, provider: p, context: m.context, output: m.output, efforts: offered(m), images: !!m.images, inputs: m.inputs || [] }); }
   return out;
 }
 
@@ -545,7 +647,7 @@ function renderConnect() {
 
   const b = el("div", "val");
   if (urls.length > 1) b.append(connectPick("connectAddress", "Address", base,
-    urls.map((u) => ({ v: u, name: f.base(u), note: t(u === g.url ? "This computer" : u === g.publicURL ? "Public address" : "Local network") })), connectURL,
+    urls.map((u) => ({ v: u, name: f.base(u), note: addrWho(g, u, gwLAN(g).others) })), connectURL,
     (u) => { connectWant = u; keepPick("magpie.connectAddress", u); renderConnect(); }));
   else b.append(el("code", "", base));
   b.append(copyBtn(base, "Base URL"));
@@ -657,7 +759,7 @@ function renderGatewayModels() {
     const name = el("div", "name", m.id);
     if (namedFree(m.id, m.name)) name.append(freeBadge(false));
     who.append(name, el("div", "sub", m.name && m.name !== m.id.split("/")[1] ? `${m.name} · ${m.provider.name}` : m.provider.name));
-    row.append(m.group ? stackIcon(m.icons) : icon(m.provider.icon || "generic"), who, modelInfo(m), copyBtn(m.id, t("Model id")));
+    row.append(m.group ? stackIcon(m.icons) : icon(m.provider.icon || "generic"), who, mediaInfo(m), copyBtn(m.id, t("Model id")));
     row.title = t("Use this model in the snippets");
     // a decision model is put in System One's snippets, any other in the
     // other APIs'; the API follows the model clicked
@@ -707,7 +809,9 @@ function renderActivity() {
   for (const c of calls) {
     const id = callRow(c);
     const open = expandedCalls.has(id);
-    const item = el("div", "call-item" + (open ? " open" : "") + (c.status >= 400 ? " bad" : ""));
+    // a call its agent canceled (c.canceled) saw no error: told in the
+    // muted colour, neither failed nor answered
+    const item = el("div", "call-item" + (open ? " open" : "") + (c.status >= 400 ? (c.canceled ? " gone" : " bad") : ""));
     const r = el("div", "call");
     r.setAttribute("role", "button");
     r.setAttribute("tabindex", "0");
@@ -794,17 +898,19 @@ magpie.plugin("gateway", (ctx) => {
   <div id="gatewayLan"></div>
 </div>
 <section id="gatewayKeysBlock" hidden>
-  <div class="row-head"><span class="label" data-t>Gateway keys</span><span class="grow"></span><button class="text" id="addGatewayKey" data-t>Add gateway key</button></div>
+  <div class="row-head"><span class="label" data-t>Gateway keys</span><span class="grow"></span><button class="text" id="accountGroups" data-t>Account groups</button><button class="text" id="addGatewayKey" data-t>Add gateway key</button></div>
   <p class="usage-note" data-t>Create a gateway key for each client. Usage is counted separately for each key.</p>
   <section id="gatewayKeys"></section>
 </section>
-<p class="usage-note gw-keys-off" id="gatewayKeysOff" hidden data-t>Gateway keys are for other computers, and for a tunnel to this one such as Cloudflare Tunnel: they are added here once Share on local network is on. Agents on this computer need none.</p>
+<p class="usage-note gw-keys-off" id="gatewayKeysOff" hidden data-t>Gateway keys are for other computers, a tunnel to this one such as Cloudflare Tunnel, and web pages: they are added here once Share on local network is on, or a web page is listed in Settings. Agents on this computer need none.</p>
 <div class="row-head"><button class="fold" id="foldConnect" aria-expanded="true" aria-controls="connect"><span class="label" data-t>Connect</span></button><span class="grow"></span><span class="note" id="connectNote"></span></div>
 <section class="list connect" id="connect"></section>
 <div class="row-head"><button class="fold" id="foldModels" aria-expanded="true" aria-controls="gwModels"><span class="label" data-t>Models</span><span class="note" id="modelsCount"></span></button><span class="grow"></span><button class="text" id="copyModels" data-t>Copy all ids</button></div>
 <div class="list" id="gwModels"></div>
 <div class="row-head"><span class="label" data-t>Recent calls</span><span class="grow"></span><span class="note" id="callsNote"></span></div>
 <div class="list activity" id="activity"></div>
+<div class="row-head" id="gwOwnHead" hidden><span class="label" data-t>Settings</span></div>
+<div class="list prefs gw-own" id="gwOwn"></div>
 `,
     mount() {
       $("#foldConnect").prepend(svg(CHEV_R, 11, 1.6));

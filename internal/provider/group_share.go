@@ -52,8 +52,12 @@ func ShareGroup(id string) (string, error) {
 	g.Members, g.Match = ownMembers(g)
 	g.Matched = nil
 	g.Auto, g.Hidden, g.Disabled = false, false, false
-	g.Accounts = nil // this magpie's accounts: another has its own
-	g.Seen = nil     // what this magpie found: another finds its own
+	g.Accounts = nil          // this magpie's accounts: another has its own
+	withoutMemberAccounts(&g) // a member's own account too
+	g.Keys = nil              // this magpie's gateway keys, the same
+	g.Redact = ""             // and whether it masks: the receiver's call
+	g.Template = ""           // the picks as they are: made of this magpie's models
+	g.Seen = nil              // what this magpie found: another finds its own
 	g.Rules = slices.DeleteFunc(g.Rules, Rule.ByFolder)
 	out, err := json.Marshal(SharedGroup{Magpie: ShareMark, Version: ShareVersion, Group: g})
 	return string(out), err
@@ -159,7 +163,11 @@ func importGroup(text string, over bool) (Imported, error) {
 		return Imported{}, err
 	}
 	g := s.Group
-	g.Accounts = nil // another magpie's accounts, never this one's
+	g.Accounts = nil          // another magpie's accounts, never this one's
+	g.Keys = []string{}       // its gateway keys too; over, the user's are kept below
+	g.Redact = ""             // whether it masks is the receiver's call, never a text's
+	g.Template = ""           // the picks as written, made of the sender's models
+	withoutMemberAccounts(&g) // and a member's own account (a text made before ShareGroup dropped them)
 	entries := providerEntries()
 	all := Groups()
 	var res Imported
@@ -207,16 +215,21 @@ func importGroup(text string, over bool) (Imported, error) {
 		p, id, ok := resolveIn(entries, model)
 		return ok && !CanFast(p, id)
 	})
+	g.Ultra = slices.DeleteFunc(kept(g.Ultra), func(f string) bool { return !slices.Contains(g.Fast, f) })
 	g.Weights = renamedWeights(g.Weights, func(m string) string { return here[strings.TrimSpace(m)] })
+	g.EffortMaps = renamedEffortMaps(g.EffortMaps, func(m string) string { return here[strings.TrimSpace(m)] })
 	if g.Routing != Manual && len(g.Off) == len(g.Members) {
 		g.Off = nil // the ones it sent to are gone: those left are on
 	}
 	g.Pick = here[strings.TrimSpace(g.Pick)]
-	if c := strings.TrimSpace(g.Classifier); c != "" {
-		if g.Classifier = place(c); g.Classifier == GroupPrefix+g.ID {
-			g.Classifier = ""
+	// each classifier as this magpie has it; one it hasn't, or the group
+	// itself, is left out of the list
+	g.MapClassifiers(func(c string) string {
+		if c = place(c); c == GroupPrefix+g.ID {
+			return ""
 		}
-	}
+		return c
+	})
 	// a rule sends to a model the group names, or one its patterns match
 	// here
 	in := append(slices.Clone(g.Members), matchesIn(entries, g)...)
@@ -259,6 +272,8 @@ func importGroup(text string, over bool) (Imported, error) {
 		g.Name, _ = freeGroupName(slices.DeleteFunc(slices.Clone(all), func(o Group) bool { return o.ID == id }), name, id)
 		g.ID = old.ID
 		g.Accounts = old.Accounts
+		g.Keys = slices.Clone(old.Keys)
+		g.Redact = old.Redact
 		for _, r := range old.Rules {
 			if !r.ByFolder() {
 				continue
@@ -295,6 +310,7 @@ func importGroup(text string, over bool) (Imported, error) {
 // Providers order; "" when none does. A member's own effort goes with it.
 func memberHere(entries []Entry, all []Group, m string) string {
 	m = CanonicalRef(strings.TrimPrefix(strings.TrimSpace(m), "magpie/"))
+	m, _ = MemberAccount(m) // another magpie's account, never this one's
 	model, effort := memberEffortIn(entries, m)
 	if gid, ok := strings.CutPrefix(model, GroupPrefix); ok {
 		if slices.ContainsFunc(all, func(g Group) bool { return g.ID == gid && !g.Hidden }) {

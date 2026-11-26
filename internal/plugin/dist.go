@@ -13,12 +13,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/source"
 	"github.com/yetone/magpie/internal/update"
 )
@@ -81,7 +81,7 @@ var errDistUnread = errors.New("the community repo's dist branch can't be read")
 
 // distFile is a file the index may name: one tarball under tgz/, nothing
 // that leaves the branch or plugins/dist.
-var distFile = regexp.MustCompile(`^tgz/[A-Za-z0-9._-]+\.tgz$`)
+var distFile = lazyre.New(`^tgz/[A-Za-z0-9._-]+\.tgz$`)
 
 // distPkg is what the dist branch has of the package: nil with no error
 // when the branch was read and has none, or the package isn't one of its
@@ -298,46 +298,49 @@ func distWanted(spec string) (name, version string, ok bool) {
 	return name, version, true
 }
 
-var exactVersion = regexp.MustCompile(`^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)
+var exactVersion = lazyre.New(`^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)
 
 // installDist installs the package's version from the dist branch: its
 // tarball fetched, checked against the index's sha512, kept in
 // plugins/dist (bun.lock names it there, and a later bun add installs it
-// again from it), and added with bun. installMu held.
-func installDist(ctx context.Context, bun, name, version string) error {
+// again from it), and added with bun, the copy Bun made checked against it
+// (addDist). It says the version it added (at
+// "latest", the branch's newest), "" when it got no further than knowing
+// the branch has none. installMu held.
+func installDist(ctx context.Context, bun, name, version string) (string, error) {
 	d, err := distPkg(ctx, name)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if d == nil {
-		return fmt.Errorf("the community repo's dist branch has no %s", name)
+		return "", fmt.Errorf("the community repo's dist branch has no %s", name)
 	}
 	if version == "latest" {
 		version = d.Latest
 	}
 	v, ok := d.Versions[version]
 	if !ok {
-		return fmt.Errorf("the community repo's dist branch has no %s@%s", name, version)
+		return "", fmt.Errorf("the community repo's dist branch has no %s@%s", name, version)
 	}
 	if !distFile.MatchString(v.File) {
-		return fmt.Errorf("the community repo's dist branch names %q for %s@%s, not a tarball of its own", v.File, name, version)
+		return version, fmt.Errorf("the community repo's dist branch names %q for %s@%s, not a tarball of its own", v.File, name, version)
 	}
 	b, err := fetchJSONFaithful(ctx, distBase+"/"+v.File, 64<<20)
 	if err != nil {
-		return err
+		return version, err
 	}
 	sum := sha512.Sum512(b)
 	if got := "sha512-" + base64.StdEncoding.EncodeToString(sum[:]); got != v.Integrity {
-		return fmt.Errorf("%s from the community repo's dist branch isn't the tarball its index names (sha512 %s, not %s)", v.File, got, v.Integrity)
+		return version, fmt.Errorf("%s from the community repo's dist branch isn't the tarball its index names (sha512 %s, not %s)", v.File, got, v.Integrity)
 	}
 	dir := filepath.Join(Dir(), "dist")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+		return version, err
 	}
 	file := path.Base(v.File)
 	tmp, err := os.CreateTemp(dir, file+".*")
 	if err != nil {
-		return err
+		return version, err
 	}
 	_, werr := tmp.Write(b)
 	if cerr := tmp.Close(); werr == nil {
@@ -348,9 +351,9 @@ func installDist(ctx context.Context, bun, name, version string) error {
 	}
 	if werr != nil {
 		os.Remove(tmp.Name())
-		return werr
+		return version, werr
 	}
-	return bunAdd(ctx, bun, "./dist/"+file)
+	return version, addDist(ctx, bun, name, file, b)
 }
 
 // pruneDist takes out the tarballs in plugins/dist that neither
@@ -397,7 +400,7 @@ func distNamed(b []byte, file string) bool {
 
 // distLockedAt is a package bun.lock's packages has at a tarball in
 // plugins/dist, and that tarball: "<name>": ["<name>@./dist/<file>", …].
-var distLockedAt = regexp.MustCompile(`\["((?:@[^"/@]+/)?[^"/@]+)@(?:file:)?(?:\./)?dist/([A-Za-z0-9._-]+\.tgz)"`)
+var distLockedAt = lazyre.New(`\["((?:@[^"/@]+/)?[^"/@]+)@(?:file:)?(?:\./)?dist/([A-Za-z0-9._-]+\.tgz)"`)
 
 // mendDist sends bun.lock back to package.json for the packages it has at a
 // dist tarball package.json doesn't name, when package.json has them at one
@@ -442,7 +445,7 @@ func mendDist(ctx context.Context, bun string) {
 		// what this can't mend, the command it comes before says
 		out, err := bunCommand(ctx, bun, Dir(), append([]string{"update", "--ignore-scripts"}, stale...)...).CombinedOutput()
 		if err != nil {
-			log.Printf("plugins: bun.lock behind package.json for %s; bun update: %v: %s", strings.Join(stale, ", "), err, lastLines(string(out), 3))
+			log.Printf("plugins: bun.lock behind package.json for %s; bun update: %v: %s", strings.Join(stale, ", "), err, bunSaid(string(out), 3))
 		} else {
 			log.Printf("plugins: bun.lock behind package.json for %s, sent back", strings.Join(stale, ", "))
 		}

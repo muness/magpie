@@ -5,8 +5,10 @@
 // The build comes from where Anthropic's installer (claude.ai/install.sh)
 // takes it: the release's manifest.json names each platform's SHA-256 and
 // size, and the binary is checked against both before it is kept. It is
-// kept in magpie's cache folder, not on PATH, so it stands in for no agent:
-// it is only what the bridge and the sign-in run. While magpie serves, it
+// kept in magpie's cache folder, not on PATH: it is what the bridge, the
+// sign-in and `magpie claude` run, and the Agents page doesn't take
+// ~/.claude for an uninstall's leftover while it is here (agent's
+// cliHeld). While magpie serves, it
 // keeps that download at the newest release (KeepCurrent), as Claude
 // Code's own updater would, which magpie's runs turn off.
 package claudecode
@@ -26,10 +28,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/yetone/magpie/internal/appdir"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/libc"
-	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/netproxy"
+	"github.com/yetone/magpie/internal/stall"
 )
 
 // Base is where Anthropic publishes Claude Code's builds, as its installer
@@ -47,7 +52,7 @@ func exeName(goos string) string {
 	return "claude"
 }
 
-var versionRe = regexp.MustCompile(`^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$`)
+var versionRe = lazyre.New(`^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$`)
 
 // Downloaded is the Claude Code magpie downloaded and its version, or ""
 // when there is none: the newest of Root's versions that has the binary.
@@ -86,10 +91,10 @@ func newer(a, b string) bool {
 }
 
 // Find is the Claude Code to run on this machine: the user's own (on PATH
-// or where its installers put it, proc.FindTool), else the one magpie
-// downloaded; "" when there is neither.
+// or where its installers put it, the newest of them: Own), else the one
+// magpie downloaded; "" when there is neither.
 func Find() string {
-	if p := proc.FindTool("claude"); p != "" {
+	if p := Own(); p != "" {
 		return p
 	}
 	p, _ := Downloaded()
@@ -265,7 +270,22 @@ func prune(kept string) {
 	}
 }
 
+// download fetches r to to, once more over HTTP/1.1 when the connection
+// broke off (netproxy.AgainOverHTTP1): a proxy that cuts HTTP/2 streams
+// part way carries HTTP/1.1 whole.
 func download(ctx context.Context, r Release, to string, progress func(int64)) error {
+	return netproxy.AgainOverHTTP1(ctx, func(ctx context.Context) error { return downloadOnce(ctx, r, to, progress) })
+}
+
+// downloadStall is how long a download waits for its next byte. There is
+// no bound on the whole: a slow link still moving finishes the ~200 MB
+// build (#5572). A var for tests.
+var downloadStall = 60 * time.Second
+
+func downloadOnce(ctx context.Context, r Release, to string, progress func(int64)) (err error) {
+	ctx, w := stall.Start(ctx, downloadStall)
+	defer w.Stop()
+	defer func() { err = w.Err(err) }()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.URL, nil)
 	if err != nil {
 		return err
@@ -283,7 +303,7 @@ func download(ctx context.Context, r Release, to string, progress func(int64)) e
 		return err
 	}
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(out, h, progressWriter(progress)), io.LimitReader(res.Body, r.Size+1))
+	n, err := io.Copy(io.MultiWriter(out, h, progressWriter(progress)), io.LimitReader(w.Reader(res.Body), r.Size+1))
 	if cerr := out.Close(); err == nil {
 		err = cerr
 	}

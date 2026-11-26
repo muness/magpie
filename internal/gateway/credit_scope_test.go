@@ -103,6 +103,10 @@ func TestOutOfCreditLeavesFreeModels(t *testing.T) {
 	if !p.PaidBesideFree("deepseek-v4-pro") || p.PaidBesideFree("fake-1") {
 		t.Fatalf("deepseek-v4-pro paid beside free %v, fake-1 %v", p.PaidBesideFree("deepseek-v4-pro"), p.PaidBesideFree("fake-1"))
 	}
+	// a free model WorkBuddy refuses still rests the account (no package)
+	if p.FreeBesidePaid("fake-1") {
+		t.Fatal("fake-1 free beside paid outside OpenCode")
+	}
 	restingUntil.Lock()
 	restingUntil.m, restingUntil.note = map[string]time.Time{}, map[string]Rest{}
 	restingUntil.Unlock()
@@ -141,5 +145,24 @@ func TestOutOfCreditLeavesFreeModels(t *testing.T) {
 	defer mu.Unlock()
 	if len(keys) != 1 || keys[0] != "Bearer k1" {
 		t.Fatalf("fake-1 went with %v, want the first account's (k1); rests %v", keys, got)
+	}
+}
+
+// OpenAI answers an organization whose prepaid API credits are spent with
+// 429 and the code credit_balance_exhausted (hey_boyce on X, 11-06). The
+// body here carries OpenAI's documented code alone, not a captured reply:
+// it is out of credit, so the next account takes the request, not a rate
+// limit that asks the same key again in a minute.
+func TestOpenAICreditBalanceExhaustedIsCredit(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"code":"credit_balance_exhausted"}}`,
+		`{"error":{"code":"credit_balance_exhausted","type":"rate_limit_exceeded"}}`,
+	} {
+		if got := failure(429, []byte(body)); got != failCredit {
+			t.Errorf("%s: %s, want %s", body, got, failCredit)
+		}
+		if minuteRate([]byte(body)) {
+			t.Errorf("%s: read as a minute's rate limit", body)
+		}
 	}
 }

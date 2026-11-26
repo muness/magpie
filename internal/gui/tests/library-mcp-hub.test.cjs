@@ -19,7 +19,10 @@
 // posts servers/hub-open with the app's name, never a link) and none in a
 // browser. No agent is told to the user as a command to run. The address
 // is the public one in a browser and the gateway in the app. A click again
-// turns it off. In every language, both engines, a wide window in the app
+// turns it off. Other apps also get the address that gives the tools on
+// demand (?tools=on-demand, Passings_z on X), with what it does, while
+// Tools on demand is on; with every tool whole it isn't offered. In every
+// language, both engines, a wide window in the app
 // and a narrow one in a browser: no sideways scroll, and the switch beside
 // its text.
 // No backend: the API is faked here.
@@ -37,6 +40,7 @@ const MANY = Array.from({ length: 21 }, (_, i) => ({ id: "agent" + (i + 1), name
 const fixture = (on, st = {}) => ({
   dir: `${HOME}/.magpie/library`, backups: `${HOME}/.magpie/backups`, home: HOME,
   mcpHub: on, hubPath: "/mcp/magpie/hub/",
+  hubOnDemandQuery: "tools=on-demand", hubOnDemandOver: 10, hubAllTools: !!st.allTools,
   agents: [
     { id: "claude", name: "Claude Code", icon: "claudecode-color", skills: `${HOME}/.claude/skills`, mcp: `${HOME}/.claude.json`, ...(on ? { hub: "on" } : {}) },
     { id: "codex", name: "Codex", icon: "codex-color", mcp: `${HOME}/.codex/config.toml`, ...(on ? { hub: "own" } : {}) },
@@ -114,6 +118,21 @@ const shot = async (page, name) => {
   await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `hub-${name}.png`) });
 };
 
+// two cards one over the other in the Library's body, with nothing between,
+// keep room between them (the owner, 11-23: the install card sat on the
+// Skill router's): every pair of boxed neighbours is at least 10px apart
+const crowded = (page) => page.evaluate(() => {
+  const boxed = (e) => { const c = getComputedStyle(e); return parseFloat(c.borderTopWidth) > 0 || c.backgroundColor !== "rgba(0, 0, 0, 0)"; };
+  const kids = [...document.querySelectorAll("#view-library .lib-body:not(.lib-skel) > *")].filter((e) => e.getBoundingClientRect().height);
+  const out = [];
+  for (let i = 1; i < kids.length; i++) {
+    if (!boxed(kids[i - 1]) || !boxed(kids[i])) continue;
+    const gap = kids[i].getBoundingClientRect().top - kids[i - 1].getBoundingClientRect().bottom;
+    if (gap < 10) out.push(`${kids[i - 1].className} | ${kids[i].className}: ${gap.toFixed(1)}px`);
+  }
+  return { n: kids.length, out };
+});
+
 const sideways = (page) => page.evaluate(() => {
   const over = [];
   const w = document.documentElement.clientWidth;
@@ -137,7 +156,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const w = (key, vars) => tr(lang, key, vars);
         const web = width < 800;
         // Cursor is one of the agents in the app, and not in a browser
-        const st = { on: false, sent: [], opened: [], all: [], copied: [], web, cursor: !web };
+        // every tool whole in a browser: no address for the tools on demand
+        const st = { on: false, sent: [], opened: [], all: [], copied: [], web, cursor: !web, allTools: web };
         const url = (web ? "https://mac.tail0.ts.net" : "http://127.0.0.1:3425") + "/mcp/magpie/hub";
         const errors = [];
         const ctx = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: "reduce" });
@@ -161,14 +181,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(await sw.getAttribute("role"), "switch");
         assert.equal(await sw.getAttribute("aria-checked"), "false");
         assert.equal(await v.locator(".lib-hub-why").count(), 0);
-        // below the servers, not among them
-        const below = await page.evaluate(() => {
-          const rows = [...document.querySelectorAll("#view-library .lib-server")];
+        // at the top: over the servers and Add server, not among them
+        const above = await page.evaluate(() => {
+          const rows = [...document.querySelectorAll("#view-library .lib-server, #view-library .after-list")];
           const hub = document.querySelector("#view-library .lib-hub");
-          return rows.length > 0 && rows.every((r) => r.getBoundingClientRect().bottom <= hub.getBoundingClientRect().top);
+          return rows.length > 1 && rows.every((r) => hub.getBoundingClientRect().bottom <= r.getBoundingClientRect().top);
         });
-        assert.ok(below, "the hub's row isn't below the servers");
+        assert.ok(above, "the hub's row isn't above the servers");
         assert.deepEqual(await sideways(page), [], "sideways scroll, off");
+        { const c = await crowded(page); assert.ok(c.n > 2, "the body is measured"); assert.deepEqual(c.out, [], "cards apart, off"); }
 
         // on
         await sw.click();
@@ -204,6 +225,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         });
         assert.ok(fits, "the switch is outside its row");
         assert.deepEqual(await sideways(page), [], "sideways scroll, on");
+        { const c = await crowded(page); assert.ok(c.n > 2, "the body is measured"); assert.deepEqual(c.out, [], "cards apart, on"); }
 
         // Connect…: the agents, in their groups, each with where it stands
         await at.locator(".lib-hubconnect").click();
@@ -216,7 +238,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // one agent that can be: named, not counted
         assert.equal(await lead(), web ? w("{agent} uses the library's servers through magpie", { agent: "Claude Code" }) : w("{on} of {all} agents use the library's servers through magpie", { on: 1, all: 2 }));
         assert.equal((await sheet.locator(".lib-hubsub").textContent()).trim().replace(/\u00a0/g, " "),
-          [web ? w("Each server runs once, for all of them") : w("{n} more can be connected", { n: 1 }), w("{n} keep each server's own entry", { n: 2 })].join(" · "));
+          [web ? w("Each server runs once, for all of them") : w("{n} more can use them", { n: 1 }), w("{n} keep each server's own entry", { n: 2 })].join(" · "));
         // the diagram's servers are the library's three, magpie-image's mark too (the owner: why isn't its logo there?)
         assert.equal(await sheet.locator(".lib-hubroute > .lib-hubstack").last().locator(":scope > *").count(), 3);
         assert.equal(await sheet.locator('.ehead > .lib-hubmark use[href="#bird"]').count(), 1);
@@ -225,7 +247,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const groups = () => sheet.locator(".lib-hubgrp").evaluateAll((gs) => gs.map((g) => [g.dataset.group, [...g.querySelectorAll(".lib-hubagent")].map((r) => r.dataset.agent)]));
         assert.deepEqual(await groups(), [...(web ? [] : [["off", ["cursor"]]]), ["on", ["claude"]], ["kept", ["codex", "claude-desktop"]]]);
         assert.deepEqual((await sheet.locator(".lib-hubsec > span:first-child").allTextContents()).map((x) => x.trim()),
-          [...(web ? [] : [w("Not connected")]), w("Connected"), w("Keep each server's own entry")]);
+          [...(web ? [] : [w("Not using the library")]), w("Using the library"), w("Keep each server's own entry")]);
         const rows = sheet.locator(".lib-hubagent");
         const states = () => rows.evaluateAll((rs) => rs.map((r) => [r.dataset.agent, r.dataset.state]));
         assert.deepEqual(await states(), [...(web ? [] : [["cursor", "none"]]), ["claude", "on"], ["codex", "own"], ["claude-desktop", "no-remote"]]);
@@ -277,7 +299,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
         // Other apps: the address, and a row per app with what adds it
         await tabs.last().click();
-        assert.equal((await sheet.locator(".lib-hubaddr code").textContent()).trim(), url);
+        assert.deepEqual((await sheet.locator(".lib-hubaddr code").allTextContents()).map((x) => x.trim()), web ? [url] : [url, url + "?tools=on-demand"]);
+        if (!web) {
+          // its own copy gives the address with the query
+          await sheet.locator(".lib-hubaddr-lazy .copy").click();
+          for (let i = 0; i < 250 && st.copied.at(-1) !== url + "?tools=on-demand"; i++) await page.waitForTimeout(20);
+          assert.equal(st.copied.at(-1), url + "?tools=on-demand");
+        }
         const apps = sheet.locator(".lib-hubapp");
         // Cursor is set up by hand only when magpie doesn't look after it
         assert.deepEqual(await apps.evaluateAll((rs) => rs.map((r) => r.dataset.app)), [...(web ? ["cursor"] : []), "vscode", "windsurf", "json"]);
@@ -303,7 +331,8 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal((await app("windsurf").locator(".sub").textContent()).trim(), w("Paste it into ~/.codeium/windsurf/mcp_config.json"));
         assert.deepEqual(await copied("windsurf", "Windsurf"), { mcpServers: { magpie: { serverUrl: url } } });
         assert.deepEqual(await copied("json", w("Other")), { mcpServers: { magpie: { type: "http", url } } });
-        assert.equal((await sheet.locator(".lib-hubcap").textContent()).trim(), w("From another computer, use the address magpie is reached at there, with a gateway key: Authorization: Bearer <key>."));
+        assert.deepEqual((await sheet.locator(".lib-hubcap").allTextContents()).map((x) => x.trim()), [w("From another computer, use the address magpie is reached at there, with a gateway key: Authorization: Bearer <key>. A key with a model, account or spend limit isn't given the servers that run as programs here."),
+          ...(web ? [] : [w("For an app that doesn't search its tools itself: past {n} tools, it is given one that finds a tool and one that runs it.", { n: 10 })])]);
         assert.deepEqual(await sideways(page), [], "sideways scroll, apps");
         await shot(page, `${engine}-${lang}-${width}-apps`);
         await bar.locator("button.primary").click();

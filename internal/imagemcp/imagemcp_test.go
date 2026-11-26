@@ -195,7 +195,7 @@ func TestGenerateSavesInTheProject(t *testing.T) {
 func TestGatewayRefusalIsAToolError(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(400)
-		io.WriteString(w, `{"error":{"message":"no model draws: pick one in Settings → Images → Image generation"}}`)
+		io.WriteString(w, `{"error":{"message":"no model draws: pick one in Settings → Models → Images → Image generation"}}`)
 	}))
 	defer up.Close()
 	s := &server{gateway: up.URL, client: http.DefaultClient, agent: "x", pending: map[string]chan rpc{}}
@@ -536,8 +536,8 @@ func TestGenerateTakesTheModel(t *testing.T) {
 	project := t.TempDir()
 	c := start(t, g, project)
 	c.call("initialize", map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{"roots": map[string]any{}}, "clientInfo": map[string]any{"name": "claude-code", "version": "2.1.0"}})
-	r := c.call("tools/call", map[string]any{"name": "generate_image", "arguments": map[string]any{"prompt": "a magpie", "model": "painter"}})
-	if r["isError"] == true || len(g.body) != 1 || !strings.Contains(g.body[0], `"model":"art/painter"`) {
+	r := c.call("tools/call", map[string]any{"name": "generate_image", "arguments": map[string]any{"prompt": "a magpie", "model": "painter", "complexity": "low"}})
+	if r["isError"] == true || len(g.body) != 1 || !strings.Contains(g.body[0], `"model":"art/painter"`) || !strings.Contains(g.body[0], `"complexity":"low"`) {
 		t.Fatalf("%v: asked %v", r, g.body)
 	}
 	r = c.call("tools/call", map[string]any{"name": "generate_image", "arguments": map[string]any{"prompt": "a magpie", "model": "art/nope"}})

@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"maps"
-	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // The routings besides the default, smart, in order.
@@ -51,6 +51,11 @@ const (
 	// before it that renews meanwhile doesn't take its requests back
 	// (dzxx0496 on Discord; routes.Drain).
 	Drain = "drain"
+	// PaceDrain picks the key or account as Pace does, the one with the
+	// most left per hour until it renews, and then stays on it as Drain
+	// does until it is used up or refused, when it picks again
+	// (guhailin3 on X; routes.PaceDrain).
+	PaceDrain = "pace-drain"
 	// FreeExpiring spends free quota before paid, the free quota that is
 	// lost soonest first: a free account (FreePlan, or a model that costs
 	// nothing there, FreeModel) at its next reset or its credits' expiry,
@@ -58,6 +63,13 @@ const (
 	// (routes.FreeExpiring; wowbbs on Discord: five check-in accounts of
 	// WorkBuddy, MiniMax, Trae and Qoder in one group). A group's only.
 	FreeExpiring = "expiring"
+	// SmallFirst sends a request to the member with the smallest context
+	// window that holds it, so the big ones are kept for long requests
+	// (routes.SmallFirst; yg6888 on X: Composer's 200K and Grok 4.7's
+	// 256K never answered in a group of 1M models under Smart). Members
+	// too small are left out as under every routing (roomy). A group's
+	// only: a provider's keys and accounts serve one window.
+	SmallFirst = "fit"
 )
 
 // FreePlan says whether an account's plan, as its vendor or plugin names
@@ -74,13 +86,23 @@ func FreePlan(plan string) bool {
 }
 
 // pluginRouting is a routing a plugin serves: "<plugin>/<name>".
-var pluginRouting = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var pluginRouting = lazyre.New(`^[A-Za-z0-9._-]+/[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // PluginRouting says whether routing is one a plugin serves,
 // "<plugin>/<name>" (a JS gateway plugin's strategies). providers.json
 // keeps one as saved, served now or not: one no plugin serves is tried in
 // its listed order.
 func PluginRouting(routing string) bool { return pluginRouting.MatchString(routing) }
+
+// GroupRouting says whether routing is one a routing group can be routed
+// by besides Smart (""): a built-in one, Manual, or a plugin's.
+func GroupRouting(routing string) bool {
+	switch routing {
+	case Ordered, Rotate, LeastUsed, Pace, Weighted, FreeFirst, Fastest, Cheapest, Drain, PaceDrain, FreeExpiring, SmallFirst, Manual:
+		return true
+	}
+	return PluginRouting(routing)
+}
 
 // SetRouting changes how a provider's requests spread over its keys or
 // accounts.
@@ -102,6 +124,29 @@ func SetSink(id string, sink bool) error {
 		return err
 	}
 	p.Sink = sink
+	return Save(*p)
+}
+
+// SetUseFirst puts a provider's keys or accounts ahead of the other
+// providers' where Smart weighs them together, or back in Smart's own
+// order (Provider.UseFirst).
+func SetUseFirst(id string, on bool) error {
+	p, err := Find(id)
+	if err != nil {
+		return err
+	}
+	p.UseFirst = on
+	return Save(*p)
+}
+
+// SetNoStandIn keeps another model's request off a provider, or lets it
+// stand in for any again (Provider.NoStandIn).
+func SetNoStandIn(id string, on bool) error {
+	p, err := Find(id)
+	if err != nil {
+		return err
+	}
+	p.NoStandIn = on
 	return Save(*p)
 }
 
@@ -198,6 +243,12 @@ func SetRestartApp(id string, on bool) error {
 	return Save(*p)
 }
 
+// CodexRestartsApp is codexRestartsApp, for the agent package: a change
+// of Codex's route magpie makes by itself restarts the Codex app's
+// app-server (moving the chats it has open first, CodexBeforeAppEnd) only
+// when it says so.
+func CodexRestartsApp() bool { return codexRestartsApp() }
+
 // codexRestartsApp is whether the user had magpie restart the Codex app's
 // app-server for a change it makes by itself (Provider.RestartApp). While
 // providers.json can't be read it is unknown, and the app is left be: a
@@ -291,6 +342,37 @@ func Unwaited() (release func()) {
 	return sync.OnceFunc(func() { unwaited.Add(-1) })
 }
 
+// readsOut counts the allowance and usage reads a caller left running
+// in the background (Allowances past firstWait, SubscriptionUsage with a
+// stale copy to serve, a key's allowance), for a test to wait for at its
+// end: what such a read finds — Claude Code's sign-in in whatever home is
+// set by then — lands in the next test's caches otherwise (#3174).
+var readsOut struct {
+	sync.Mutex
+	n    int
+	idle chan struct{} // closed when n drops to 0
+}
+
+// goRead runs f as a read left out (readsOut).
+func goRead(f func()) {
+	readsOut.Lock()
+	if readsOut.n == 0 {
+		readsOut.idle = make(chan struct{})
+	}
+	readsOut.n++
+	readsOut.Unlock()
+	go func() {
+		defer func() {
+			readsOut.Lock()
+			if readsOut.n--; readsOut.n == 0 {
+				close(readsOut.idle)
+			}
+			readsOut.Unlock()
+		}()
+		f()
+	}()
+}
+
 // Allowance is an account's allowance windows as last known.
 type Allowance []Limit
 
@@ -316,6 +398,10 @@ type Limit struct {
 	// account at (WindowCaps.own); it rides in pool, never in the
 	// allowance itself
 	aside bool
+	// extra is set beside aside on a Claude account's extra usage
+	// (QuotaWindow.Extra): its cap holds the account as
+	// ClaudeNoExtraUsage would (Allowance.extraCapped), not outright
+	extra bool
 	// ResetRunsOut is when the reset the account spends by itself before
 	// it runs out does (resetRunsOut): spent then, it starts this window
 	// again — at Restarts, which routing takes for the window's renewal
@@ -467,20 +553,39 @@ func (a Allowance) CapUsed(model string, now time.Time) float64 {
 // Zero when that window's reset isn't known, or has passed (it is empty
 // again then, its next reset not known).
 func (a Allowance) Fullest(model string, now time.Time) time.Time {
+	at, _ := a.fullest(model, now)
+	return at
+}
+
+// FullestName is the name of the window For's share is of (Fullest's),
+// when more than one window counts model: the share alone ("41% used")
+// read as the five hours on the Routing page while it was the week's,
+// the five hours at 0% (Wing8Aqua on X). Empty when one window, or none,
+// counts it, or the vendor didn't name it.
+func (a Allowance) FullestName(model string, now time.Time) string {
+	_, name := a.fullest(model, now)
+	return name
+}
+
+func (a Allowance) fullest(model string, now time.Time) (time.Time, string) {
 	model = strings.ToLower(model)
-	used, at := -1.0, time.Time{}
+	used, at, name, n := -1.0, time.Time{}, "", 0
 	for _, l := range a {
 		if !l.applies(model) {
 			continue
 		}
+		n++
 		if !l.Resets.IsZero() && !l.Resets.After(now) {
 			l.Used, l.Resets = 0, time.Time{}
 		}
 		if l.Used > used || l.Used == used && l.Resets.After(at) {
-			used, at = l.Used, l.Resets
+			used, at, name = l.Used, l.Resets, l.Name
 		}
 	}
-	return at
+	if n < 2 {
+		name = ""
+	}
+	return at, name
 }
 
 // Count is the count of the window For's share is of — the fullest that
@@ -513,6 +618,17 @@ func (a Allowance) Count(model string, now time.Time) (amount, of float64, unit 
 // whose credits have no reset, go by the package that ends first
 // (cdredfox on X).
 func (a Allowance) Renewal(model string, now time.Time) []time.Time {
+	ls := a.renewing(model, now)
+	out := make([]time.Time, len(ls))
+	for i, l := range ls {
+		out[i] = l.Resets
+	}
+	return out
+}
+
+// renewing is the windows that count model as Renewal ranks them, the
+// biggest first, each Resets its renewal.
+func (a Allowance) renewing(model string, now time.Time) []Limit {
 	model = strings.ToLower(model)
 	restart := a.Restarts(now)
 	var ls []Limit
@@ -521,6 +637,7 @@ func (a Allowance) Renewal(model string, now time.Time) []time.Time {
 			continue
 		}
 		if !l.Resets.After(now) {
+			l.Used, l.Amount = 0, 0 // its reset has passed: empty again
 			l.Resets = time.Time{}
 			if l.Span > 0 {
 				l.Resets = now.Add(l.Span)
@@ -538,11 +655,41 @@ func (a Allowance) Renewal(model string, now time.Time) []time.Time {
 		}
 		return ls[i].Resets.After(ls[j].Resets)
 	})
-	out := make([]time.Time, len(ls))
-	for i, l := range ls {
-		out[i] = l.Resets
+	return ls
+}
+
+// Unreached is how many of Renewal's windows, the biggest first, Smart
+// passes over, ranking the account by the next one: a window whose left
+// the next shorter window can no longer let through before it renews,
+// once that one renews, unless what that one has left is used first.
+// Both are counted in one unit (Limit.Of): a Volcengine Agent Plan's
+// month of 20,000 with 18,372 left, renewing two weeks after its week of
+// 7,000 does, can take at most 14,000 after the week renews, so what the
+// week has left is lost at its reset as a weekly plan's is, and it ranks
+// by its week (#5639, louisgreen0726). While the weeks still to come can
+// carry what the month has left, the month is the real cap, as when the
+// month holds less than its weeks add up to (#1778), and it ranks by the
+// month as before. A week partly before the month renews counts for the
+// share of it that is. Only a budget window ranks so (budgetSpan): what
+// five hours leave at their reset is never taken for lost, as
+// everywhere in Smart. Windows that don't tell their counts, or tell
+// them in different units, are never compared: 0.
+func (a Allowance) Unreached(model string, now time.Time) int {
+	ls := a.renewing(model, now)
+	n := 0
+	for ; n+1 < len(ls); n++ {
+		big, next := ls[n], ls[n+1]
+		if big.Of <= 0 || next.Of <= 0 || big.Unit != next.Unit || next.Span < budgetSpan || big.Span <= next.Span ||
+			big.Resets.IsZero() || !next.Resets.Before(big.Resets) {
+			break
+		}
+		left := big.Of * (100 - min(100, max(0, big.Used))) / 100
+		after := next.Of * float64(big.Resets.Sub(next.Resets)) / float64(next.Span)
+		if left <= after {
+			break
+		}
 	}
-	return out
+	return n
 }
 
 // Left is how much a wallet that counts model has left, in unit
@@ -580,6 +727,38 @@ func (a Allowance) Lapse(model string, now time.Time) time.Time {
 	return t
 }
 
+// lapseHorizon is how far ahead credits about to be lost count as spent
+// already: all of them within a week, none past it (Allowance.Lapsing).
+// They were faded across the week before, so a daily check-in reward of a
+// few dozen credits, a fraction of a point of a 5000-credit pool, fell
+// under the threshold until its last hours (kudi3699 on X).
+const lapseHorizon = 7 * 24 * time.Hour
+
+// Lapsing is the share of an allowance, in points of the 0–100 used share,
+// that is lost soon whatever is done: what a window that counts model
+// loses at RunsOut (RunsOutLeft of Of, never more than it has left), when
+// that is within lapseHorizon. Credits that are
+// lost unspent cost nothing to spend, so a ranking by the share used takes
+// them off it, and an account whose month is half used but whose check-in
+// credits lapse tomorrow is not kept behind a fresh one (kudi3699 on X).
+// Zero when no window says how much lapses: the amount is never guessed
+// from what is left. The most of any window's, as they overlap.
+func (a Allowance) Lapsing(model string, now time.Time) float64 {
+	model = strings.ToLower(model)
+	best := 0.0
+	for _, l := range a {
+		if !l.applies(model) || !l.RunsOut.After(now) || l.RunsOutLeft <= 0 || l.Of <= 0 {
+			continue
+		}
+		if l.RunsOut.Sub(now) >= lapseHorizon {
+			continue
+		}
+		u := min(100, max(0, l.Used))
+		best = max(best, min(100*l.RunsOutLeft/l.Of, 100-u))
+	}
+	return best
+}
+
 // Full is when an account used up for model can take it again: the last
 // reset of its windows that are full, zero when none is or it isn't known.
 func (a Allowance) Full(model string, share float64, now time.Time) time.Time {
@@ -591,6 +770,14 @@ func (a Allowance) Full(model string, share float64, now time.Time) time.Time {
 		}
 	}
 	return t
+}
+
+// Scoped says whether some window of the allowance counts some models only
+// and counts model: Opus's or Fable's own week. A refusal of model with none
+// of its windows read full may be that window's, read before it filled.
+func (a Allowance) Scoped(model string) bool {
+	model = strings.ToLower(model)
+	return slices.ContainsFunc(a, func(l Limit) bool { return (l.Model != "" || l.matches != nil) && l.applies(model) })
 }
 
 // Pooled says whether a refusal of model for its allowance leaves the
@@ -616,6 +803,13 @@ func (a Allowance) Pooled(model string, share float64, now time.Time) bool {
 		}
 		pooled = pooled || scoped
 		whole = whole || !scoped
+	}
+	if !pooled && !whole {
+		// no window counts model, as Antigravity's Gemini models that
+		// fetchAvailableModels gives no quota (#3737): when every window
+		// the account has is some models' only, nothing is known to be
+		// the whole account's, and the refusal is the model's
+		return len(a) > 0 && !slices.ContainsFunc(a, func(l Limit) bool { return l.Model == "" && l.matches == nil })
 	}
 	return full || pooled && !whole
 }
@@ -740,8 +934,18 @@ func (l Limit) expiring(u float64, now, ends time.Time) (pace float64, at time.T
 // Allowances is each of an agent's accounts' allowance by user, as last
 // known, asked for again in the background when that was over a minute
 // ago. Only the very first ask waits, and not for long. An account
-// missing is one not known yet.
+// missing is one not known yet. A ChatGPT API account is known by the
+// same ChatGPT account's Codex reading (samePlanAllowances).
 func Allowances(agent string) map[string]Allowance {
+	m := readAllowances(agent)
+	if agent == ChatGPTAPIID {
+		m = samePlanAllowances(m)
+	}
+	return m
+}
+
+// readAllowances is Allowances as agent's own readings tell it.
+func readAllowances(agent string) map[string]Allowance {
 	c := &usedCache
 	c.Lock()
 	if c.m == nil {
@@ -752,7 +956,7 @@ func Allowances(agent string) map[string]Allowance {
 		done = make(chan struct{})
 		c.loading[agent] = done
 		began := c.generation
-		go func() {
+		goRead(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			share := renewalShare(agent) // read before the lock: it reads providers.json
@@ -786,7 +990,7 @@ func Allowances(agent string) map[string]Allowance {
 				}
 				c.read[key] = st
 			}
-			var renewed, restarts []string
+			var renewed, restarts, credits []string
 			for user, a := range all {
 				key := agent + "/" + strings.ToLower(user)
 				if c.renewed[key] > began {
@@ -802,6 +1006,11 @@ func Allowances(agent string) map[string]Allowance {
 					}
 					if a.startedAgain(was.a, was.at, share, now) {
 						restarts = append(restarts, user)
+					}
+					if a.OnCredits() && !was.a.OnCredits() {
+						// credits it was not read to hold: bought once
+						// its allowance ran out (NoteCodexCredits)
+						credits = append(credits, user)
 					}
 				}
 				c.seen[key] = reading{a, now}
@@ -837,8 +1046,13 @@ func Allowances(agent string) map[string]Allowance {
 			for _, user := range restarts {
 				tellStarted(agent, user)
 			}
+			for _, user := range credits {
+				if agent != "codex" || CodexCredits(user) {
+					tellCredits(agent, user)
+				}
+			}
 			close(done)
-		}()
+		})
 	}
 	_, known := c.m[agent]
 	c.Unlock()
@@ -880,7 +1094,7 @@ func ReadUsageNow(ctx context.Context, agent string, users ...string) bool {
 	}
 	c := &usedCache
 	for range 3 {
-		Allowances(agent)
+		readAllowances(agent)
 		c.Lock()
 		done, back := c.loading[agent], !c.at[agent].IsZero()
 		c.Unlock()
@@ -988,7 +1202,7 @@ func AwaitAllowance(ctx context.Context, agent, user string) bool {
 		return false
 	}
 	for range 3 {
-		Allowances(agent)
+		readAllowances(agent)
 		c.Lock()
 		done := c.loading[agent]
 		c.Unlock()
@@ -1169,7 +1383,9 @@ func allowanceOf(ws []QuotaWindow, now time.Time) Allowance {
 		if !w.Aside || w.Text || w.Model != "" || w.PoolWindow() {
 			continue
 		}
-		al := Limit{Used: w.Used, Span: w.Span, Name: w.Name, Resets: resets(w), aside: true}
+		// with its count, so a cap of an amount of its unit holds too
+		al := Limit{Used: w.Used, Span: w.Span, Name: w.Name, Resets: resets(w), aside: true,
+			Amount: w.Amount, Of: w.Limit, Unit: w.Unit, extra: w.Extra}
 		for i := range a {
 			a[i].pool = append(a[i].pool, al)
 		}

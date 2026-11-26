@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yetone/magpie/internal/stall"
 	"github.com/yetone/magpie/internal/testenv"
 )
 
@@ -66,8 +67,8 @@ func bunReleases(t *testing.T, exe []byte) *atomic.Int32 {
 	return &asked
 }
 
-// bunHome gives the test its own magpie folders, no $MAGPIE_BUN, and Bun's
-// newest release as given.
+// bunHome gives the test its own magpie folders, no $MAGPIE_BUN, no Bun
+// on PATH taken, and Bun's newest release as given.
 func bunHome(t *testing.T, latest string, published time.Time) {
 	t.Helper()
 	dir := t.TempDir()
@@ -80,6 +81,10 @@ func bunHome(t *testing.T, latest string, published time.Time) {
 	old := bunLatest
 	bunLatest = func(context.Context) (string, time.Time, error) { return latest, published, nil }
 	t.Cleanup(func() { bunLatest = old })
+	// nor a Bun on the machine's PATH to fall back on
+	oldPath := pathBuns
+	pathBuns = func() []string { return nil }
+	t.Cleanup(func() { pathBuns = oldPath })
 }
 
 func stubTry(t *testing.T, f func(exe, v string) error) {
@@ -344,5 +349,26 @@ func TestDownloadBunDefaultSkipsOfficialSums(t *testing.T) {
 	}
 	if zipAsked.Load() != 1 {
 		t.Fatalf("zip asked %d times", zipAsked.Load())
+	}
+}
+
+// Bun's download has no bound on the whole (#5572); a server that goes
+// silent part way is ended by the stall, said as one.
+func TestBunDownloadThatGoesSilentIsAStall(t *testing.T) {
+	old := downloadStall
+	downloadStall = 100 * time.Millisecond
+	t.Cleanup(func() { downloadStall = old })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		w.Write([]byte("PK"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := getURL(ctx, srv.URL+"/bun.zip", 1<<20)
+	if !errors.Is(err, stall.ErrStalled) || ctx.Err() != nil {
+		t.Fatalf("err = %v, want a stall", err)
 	}
 }

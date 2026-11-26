@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"unicode"
@@ -19,6 +18,7 @@ import (
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // Subagents (#2283) are agents of their own the main agent hands a task
@@ -27,8 +27,8 @@ import (
 // as a file of that agent's own, in its own folder and shape (each read
 // from the agent's source or binary):
 //
-//	Claude Code     <claude dir>/agents/<name>.md      name, description, skills, mcpServers; the prompt below
-//	Codex           <codex home>/agents/<name>.toml    name, description, model, developer_instructions
+//	Claude Code     <claude dir>/agents/<name>.md      name, description, skills, mcpServers, effort; the prompt below
+//	Codex           <codex home>/agents/<name>.toml    name, description, model, model_reasoning_effort, developer_instructions
 //	OpenCode        <config>/agents/<name>.md          description, mode: subagent; named by its file
 //	Gemini CLI      ~/.gemini/agents/<name>.md         name, description
 //	Qwen Code       <qwen home>/agents/<name>.md       name, description
@@ -45,7 +45,17 @@ import (
 // (codex-rs core/src/agent/child_config.rs, apply_spawn_agent_role after
 // apply_requested_spawn_agent_model_overrides), so the subagent's
 // requests carry it. Every other agent's subagent runs on the model that
-// agent picks for it (the page says so). What magpie wrote is recorded file
+// agent picks for it (the page says so). A subagent's reasoning effort
+// (xuanbo1889245 on X) goes to Claude Code, as its agent file's effort
+// (low, medium, high, xhigh, max or a number, in its agent frontmatter
+// schema), and to Codex, as the role's model_reasoning_effort, which
+// role.rs's AgentRoleOverrides puts over the spawn's and tells the lead
+// can't be changed. Grok Build checks an agent file's effort (minimal and
+// none fail the file), but a run with one as its agent sent no effort of it,
+// so it is given none until that is seen to work (#7465); OpenCode, Droid,
+// Gemini CLI, Qwen Code, Cursor (whose reader takes name, description,
+// model, readonly, background and tools) and Copilot CLI read no effort
+// from a subagent's file. What magpie wrote is recorded file
 // by file with its hash (Applied.Subagents): a file still as magpie wrote
 // it is magpie's to rewrite or remove, one the user changed is theirs from
 // then on, and a file by that name magpie didn't write is never touched.
@@ -53,14 +63,27 @@ import (
 // Subagent is one the agents ticked for it are given.
 type Subagent struct {
 	Name        string `json:"name"`
+	Bundle      string `json:"bundle,omitempty"` // the plugin it came with (plugin.go)
 	Description string `json:"description"`
 	Prompt      string `json:"prompt"`
 	// Model is the model or routing group the subagent runs on, as the
 	// agent names it; "" leaves it to the agent
-	Model  string   `json:"model,omitempty"`
+	Model string `json:"model,omitempty"`
+	// Effort is the reasoning effort it runs at, one of SubagentEfforts;
+	// "" leaves it to the agent
+	Effort string   `json:"effort,omitempty"`
 	Skills []string `json:"skills,omitempty"`
 	MCP    []string `json:"mcp,omitempty"`
 	Agents []string `json:"agents"`
+	// From is the file it was imported from, its Path the file's in the
+	// repository, and FromHash what it said then (subagent_import.go)
+	From     *Source `json:"from,omitempty"`
+	FromHash string  `json:"fromHash,omitempty"`
+	// File is a file of the user's own it is kept in on this computer,
+	// "" for the library's; FileHash what the file said when magpie last
+	// wrote or took it in (subagent_file.go)
+	File     string `json:"file,omitempty"`
+	FileHash string `json:"fileHash,omitempty"`
 }
 
 // SubagentFile is a file magpie wrote for a subagent, and the hash of what
@@ -74,7 +97,7 @@ type SubagentFile struct {
 // subagentNameRe is a name every agent takes: Cursor's and CodeBuddy's
 // are lowercase letters, digits and -, Qwen Code's 2 to 50 characters
 // that neither start nor end with - (validateName in its subagents).
-var subagentNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$`)
+var subagentNameRe = lazyre.New(`^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$`)
 
 // reservedSubagents are names Qwen Code keeps for itself.
 var reservedSubagents = []string{"self", "system", "user", "model", "tool", "config", "default", "main"}
@@ -84,6 +107,10 @@ const (
 	maxSubagentPrompt      = 100_000
 	maxSubagentModel       = 200
 )
+
+// SubagentEfforts are the efforts a subagent may be set to run at, each
+// one Claude Code's agent frontmatter and Codex's ReasoningEffort take.
+var SubagentEfforts = []string{"low", "medium", "high", "xhigh", "max"}
 
 // SubagentAgents are the agents a subagent can be given, in the order the
 // page lists them.
@@ -95,9 +122,10 @@ type subagentSpec struct {
 	ext string
 	// skills and mcp: the agent's file names the subagent's own; one
 	// without uses all the agent has. model: it names the subagent's
-	// model; one without runs it on the model the agent picks
-	skills, mcp, model bool
-	render             func(s *Subagent, skills, mcp []string) []byte
+	// model; one without runs it on the model the agent picks. effort:
+	// it names the effort the subagent runs at
+	skills, mcp, model, effort bool
+	render                     func(s *Subagent, skills, mcp []string) []byte
 }
 
 func (sp *subagentSpec) path(name string) string { return filepath.Join(sp.dir, name+sp.ext) }
@@ -130,12 +158,15 @@ func subagentSpecOf(t *Target) (*subagentSpec, string) {
 			if len(mcp) > 0 {
 				kv = append(kv, [2]string{"mcpServers", yamlList(mcp)})
 			}
+			if s.Effort != "" {
+				kv = append(kv, [2]string{"effort", s.Effort})
+			}
 			return kv
 		})
-		sp.skills, sp.mcp = true, true
+		sp.skills, sp.mcp, sp.effort = true, true, true
 		return sp, ""
 	case "codex":
-		return &subagentSpec{dir: filepath.Join(codexDir(), "agents"), ext: ".toml", render: codexRole, model: true}, ""
+		return &subagentSpec{dir: filepath.Join(codexDir(), "agents"), ext: ".toml", render: codexRole, model: true, effort: true}, ""
 	case "opencode":
 		// named by its file; mode subagent is for the main agent to call
 		return md(filepath.Join(filepath.Dir(a.Path), "agents"), func(s *Subagent, _, _ []string) [][2]string {
@@ -204,15 +235,17 @@ func frontmatter(kv [][2]string, body string) []byte {
 // developer_instructions, each required, and the model it runs on when
 // one is set. The file is a config layer (RawAgentRoleFileToml flattens
 // ConfigToml), and its model is put over the lead's pick
-// (AgentRoleOverrides in core/src/agent/role.rs). A subagent with no
-// model is written as it was before there was one.
+// (AgentRoleOverrides in core/src/agent/role.rs), as is its
+// model_reasoning_effort. A subagent with no model or effort is written
+// as it was before there was one.
 func codexRole(s *Subagent, _, _ []string) []byte {
 	b, _ := toml.Marshal(struct {
 		Name                  string `toml:"name"`
 		Description           string `toml:"description"`
 		Model                 string `toml:"model,omitempty"`
+		Effort                string `toml:"model_reasoning_effort,omitempty"`
 		DeveloperInstructions string `toml:"developer_instructions,multiline"`
-	}{s.Name, s.Description, s.Model, strings.TrimRight(s.Prompt, "\n") + "\n"})
+	}{s.Name, s.Description, s.Model, s.Effort, strings.TrimRight(s.Prompt, "\n") + "\n"})
 	return b
 }
 
@@ -243,6 +276,9 @@ func (s *Subagent) check() error {
 	if len(s.Model) > maxSubagentModel || strings.ContainsFunc(s.Model, unicode.IsSpace) {
 		return fmt.Errorf("subagent model %q: a model's id, without spaces, of at most %d bytes", s.Model, maxSubagentModel)
 	}
+	if s.Effort != "" && !slices.Contains(SubagentEfforts, s.Effort) {
+		return fmt.Errorf("subagent effort %q: one of %s", s.Effort, strings.Join(SubagentEfforts, ", "))
+	}
 	for _, a := range s.Agents {
 		if base, _, _ := strings.Cut(a, "@wsl:"); !slices.Contains(SubagentAgents, base) {
 			return fmt.Errorf("%s can't be given subagents", a)
@@ -261,7 +297,7 @@ func (l *Library) subagent(name string) *Subagent {
 }
 
 // renderSubagent is s as an agent's file: of its skills and servers,
-// those the library still has.
+// those the library still has, a server turned off (ServerOn) left out.
 func (l *Library) renderSubagent(sp *subagentSpec, s *Subagent) []byte {
 	var skills, mcp []string
 	if sp.skills {
@@ -273,7 +309,7 @@ func (l *Library) renderSubagent(sp *subagentSpec, s *Subagent) []byte {
 	}
 	if sp.mcp {
 		for _, n := range s.MCP {
-			if l.server(n) != nil {
+			if x := l.server(n); x != nil && !x.Hidden {
 				mcp = append(mcp, n)
 			}
 		}
@@ -300,29 +336,52 @@ func (l *Library) syncSubagents(t *Target, b *backups, res *Result) {
 		}
 		return
 	}
-	wanted := map[string]*Subagent{} // path → the subagent written there
-	for _, s := range want {
-		wanted[sp.path(s.Name)] = s
+	files := make([]ownFile, len(want))
+	for i, s := range want {
+		files[i] = ownFile{name: s.Name, path: sp.path(s.Name), body: func() []byte { return l.renderSubagent(sp, s) }}
+	}
+	a.Subagents = syncOwnFiles(t, "subagent", a.Subagents, files, b, res)
+}
+
+// ownFile is a file of its own magpie wants an agent to have, for the
+// library's item called name: at path, with what body renders.
+type ownFile struct {
+	name, path string
+	body       func() []byte
+}
+
+// syncOwnFiles writes each file wanted, and takes out every one magpie
+// wrote before (had) that is wanted no more, for subagents and slash
+// commands alike. A file still as magpie wrote it (its hash) is magpie's
+// to rewrite or remove; one the user changed is theirs from then on; one
+// by that name magpie didn't write is never touched, and is a problem
+// under noun:name, unless it says what magpie would write, when it is
+// taken as magpie's. It returns what magpie wrote, sorted by path.
+func syncOwnFiles(t *Target, noun string, had []SubagentFile, want []ownFile, b *backups, res *Result) []SubagentFile {
+	id := t.Agent.ID
+	wanted := map[string]*ownFile{} // path → the file wanted there
+	for i := range want {
+		wanted[want[i].path] = &want[i]
 	}
 	done := map[string]bool{}
 	var kept []SubagentFile
-	write := func(s *Subagent, path string, body []byte) bool {
+	write := func(name, path string, body []byte) bool {
 		if err := b.keep(id, path); err != nil {
-			res.fail(id, "subagent:"+s.Name, err)
+			res.fail(id, noun+":"+name, err)
 			return false
 		}
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			res.fail(id, "subagent:"+s.Name, err)
+			res.fail(id, noun+":"+name, err)
 			return false
 		}
 		if err := edit.WriteAtomic(path, body); err != nil {
-			res.fail(id, "subagent:"+s.Name, err)
+			res.fail(id, noun+":"+name, err)
 			return false
 		}
 		res.changed(id)
 		return true
 	}
-	for _, f := range a.Subagents {
+	for _, f := range had {
 		cur, err := os.ReadFile(f.Path)
 		switch {
 		case os.IsNotExist(err):
@@ -331,7 +390,7 @@ func (l *Library) syncSubagents(t *Target, b *backups, res *Result) {
 		case err != nil:
 			// can't tell whether it is still magpie's: left, and kept on
 			// record, untouched
-			res.fail(id, "subagent:"+f.Name, err)
+			res.fail(id, noun+":"+f.Name, err)
 			kept = append(kept, f)
 			done[f.Path] = true
 			continue
@@ -340,15 +399,15 @@ func (l *Library) syncSubagents(t *Target, b *backups, res *Result) {
 			// the loop below says if the library still wants that name
 			continue
 		}
-		s := wanted[f.Path]
-		if s == nil {
+		w := wanted[f.Path]
+		if w == nil {
 			if err := b.keep(id, f.Path); err != nil {
-				res.fail(id, "subagent:"+f.Name, err)
+				res.fail(id, noun+":"+f.Name, err)
 				kept = append(kept, f)
 				continue
 			}
 			if err := os.Remove(f.Path); err != nil && !os.IsNotExist(err) {
-				res.fail(id, "subagent:"+f.Name, err)
+				res.fail(id, noun+":"+f.Name, err)
 				kept = append(kept, f)
 				continue
 			}
@@ -356,39 +415,41 @@ func (l *Library) syncSubagents(t *Target, b *backups, res *Result) {
 			continue
 		}
 		done[f.Path] = true
-		body := l.renderSubagent(sp, s)
-		if !bytes.Equal(cur, body) && !write(s, f.Path, body) {
+		body := w.body()
+		if !bytes.Equal(cur, body) && !write(w.name, f.Path, body) {
 			kept = append(kept, f)
 			continue
 		}
-		kept = append(kept, SubagentFile{Name: s.Name, Path: f.Path, Hash: subagentHash(body)})
+		kept = append(kept, SubagentFile{Name: w.name, Path: f.Path, Hash: subagentHash(body)})
 	}
-	for _, s := range want {
-		path := sp.path(s.Name)
-		if done[path] {
+	for _, w := range want {
+		if done[w.path] {
 			continue
 		}
-		body := l.renderSubagent(sp, s)
-		cur, err := os.ReadFile(path)
+		body := w.body()
+		cur, err := os.ReadFile(w.path)
 		switch {
 		case err == nil && bytes.Equal(cur, body):
 			// the same as magpie would write: taken as magpie's
 		case err == nil:
-			res.fail(id, "subagent:"+s.Name, fmt.Errorf("%s has a subagent of its own at %s, which magpie leaves as it is", t.Agent.Name, path))
+			res.fail(id, noun+":"+w.name, fmt.Errorf("%s has a %s of its own at %s, which magpie leaves as it is", t.Agent.Name, ownNoun[noun], w.path))
 			continue
 		case !os.IsNotExist(err):
-			res.fail(id, "subagent:"+s.Name, err)
+			res.fail(id, noun+":"+w.name, err)
 			continue
 		default:
-			if !write(s, path, body) {
+			if !write(w.name, w.path, body) {
 				continue
 			}
 		}
-		kept = append(kept, SubagentFile{Name: s.Name, Path: path, Hash: subagentHash(body)})
+		kept = append(kept, SubagentFile{Name: w.name, Path: w.path, Hash: subagentHash(body)})
 	}
 	slices.SortFunc(kept, func(x, y SubagentFile) int { return strings.Compare(x.Path, y.Path) })
-	a.Subagents = kept
+	return kept
 }
+
+// ownNoun is how a problem names what is in the agent's way.
+var ownNoun = map[string]string{"subagent": "subagent", "command": "slash command", "rule": "rule"}
 
 // ---- changes ---------------------------------------------------------------
 
@@ -399,6 +460,7 @@ func SaveSubagent(old string, s Subagent) (*Result, error) {
 	s.Description = strings.Join(strings.Fields(s.Description), " ")
 	s.Prompt = strings.TrimRight(strings.ReplaceAll(s.Prompt, "\r\n", "\n"), " \n\t")
 	s.Model = strings.TrimSpace(s.Model)
+	s.Effort = strings.ToLower(strings.TrimSpace(s.Effort))
 	if err := s.check(); err != nil {
 		return nil, err
 	}
@@ -406,12 +468,42 @@ func SaveSubagent(old string, s Subagent) (*Result, error) {
 		if s.Name != old && l.subagent(s.Name) != nil {
 			return fmt.Errorf("the library already has a subagent called %s", s.Name)
 		}
+		file, err := l.ownSubagentPath(s.Name, s.File)
+		if err != nil {
+			return err
+		}
+		s.From, s.FromHash, s.File, s.FileHash = nil, "", file, ""
 		if old != "" {
 			i := slices.IndexFunc(l.Subagents, func(x *Subagent) bool { return x.Name == old })
 			if i < 0 {
 				return fmt.Errorf("no subagent called %s", old)
 			}
+			was := l.Subagents[i]
+			// where it was imported from stays, its edits telling an
+			// import again to leave it alone
+			s.From, s.FromHash = was.From.clone(), was.FromHash
+			if was.file() == s.file() {
+				s.FileHash = was.FileHash
+			} else {
+				dropSubagentFile(was)
+			}
 			l.Subagents = slices.Delete(l.Subagents, i, i+1)
+			if old != s.Name {
+				l.renameProjectSubagents(old, s.Name)
+			}
+		}
+		// a file of the user's own that is there already is what it says
+		if file != "" && s.FileHash == "" {
+			if b, err := os.ReadFile(file); err == nil {
+				x, err := readOwnSubagent(s.Name, b)
+				if err != nil {
+					return fmt.Errorf("%s: %v", file, err)
+				}
+				s.Description, s.Prompt, s.Model, s.Effort, s.Skills, s.MCP = x.Description, x.Prompt, x.Model, x.Effort, x.Skills, x.MCP
+				s.FileHash = subagentHash(b)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
 		}
 		s.Skills = slices.Compact(slices.Sorted(slices.Values(s.Skills)))
 		s.MCP = slices.Compact(slices.Sorted(slices.Values(s.MCP)))
@@ -450,7 +542,13 @@ func RemoveSubagents(names []string) (*Result, error) {
 				return fmt.Errorf("no subagent called %s", n)
 			}
 		}
-		l.Subagents = slices.DeleteFunc(l.Subagents, func(s *Subagent) bool { return slices.Contains(names, s.Name) })
+		l.Subagents = slices.DeleteFunc(l.Subagents, func(s *Subagent) bool {
+			if slices.Contains(names, s.Name) {
+				dropSubagentFile(s)
+				return true
+			}
+			return false
+		})
 		return nil
 	})
 }
@@ -462,6 +560,10 @@ type SubagentView struct {
 	*Subagent
 	// Files are, for each agent it was written to, the file
 	Files map[string]string `json:"files,omitempty"`
+	// Path is the file it is kept in on this computer, to edit it in;
+	// FileError why an edit there wasn't taken in
+	Path      string `json:"path,omitempty"`
+	FileError string `json:"fileError,omitempty"`
 	// Problems are the agents it couldn't be given to, and why
 	Problems map[string]string `json:"problems,omitempty"`
 }
@@ -480,6 +582,9 @@ type SubagentAgentView struct {
 	// Model: its subagents run on a model of their own when one is set;
 	// one that doesn't runs them on the model the agent picks
 	Model bool `json:"model,omitempty"`
+	// Effort: its subagents run at an effort of their own when one is
+	// set; one that doesn't runs them at the agent's
+	Effort bool `json:"effort,omitempty"`
 }
 
 // subagentsView is the Subagents page for these agents, and those in
@@ -496,7 +601,7 @@ func (l *Library) subagentsView(targets []*Target, asleep []*agent.Agent, of fun
 		sp, why := subagentSpecOf(t)
 		av := SubagentAgentView{ID: t.Agent.ID, No: why, WSL: t.Agent.WSL != ""}
 		if sp != nil {
-			av.Dir, av.Skills, av.MCP, av.Model = sp.dir, sp.skills, sp.mcp, sp.model
+			av.Dir, av.Skills, av.MCP, av.Model, av.Effort = sp.dir, sp.skills, sp.mcp, sp.model, sp.effort
 		}
 		agents = append(agents, av)
 	}
@@ -509,7 +614,8 @@ func (l *Library) subagentsView(targets []*Target, asleep []*agent.Agent, of fun
 	for _, s := range l.Subagents {
 		c := *s
 		c.Agents = orNone(c.Agents)
-		sv := SubagentView{Subagent: &c, Problems: of("subagent:" + s.Name)}
+		sv := SubagentView{Subagent: &c, Problems: of("subagent:" + s.Name), Path: s.file(), FileError: subagentFileError(s)}
+		c.FileHash = ""
 		for id, a := range l.Applied {
 			for _, f := range a.Subagents {
 				if f.Name == s.Name && slices.Contains(s.Agents, id) {

@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/proc"
 )
 
@@ -88,14 +88,14 @@ var ActionMenus = []string{"provider", "agent"}
 
 // actionID is what an action's id is: short, of lower-case letters,
 // digits and dashes, so the page can switch on it
-var actionID = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
+var actionID = lazyre.New(`^[a-z0-9][a-z0-9-]{0,39}$`)
 
 // maxActions is how many actions one plugin adds, at most.
 const maxActions = 8
 
 // PageReads are the reads a plugin's page can be granted, each in
 // magpie.permissions. None of them carries a secret.
-var PageReads = []string{"usage:summary", "providers:list"}
+var PageReads = []string{"usage:summary", "usage:day", "providers:list"}
 
 // PanelSlots are the places in magpie's own pages a plugin's panel can
 // go: under the Agents page's list, at the end of the Usage page, on
@@ -353,6 +353,9 @@ func FileIn(dir, rel string) (string, bool) {
 // starts the host again for it.
 func SetPageOptions(spec string, opts map[string]any) error {
 	t := Target(spec)
+	if p, _ := PrivacyModels(t); p != nil {
+		return SetOptions(spec, opts)
+	}
 	if mw, _ := Middleware(t); mw != "" {
 		return SetOptions(spec, opts)
 	}
@@ -366,8 +369,12 @@ func SetPageOptions(spec string, opts map[string]any) error {
 	if w, only := Window(t); w == nil || !only {
 		return SetOptions(spec, opts)
 	}
+	// under plugins.json's lock too, as SetOptions is: another magpie's
+	// change saved meanwhile stands (#4666)
+	listFileMu.Lock()
 	listMu.Lock()
 	defer listMu.Unlock()
+	defer listFileMu.Unlock()
 	l := Load()
 	i := indexOf(l, spec)
 	if i < 0 {

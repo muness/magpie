@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"cmp"
 	"errors"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/tidwall/gjson"
@@ -20,6 +22,7 @@ import (
 type socketTurn struct {
 	header http.Header
 	msg    []byte
+	socket int // which handshake, from 1
 }
 
 // fakeSocketBackend stands in for the ChatGPT backend: a turn over its
@@ -41,10 +44,20 @@ type fakeSocketBackend struct {
 	// closeWith, when set, closes the socket with that status after the
 	// frames, instead of a normal close
 	closeWith websocket.StatusCode
+	// keep reads the socket's next turn after a reply, as the backend
+	// does, until the client closes it
+	keep bool
+	// path is the Responses path it answers at, chatgpt.com's when "";
+	// whole has its HTTP reply run to response.completed
+	path  string
+	whole bool
+	// hold is how long a turn waits before its first frame, as the
+	// backend thinking before it answers
+	hold time.Duration
 }
 
 func (f *fakeSocketBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses") {
+	if !strings.HasSuffix(r.URL.Path, cmp.Or(f.path, "/backend-api/codex/responses")) {
 		http.NotFound(w, r)
 		return
 	}
@@ -63,22 +76,29 @@ func (f *fakeSocketBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// before Read returns
 		f.mu.Lock()
 		f.handshakes++
+		n := f.handshakes
 		f.mu.Unlock()
 		c.SetReadLimit(-1)
 		if f.limit > 0 {
 			c.SetReadLimit(f.limit)
 		}
-		_, msg, err := c.Read(r.Context())
-		if err != nil {
-			return
-		}
-		turn := socketTurn{header: r.Header.Clone(), msg: msg}
-		f.mu.Lock()
-		f.sockets = append(f.sockets, turn)
-		f.mu.Unlock()
-		for _, fr := range f.frames(turn) {
-			if c.Write(r.Context(), websocket.MessageText, []byte(fr)) != nil {
+		for {
+			_, msg, err := c.Read(r.Context())
+			if err != nil {
 				return
+			}
+			turn := socketTurn{header: r.Header.Clone(), msg: msg, socket: n}
+			f.mu.Lock()
+			f.sockets = append(f.sockets, turn)
+			f.mu.Unlock()
+			time.Sleep(f.hold)
+			for _, fr := range f.frames(turn) {
+				if c.Write(r.Context(), websocket.MessageText, []byte(fr)) != nil {
+					return
+				}
+			}
+			if !f.keep {
+				break
 			}
 		}
 		if f.closeWith != 0 {
@@ -92,6 +112,14 @@ func (f *fakeSocketBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.posts++
 	f.mu.Unlock()
+	if f.whole {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, sse(
+			`event: response.created`+"\n"+`data: {"type":"response.created","response":{"id":"h1"}}`,
+			`event: response.output_text.delta`+"\n"+`data: {"type":"response.output_text.delta","delta":"pong"}`,
+			`event: response.completed`+"\n"+`data: {"type":"response.completed","response":{"id":"h1","usage":{"input_tokens":7,"output_tokens":1}}}`))
+		return
+	}
 	w.Header()["Content-Type"] = nil
 	io.WriteString(w, sse(
 		`event: response.created`+"\n"+`data: {"type":"response.created","response":{"id":"r1"}}`,
@@ -111,9 +139,11 @@ func socketOn(t *testing.T) {
 	codexSocketOff.Store(false)
 	t.Cleanup(func() {
 		codexSocketOff.Store(true)
+		codexKeepDrain()
 		codexShunMu.Lock()
 		clear(codexShun)
 		clear(codexTooBig)
+		clear(codexNoDelta)
 		codexShunMu.Unlock()
 	})
 }

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Library · magpie docs</title>
+<title>Library: MCP servers, skills, hooks and subagents for every coding agent · magpie</title>
 <meta name="description" content="How magpie's Library works: where it writes instructions, MCP servers, skills, hooks and subagents for each agent, and how subagent models are picked.">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fafafa">
@@ -39,6 +39,54 @@
 <meta property="og:image" content="https://usemagpie.ai/img/og.png">
 <meta property="og:url" content="https://usemagpie.ai/docs/library">
 <meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "TechArticle",
+   "headline": "Library",
+   "description": "How magpie's Library works: where it writes instructions, MCP servers, skills, hooks and subagents for each agent, and how subagent models are picked.",
+   "inLanguage": "en",
+   "url": "https://usemagpie.ai/docs/library",
+   "about": {
+    "@type": "SoftwareApplication",
+    "name": "magpie",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS, Windows, Linux"
+   },
+   "publisher": {
+    "@type": "Organization",
+    "name": "magpie",
+    "url": "https://usemagpie.ai/"
+   }
+  },
+  {
+   "@type": "BreadcrumbList",
+   "itemListElement": [
+    {
+     "@type": "ListItem",
+     "position": 1,
+     "name": "magpie",
+     "item": "https://usemagpie.ai/"
+    },
+    {
+     "@type": "ListItem",
+     "position": 2,
+     "name": "Docs",
+     "item": "https://usemagpie.ai/docs/start"
+    },
+    {
+     "@type": "ListItem",
+     "position": 3,
+     "name": "Library",
+     "item": "https://usemagpie.ai/docs/library"
+    }
+   ]
+  }
+ ]
+}
+</script>
 </head>
 <body>
 
@@ -55,6 +103,13 @@
     <a class="toc-only" href="/docs/masking">Privacy masking</a>
     <a class="toc-only" href="/docs/mcp-router">MCP router</a>
     <a class="toc-only" href="/docs/library">Library</a>
+    <a class="toc-only" href="/docs/claude-code-models">Models in Claude Code</a>
+    <a class="toc-only" href="/docs/codex-models">Models in Codex</a>
+    <a class="toc-only" href="/docs/gemini-cli-models">Models in Gemini CLI</a>
+    <a class="toc-only" href="/docs/subscriptions">Subscriptions in any agent</a>
+    <a class="toc-only" href="/docs/local-models">Local models</a>
+    <a class="toc-only" href="/docs/opencode-models">Models in OpenCode</a>
+    <a class="toc-only" href="/docs/alternatives">magpie vs CC Switch vs CCR</a>
     <a href="/docs/import">Add to magpie</a>
     <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie-releases/releases">Releases</a>
@@ -85,6 +140,7 @@
     <a href="#models">Subagent models</a>
     <a href="#hooks">Hooks</a>
     <a href="#rtk">RTK</a>
+    <a href="#billion-context">billion-context</a>
     <a href="#touch">What magpie touches</a>
   </aside>
 
@@ -92,7 +148,7 @@
     <p class="eyebrow" id="overview">Docs · Library</p>
     <h1>Library</h1>
     <p class="lede">magpie’s <span class="ui">Library</span> keeps instructions, MCP servers, skills, hooks and subagents in one place, and writes each of them into every agent you tick for it, in that agent’s own files and format. The agents read those files as they always do. magpie adds no layer between an agent and what it is given: the agent itself decides when to use a skill, an MCP tool or a subagent.</p>
-    <p>The page has six tabs: <span class="ui">Instructions</span>, <span class="ui">MCP servers</span>, <span class="ui">Skills</span>, <span class="ui">Hooks</span>, <span class="ui">Subagents</span> and <span class="ui">RTK</span>. Each item has a row of agents; tick an agent to give it the item, untick it to take it away. An agent reads the change when it starts again.</p>
+    <p>The page has seven tabs: <span class="ui">Instructions</span>, <span class="ui">MCP servers</span>, <span class="ui">Skills</span>, <span class="ui">Hooks</span>, <span class="ui">Subagents</span>, <span class="ui">RTK</span> and <span class="ui">billion-context</span>. Each item has a row of agents; tick an agent to give it the item, untick it to take it away. An agent reads the change when it starts again.</p>
 
     <h2 id="where"><a class="anchor" href="#where">Where it is kept</a></h2>
     <ul>
@@ -151,6 +207,7 @@ magpie library sync     # write it into the agents again</pre>
       <li><b>Single tools off.</b> You can turn off tools one by one for Codex, Gemini CLI, Crush, Hermes Agent, Claude Code and OpenCode, each in its own setting. Every other agent gets the whole server.</li>
       <li><b>Sign-in.</b> A server that needs OAuth is signed in to once, in magpie. Agents then reach it through magpie’s gateway at <code>/mcp/&lt;name&gt;</code>.</li>
       <li><b>This computer only.</b> Turn off <span class="ui">Sync to your other computers</span> for a server that should stay here (<code>magpie library mcp local &lt;name&gt; on</code>).</li>
+      <li><b>Another command here.</b> For a synced server whose program sits elsewhere on this computer (a Mac and WSL), click <span class="ui">Use another command on this computer</span> under its command. Its name, agents and note still sync; your other computers keep running theirs (<code>magpie library mcp here &lt;name&gt; &lt;command…&gt;</code>).</li>
     </ul>
     <p>With the <a href="/docs/mcp-router">MCP router</a> on, each agent gets one server named <code>magpie</code> in place of these entries, and magpie runs each command server once for all of them. It is off by default.</p>
 
@@ -228,13 +285,20 @@ magpie library sync     # write it into the agents again</pre>
     <h2 id="rtk"><a class="anchor" href="#rtk">RTK</a></h2>
     <p>The RTK tab turns on <a href="https://www.rtk-ai.app/">RTK</a> per agent: the agent’s shell commands run through RTK, which shortens their output to save tokens. magpie can install RTK for you; turning it off works with RTK gone.</p>
 
+    <h2 id="billion-context"><a class="anchor" href="#billion-context">billion-context</a></h2>
+    <p>The billion-context tab turns on <a href="https://github.com/ranxianglei/billion-context">billion-context</a>’s plugin per agent: it folds older turns of a long session into summaries the model can open again, so the session stays inside the model’s window. It is offered for Pi, omp, OpenCode, Claude Code, Hermes, DeepSeek Harness and Zed, whose requests still go through magpie with it on. magpie can install it for you (<code>npm install -g billion-context --prefix=~/.local</code>) and runs its own installer and remover; turning it off puts back what the install changed in the agent’s settings. An agent turned on here can’t also run billion-context-pi or opencode-acp.</p>
+    <p>For Claude Code, billion-context’s install turns Claude Code’s own auto-compaction off. magpie turns it back on, so a session billion-context doesn’t fold, such as one in the Claude desktop app’s Code tab, compacts instead of stopping at “Prompt is too long”. A <code>DISABLE_AUTO_COMPACT</code> you set yourself is left as it is.</p>
+    <p>Zed has no billion-context plugin, and Hermes’ and DeepSeek Harness’ plugins only catch HTTPS traffic, which magpie’s local address isn’t. Turned on, magpie runs <code>bili start</code> and points the agent’s magpie provider at <code>http://127.0.0.1:8787/bili/</code> followed by magpie’s address, the route billion-context documents for any client; for Hermes and DeepSeek Harness, in every profile that has magpie’s provider. Pick one of magpie’s models for the agent on the Agents page first, and restart it after turning it on or off.</p>
+    <p>The card shows how many tokens billion-context saved, in its own count: the net savings its dashboard shows, after the rebuilds a fold causes and the summaries’ cost, with how many folds and sessions, over every session it ran on this computer. magpie asks a running billion-context for it (<code>/__bili/overview</code>); when none runs, the card shows the last count it read and when. It shows nothing until billion-context has run for an agent.</p>
+
     <h2 id="touch"><a class="anchor" href="#touch">What magpie touches</a></h2>
     <ul>
       <li>Only what it wrote: the text between its markers, entries it recorded, files it marked as its own.</li>
       <li>Never a file, entry or skill of yours with the same name. The page shows the clash and lets you choose.</li>
       <li>Anything it replaces goes to the backups first.</li>
     </ul>
-    <p>Projects can get skills and MCP servers too, in the project’s own folders (such as <code>.claude/skills</code>, <code>.agents/skills</code>, <code>.mcp.json</code> or <code>.codex/config.toml</code>).</p>
+    <p>Projects can get skills and MCP servers too, in the project’s own folders (such as <code>.claude/skills</code>, <code>.agents/skills</code>, <code>.mcp.json</code> or <code>.codex/config.toml</code>). From a terminal, <code>magpie library project add .</code> adds the folder you are in, <code>magpie library project skill add . pdf docx</code> gives it skills, <code>magpie library project skill rm . pdf</code> takes one away, and <code>magpie library project skills .</code> lists them. <code>magpie library project plugin on . superpowers</code> turns on, for this folder alone, a plugin Claude Code has installed (or a plugin in the library), <code>magpie library project plugin off . superpowers</code> turns it off again, and <code>magpie library project plugin .</code> lists which are on. To put a plugin in the library from a terminal, as Find plugins and Install do, run <code>magpie library plugin import ./my-plugin</code> with a folder (a Claude plugin, a Pi package or a marketplace), <code>owner/repo</code> or a git address; <code>agents=none</code> keeps it for projects alone, and <code>magpie library plugin</code> lists what the library has.</p>
+    <p>A project can have instructions of its own as well, so your shared instructions keep only what holds everywhere. On the Instructions page, open a project under the shared text and write what only it needs. magpie puts it between its two marker lines in the file each agent reads in that project: <code>CLAUDE.md</code> for Claude Code, <code>AGENTS.md</code> for Codex, Cursor and most others, <code>GEMINI.md</code> for Gemini CLI. The rest of the file stays yours. A file magpie makes is kept out of git, and turning an agent off takes its part out again. From a terminal: <code>magpie library project instructions . text "Use pnpm here."</code>, and <code>… agents claude,codex</code> or <code>… agents none</code>.</p>
   </article>
 </main>
 
@@ -251,6 +315,13 @@ magpie library sync     # write it into the agents again</pre>
     <a href="/docs/masking">Privacy masking</a>
     <a href="/docs/mcp-router">MCP router</a>
     <a href="/docs/library">Library</a>
+    <a href="/docs/claude-code-models">Models in Claude Code</a>
+    <a href="/docs/codex-models">Models in Codex</a>
+    <a href="/docs/gemini-cli-models">Models in Gemini CLI</a>
+    <a href="/docs/subscriptions">Subscriptions in any agent</a>
+    <a href="/docs/local-models">Local models</a>
+    <a href="/docs/opencode-models">Models in OpenCode</a>
+    <a href="/docs/alternatives">magpie vs CC Switch vs CCR</a>
     <a href="/docs/import">Add to magpie</a>
     <a href="/docs/integrate">Integrate</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>

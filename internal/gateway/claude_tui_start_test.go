@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/claudetui"
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/testenv"
 )
 
@@ -85,6 +87,10 @@ func TestClaudeTUIHungHelperNeverPrint(t *testing.T) {
 // and again, so the turn hung (lwjef on X). The turn goes in magpie's own
 // folder, told the caller's, and that folder is passed over for the
 // conversation's next turns rather than asked about again.
+//
+// The user's answers say the folder is trusted here, so the run goes
+// there first (untrustedHere); Claude Code asking all the same is the case
+// this test is about.
 func TestClaudeTUIUntrustedFolderAnswered(t *testing.T) {
 	caller := t.TempDir()
 	cwds := filepath.Join(t.TempDir(), "cwds")
@@ -93,6 +99,7 @@ func TestClaudeTUIUntrustedFolderAnswered(t *testing.T) {
   exit 1
 fi
 pwd >> '`+cwds+`'`)
+	trustInProfile(t, h, caller)
 	h.ask("Primary working directory: "+caller, "hi") // fails the test on anything but 200
 	b, _ := os.ReadFile(cwds)
 	ran := strings.Fields(string(b))
@@ -105,5 +112,63 @@ pwd >> '`+cwds+`'`)
 	h.ask("Primary working directory: "+caller, "another")
 	if n := helperStarts(started); n != 3 {
 		t.Fatalf("the helper started %d times, want three: the caller's folder was asked about again", n)
+	}
+}
+
+// An interactive mode that doesn't come up for what Claude Code waits on
+// is the same for a new Claude Code told the whole conversation: the turn
+// fails once, saying why. It was tried again, waited out another 45s, and
+// was answered 502 after twice that (sowhynot). A Claude Code that ended
+// itself before its prompt, as one that can't load the session it was
+// told to go on with does, is still tried again told the whole
+// conversation.
+func TestClaudeTUINoPromptNotTriedAgain(t *testing.T) {
+	for _, c := range []struct {
+		name, said string
+		starts     int
+	}{
+		{"no prompt", "Claude Code showed no prompt in 45s: nothing on its screen (0 bytes read)", 1},
+		{"ended itself", claudetui.EndedEarly + " (exit status 1): No conversation found", 2},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h, started := tuiHelperHarness(t, `echo "claude-tui: `+c.said+`" >&2
+exit 1`)
+			// a conversation no run here has had: replayed from a transcript
+			code, msg := h.askCode("rules", "hi", "again", "more")
+			if code == 200 || !strings.Contains(msg, c.said) {
+				t.Fatalf("%d %s", code, msg)
+			}
+			if n := helperStarts(started); n != c.starts {
+				t.Fatalf("the helper started %d times, want %d", n, c.starts)
+			}
+			if runs := h.runs(); len(runs) != 0 {
+				t.Fatalf("a -p Claude Code ran: %v", runs)
+			}
+		})
+	}
+}
+
+// A question Claude Code's interactive mode asked and the helper couldn't
+// get answered (the trust question, which Claude Code 2.1.329 asked
+// where the helper didn't see it) is asked the same under every account:
+// the turn is a 400 no account rests for, and the next account isn't
+// asked. It was a 502, and every account waited out its 45s in turn
+// before the client had it (@ahz2ygnhjmIJ0E0 on X).
+func TestClaudeTUIUnansweredQuestionIsNoAccountsFault(t *testing.T) {
+	said := "Claude Code asked whether to trust /work" + claudetui.Unanswered + "45s: Quick safety check ❯ No, exit Yes, I trust this folder"
+	h, started := tuiHelperHarness(t, `echo "claude-tui: `+said+`" >&2
+exit 1`)
+	body := `{"model":"claude-sonnet-5","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	var u Usage
+	rec := httptest.NewRecorder()
+	code, msg := h.s.serveClaudeSubscription(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)), provider.Anthropic, h.p, "claude-sonnet-5", []byte(body), &u)
+	if code != 400 || !strings.Contains(msg, said) {
+		t.Fatalf("%d %.300s", code, msg)
+	}
+	if retryable(code, rec.Body.Bytes()) {
+		t.Fatalf("the unanswered question is asked of the next account: %s", rec.Body.String())
+	}
+	if n := helperStarts(started); n != 1 {
+		t.Fatalf("the helper started %d times, want once", n)
 	}
 }

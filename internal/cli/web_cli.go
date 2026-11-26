@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/url"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/daemon"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/gui"
@@ -77,10 +79,20 @@ func webCmd(args []string) error {
 	// version manager put on PATH only in the shell's profile, as the app's
 	// does: a service or autostart has none of it (#3803)
 	proc.UserPath()
+	// a container's `magpie web` (the Docker docs' command) is its PID 1
+	// as `magpie serve` is, and is left the processes its children leave
+	// behind: a plugin's backend whose host ended stayed <defunct>, and
+	// the plugin took it for still running (swang20201 on X)
+	proc.KeepReaping(context.Background())
 	w, err := gui.StartWeb(addr, version)
 	if err != nil {
 		return err
 	}
+	// a SIGTERM drains, as serve's (serve_drain.go)
+	defer stopGatewayOnSignalAs(func(sig os.Signal) {
+		drainOnSignal(gui.ServedGateway(), sig)
+		w.Close()
+	})()
 	if !w.ServesGateway() {
 		// another magpie has the gateway (the service, magpie serve, the
 		// app): this page shows its settings and accounts, read from the
@@ -126,6 +138,9 @@ func answers(addr string) bool {
 // printWeb prints where a started page is, and what its link carries.
 func printWeb(w *gui.Web) {
 	fmt.Println(green.Render("●"), "magpie web on", bold.Render(w.Link))
+	if w.BoxLink != "" {
+		fmt.Println(muted.Render("  the LazyCat box's administrators, signed in to the box, open"), w.BoxLink, muted.Render("without the key"))
+	}
 	if l := tlsLine(); l != "" {
 		fmt.Println(l)
 	}
@@ -227,14 +242,22 @@ func serveCmd(args []string) error {
 		}
 	}
 	proc.UserPath() // as magpie web's (#3803)
+	proc.KeepReaping(context.Background())
 	if web == "" {
 		return serve()
 	}
 	go stats.Run(version, "serve")
+	// the models a Remote magpie's agents are on, as the app follows them
+	go agent.KeepFollowingRemote(context.Background(), 30*time.Second)
 	w, err := gui.StartWeb(web, version)
 	if err != nil {
 		return err
 	}
+	// a SIGTERM drains, as serve's (serve_drain.go)
+	defer stopGatewayOnSignalAs(func(sig os.Signal) {
+		drainOnSignal(gui.ServedGateway(), sig)
+		w.Close()
+	})()
 	public := advertisedURL()
 	fmt.Println(green.Render("●"), "magpie gateway on", bold.Render(gateway.URL()))
 	fmt.Println(muted.Render("  OpenAI  "), public+"/v1/chat/completions", muted.Render("·"), public+"/v1/responses")

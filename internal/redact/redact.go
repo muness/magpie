@@ -22,6 +22,8 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/json"
+	"html"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -33,6 +35,8 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/net/publicsuffix"
+
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // Options says what to mask.
@@ -55,6 +59,10 @@ type Options struct {
 	Kinds map[string]bool
 	// Model, where set, finds more in the texts to mask (model.go)
 	Model Model
+	// ModelGeneration is which build of Model this is: a plugin's model
+	// whose files or launcher changed (pii.Model's Generation) finds
+	// afresh what the old one found in a text sent before (sentSpans)
+	ModelGeneration string
 	// Route names where a request masked for a vendor may go (the gateway
 	// sets it: the providers a model, its fallbacks or a routing group's
 	// members are served by). A text sent on it before goes on it again
@@ -87,6 +95,9 @@ type Options struct {
 
 	// found are the spans Model found, by text, for one request's texts
 	found map[string][]Found
+	// args is masking a tool call's arguments (MaskJSON): the model's
+	// one-word name there is never taken for an app's (thingNamed)
+	args bool
 	// sent is masking for a vendor (Mask, MaskJSON): a text masked
 	// before on Route has the model's finds and the known values it had
 	// then (sentSpans)
@@ -117,7 +128,7 @@ func (o Options) covers(cat string) bool {
 // either side (a key inside a longer word is no key); ok checks it further.
 type rule struct {
 	kind    string
-	re      *regexp.Regexp
+	re      *lazyre.RE
 	markers []string // one of these is in any text it can match
 	// fold are markers too, looked for in the text in lower case, for a
 	// pattern that matches its words in any case (Passport, PASSPORT)
@@ -150,6 +161,10 @@ type rule struct {
 	// checks each
 	groups  []string
 	groupOK []func(string) bool
+	// may, where set, is a cheap scan that is true of any text the
+	// pattern can match, for a rule with no marker to look for: a run of
+	// 51 base58 letters
+	may func(string) bool
 }
 
 const (
@@ -159,26 +174,45 @@ const (
 )
 
 var rules = append([]rule{
-	{kind: "PRIVATE_KEY", re: regexp.MustCompile(`-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----[\s\S]+?-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----`), markers: []string{"PRIVATE KEY"}},
-	{kind: "API_KEY", re: regexp.MustCompile(`sk-(?:ant-|proj-|or-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}`), markers: []string{"sk-"}, bound: tokenCh, ok: notASlug},
+	{kind: "PRIVATE_KEY", re: lazyre.New(`-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----[\s\S]+?-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----`), markers: []string{"PRIVATE KEY"}},
+	{kind: "API_KEY", re: lazyre.New(`sk-(?:ant-|proj-|or-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}`), markers: []string{"sk-"}, bound: tokenCh, ok: notASlug},
 	// a gateway's or a relay's own: oc_sk_…, or_sk_… (#195)
-	{kind: "API_KEY", re: regexp.MustCompile(`[a-z]{2,4}_sk_[A-Za-z0-9_-]{20,}`), markers: []string{"_sk_"}, bound: tokenCh, ok: secretValue},
+	{kind: "API_KEY", re: lazyre.New(`[a-z]{2,4}_sk_[A-Za-z0-9_-]{20,}`), markers: []string{"_sk_"}, bound: tokenCh, ok: secretValue},
 	// Volcano Ark and the relays in front of it issue keys with an ark-
 	// prefix (#2946)
-	{kind: "API_KEY", re: regexp.MustCompile(`ark-[A-Za-z0-9][A-Za-z0-9_-]{15,}`), markers: []string{"ark-"}, bound: tokenCh, ok: secretValue},
-	{kind: "API_KEY", re: regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|glpat-[A-Za-z0-9_-]{20,})`), markers: []string{"gh", "github_pat_", "glpat-"}, bound: tokenCh},
-	{kind: "API_KEY", re: regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`), markers: []string{"AIza"}, bound: tokenCh},
-	{kind: "API_KEY", re: regexp.MustCompile(`xox[abposr]-[0-9A-Za-z-]{10,}`), markers: []string{"xox"}, bound: tokenCh},
-	{kind: "API_KEY", re: regexp.MustCompile(`(?:sk|rk)_live_[0-9A-Za-z]{20,}`), markers: []string{"_live_"}, bound: tokenCh},
-	{kind: "API_KEY", re: regexp.MustCompile(`(?:AKIA|ASIA)[0-9A-Z]{16}`), markers: []string{"AKIA", "ASIA"}, bound: alnum},
-	{kind: "API_KEY", re: regexp.MustCompile(`(?:hf_[A-Za-z0-9]{30,}|gsk_[A-Za-z0-9]{40,}|xai-[A-Za-z0-9]{40,}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{50,}|dop_v1_[a-f0-9]{64}|SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})`),
+	{kind: "API_KEY", re: lazyre.New(`ark-[A-Za-z0-9][A-Za-z0-9_-]{15,}`), markers: []string{"ark-"}, bound: tokenCh, ok: secretValue},
+	{kind: "API_KEY", re: lazyre.New(`(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|glpat-[A-Za-z0-9_-]{20,})`), markers: []string{"gh", "github_pat_", "glpat-"}, bound: tokenCh},
+	{kind: "API_KEY", re: lazyre.New(`AIza[0-9A-Za-z_-]{35}`), markers: []string{"AIza"}, bound: tokenCh},
+	{kind: "API_KEY", re: lazyre.New(`xox[abposr]-[0-9A-Za-z-]{10,}`), markers: []string{"xox"}, bound: tokenCh},
+	{kind: "API_KEY", re: lazyre.New(`(?:sk|rk)_live_[0-9A-Za-z]{20,}`), markers: []string{"_live_"}, bound: tokenCh},
+	{kind: "API_KEY", re: lazyre.New(`(?:AKIA|ASIA)[0-9A-Z]{16}`), markers: []string{"AKIA", "ASIA"}, bound: alnum},
+	{kind: "API_KEY", re: lazyre.New(`(?:hf_[A-Za-z0-9]{30,}|gsk_[A-Za-z0-9]{40,}|xai-[A-Za-z0-9]{40,}|npm_[A-Za-z0-9]{36}|pypi-[A-Za-z0-9_-]{50,}|dop_v1_[a-f0-9]{64}|SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})`),
 		markers: []string{"hf_", "gsk_", "xai-", "npm_", "pypi-", "dop_v1_", "SG."}, bound: tokenCh},
-	{kind: "TOKEN", re: regexp.MustCompile(`eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`), markers: []string{"eyJ"}, bound: tokenCh},
+	// Cloudflare's: the scannable prefixes of a user token, an account
+	// token, a Global API Key and a Wrangler OAuth token (cfut_, cfat_,
+	// cfk_, cfoat_; 40 characters and a checksum,
+	// developers.cloudflare.com/fundamentals/api/get-started/token-formats),
+	// an Origin CA key (always v1.0-, two hex runs), and a tunnel token
+	// (base64 of {"a":account,"t":tunnel,"s":secret}, so it starts eyJhIjoi).
+	// The unprefixed older tokens and keys are 40 letters or 37 to 45 hex
+	// and have no shape of their own; they are masked by the name they sit
+	// under (secretNames).
+	{kind: "API_KEY", re: lazyre.New(`cf(?:ut|at|k|oat)_[A-Za-z0-9_-]{40,}`), markers: []string{"cfut_", "cfat_", "cfk_", "cfoat_"}, bound: tokenCh},
+	{kind: "API_KEY", re: lazyre.New(`v1\.0-[A-Za-z0-9]{16,}-[A-Za-z0-9]{40,}`), markers: []string{"v1.0-"}, bound: tokenCh},
+	{kind: "TOKEN", re: lazyre.New(`eyJhIjoi[A-Za-z0-9+/_-]{40,}={0,2}`), markers: []string{"eyJhIjoi"}, bound: tokenCh},
+	// X-Auth-Key (the Global API Key) and X-Auth-User-Service-Key (the
+	// Origin CA key) headers, whatever the key looks like
+	{kind: "SECRET", re: lazyre.New(`(?i)x-auth-(?:user-service-)?key["']?[ \t]*[:=][ \t]*["']?([A-Za-z0-9._-]{16,})`),
+		fold: []string{"x-auth-"}, ahead: 120, ok: notAVariable},
+	// An R2 Access Key ID (32 hex, the id of its API token) is an id and
+	// goes as written (TestIDsGoAsWritten); its Secret Access Key (64 hex)
+	// is masked under a secret's name.
+	{kind: "TOKEN", re: lazyre.New(`eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`), markers: []string{"eyJ"}, bound: tokenCh},
 	// the password of user:password@host, or of :password@host as a Redis
 	// URL has it with no user
-	{kind: "PASSWORD", re: regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s:@/?#"'<>]*:([^\s@/?#"'<>]{3,})@`), markers: []string{"://"}, ok: notAVariable, at: hiddenInURL},
+	{kind: "PASSWORD", re: lazyre.New(`[A-Za-z][A-Za-z0-9+.-]*://[^\s:@/?#"'<>]*:([^\s@/?#"'<>]{3,})@`), markers: []string{"://"}, ok: notAVariable, at: hiddenInURL},
 	// password = …, API_KEY: "…", as .env files and configs have them
-	{kind: "SECRET", re: regexp.MustCompile(`(?i)[A-Za-z0-9_.-]*(?:` + secretNames.pattern() + `)[A-Za-z0-9_.-]*` + quote + `[ \t]*[:=][ \t]*` + quote + `(` + secretCh + `{8,})`),
+	{kind: "SECRET", re: lazyre.New(`(?i)[A-Za-z0-9_.-]*(?:` + secretNames.pattern() + `)[A-Za-z0-9_.-]*` + quote + `[ \t]*[:=][ \t]*` + quote + `(` + secretCh + `{8,})`),
 		markers: secretNames.markers(), ok: secretValue, at: fieldAt, field: true},
 	// an env var's name says what it holds in the upper case: a
 	// SERVICE_X_KEY, a DB_PASS (#2946). The names above have a word for the
@@ -186,16 +220,16 @@ var rules = append([]rule{
 	// that a secret's name — in the lower case a name that ends in key is
 	// code's: a sort key, a cache key, a public key (notAPlainKey turns the
 	// upper-case ones of those away too).
-	{kind: "SECRET", re: regexp.MustCompile(`(?:^|[^A-Za-z0-9_.-])[A-Za-z0-9_.-]*_(?:KEY|PASS)` + quote + `[ \t]*[:=][ \t]*` + quote + `(` + secretCh + `{8,})`),
+	{kind: "SECRET", re: lazyre.New(`(?:^|[^A-Za-z0-9_.-])[A-Za-z0-9_.-]*_(?:KEY|PASS)` + quote + `[ \t]*[:=][ \t]*` + quote + `(` + secretCh + `{8,})`),
 		markers: fieldNames{{"key", "key"}, {"pass", "pass"}}.markers(), ok: secretValue, at: namedSecretAt, field: true},
 	// an Authorization or Cookie header's value is a secret whatever it
 	// looks like: an opaque bearer token, a session value (#2946)
-	{kind: "SECRET", re: regexp.MustCompile(`(?im)^[ \t]*(?:authorization|cookie)[ \t]*:[ \t]*(\S[^\r\n]{7,})`),
+	{kind: "SECRET", re: lazyre.New(`(?im)^[ \t]*(?:authorization|cookie)[ \t]*:[ \t]*(\S[^\r\n]{7,})`),
 		markers: fieldNames{{"authorization", "authorization"}, {"cookie", "cookie"}}.markers(), ok: headerValue},
 	// a field called key and nothing more, as providers.json has one: "key":
 	// "oc_sk_…" (#195). Only a long value of letters and digits both, since
 	// code calls anything a key: a map's "key": "value", sort_key, keyboard.
-	{kind: "SECRET", re: regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_.-])` + quote + `key` + quote + `[ \t]*[:=][ \t]*` + quote + `(` + secretCh + `{16,})`),
+	{kind: "SECRET", re: lazyre.New(`(?i)(?:^|[^A-Za-z0-9_.-])` + quote + `key` + quote + `[ \t]*[:=][ \t]*` + quote + `(` + secretCh + `{16,})`),
 		markers: fieldNames{{"key", "key"}}.markers(), ok: secretValue, at: fieldAt, field: true},
 	// a password after its name in Chinese, Japanese or Korean, as people
 	// write one into a message: 密码：786kih, 密碼是 hunter2, パスワード: … .
@@ -211,15 +245,15 @@ var rules = append([]rule{
 	// an English name for one before 为, 為, 是 or ：, as a Chinese message
 	// has it: apikey 为 …, token 是 …, API Key：… (CyberCaius on Discord).
 	// password = … and API_KEY: … in a config are the SECRET rule's above.
-	{kind: "SECRET", re: regexp.MustCompile(`(?i)(?:` + secretNames.pattern() + `|pwd|api[ ]key|access[ ]key|secret[ ]key|key|\bpin(?:[ ]?code)?)` + quote +
+	{kind: "SECRET", re: lazyre.New(`(?i)(?:` + secretNames.pattern() + `|pwd|api[ ]key|access[ ]key|secret[ ]key|key|\bpin(?:[ ]?code)?)` + quote +
 		`[ \t]*(?:[为為是][ \t]*[:：]?|：)[ \t]*(?:\\?["'“「])?(` + secretCh + `{3,}[A-Za-z0-9_\-/+=~!@#%^&*])`),
 		fold: cjkCopulas, back: 24, ahead: 260, at: keyAt, field: true},
 
-	{kind: "EMAIL", re: regexp.MustCompile(`[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}`), markers: []string{"@"}, bound: alnum + "_%+-", ok: realEmail, at: emailAt, cat: catPersonal},
-	{kind: "ID_CARD", re: regexp.MustCompile(`[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]`), bound: alnum, ok: chineseID, cat: catPersonal},
-	{kind: "PHONE", re: regexp.MustCompile(`(?:\+?86[- ]?)?1[3-9]\d{9}`), bound: alnum, at: phoneAt, cat: catPersonal},
-	{kind: "BANK_CARD", re: regexp.MustCompile(`[3-6]\d{3}(?:[ -]?\d{4}){2,3}(?:[ -]?\d{1,3})?`), bound: alnum, ok: luhn, cat: catPersonal},
-}, moreRules...)
+	{kind: "EMAIL", re: lazyre.New(`[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}`), markers: []string{"@"}, bound: alnum + "_%+-", ok: realEmail, at: emailAt, cat: catPersonal},
+	{kind: "ID_CARD", re: lazyre.New(`[1-9]\d{5}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]`), bound: alnum, ok: chineseID, cat: catPersonal},
+	{kind: "PHONE", re: lazyre.New(`(?:\+?86[- ]?)?1[3-9]\d{9}`), bound: alnum, at: phoneAt, cat: catPersonal},
+	{kind: "BANK_CARD", re: lazyre.New(`[3-6]\d{3}(?:[ -]?\d{4}){2,3}(?:[ -]?\d{1,3})?`), bound: alnum, ok: luhn, cat: catPersonal},
+}, append(moreRules, cryptoRules...)...)
 
 // cjkPasswordNames are what a password is called in Chinese, Japanese and
 // Korean.
@@ -248,8 +282,8 @@ func lowerAll(names []string) []string {
 
 // cjkNamed is a value after one of names: after ：, :, =, 为, 為, 是, は
 // or 는, quoted or not, or after nothing but a space.
-func cjkNamed(names []string) *regexp.Regexp {
-	return regexp.MustCompile(`(?i)(?:` + strings.Join(names, "|") + `)[ \t]*(?:[:：=][ \t]*|[为為是][ \t]*[:：]?[ \t]*|は[ \t]*|는[ \t]*)?(?:\\?["'“「])?(` + secretCh + `{3,63}[A-Za-z0-9_\-/+=~!@#%^&*])`)
+func cjkNamed(names []string) *lazyre.RE {
+	return lazyre.New(`(?i)(?:` + strings.Join(names, "|") + `)[ \t]*(?:[:：=][ \t]*|[为為是][ \t]*[:：]?[ \t]*|は[ \t]*|는[ \t]*)?(?:\\?["'“「])?(` + secretCh + `{3,63}[A-Za-z0-9_\-/+=~!@#%^&*])`)
 }
 
 // fieldNames are what a field that holds a secret is called: a pattern for
@@ -261,9 +295,11 @@ type fieldNames []struct{ re, marker string }
 // DB_PASSWORD, apiKey, x-api-key, client_secret.
 var secretNames = fieldNames{
 	{"password", "pass"}, {"passwd", "pass"},
+	// an exchange's API passphrase (OKX, Coinbase, KuCoin)
+	{"passphrase", "pass"},
 	{"secret", "secret"},
 	{"token", "token"},
-	{`api[_-]?key`, "key"}, {`access[_-]?key`, "key"}, {`private[_-]?key`, "key"},
+	{`api[_-]?key`, "key"}, {`access[_-]?key`, "key"}, {`private[_-]?key`, "key"}, {`priv[_-]?key`, "key"},
 	{"credential", "credential"},
 }
 
@@ -298,7 +334,7 @@ const (
 )
 
 // placeholderRe is a placeholder as Mask writes it.
-var placeholderRe = regexp.MustCompile(`\{\{[A-Z][A-Z0-9_]*_[a-z2-7]{8}\}\}`)
+var placeholderRe = lazyre.New(`\{\{[A-Z][A-Z0-9_]*_[a-z2-7]{8}\}\}`)
 
 // HasPlaceholder says whether s holds text written as Mask writes a
 // placeholder, in JSON or not.
@@ -332,9 +368,10 @@ func keyValue(v string) bool {
 // time.
 func keyAt(s string, a, b int) bool {
 	v := s[a:b]
-	if pathValue(v) || versionValue(v) {
-		// where a key is kept: 私钥 ~/.ssh/id_ed25519, or a release's
-		// version: token 是 0.15.0-rc1 (fieldvalue.go)
+	if pathValue(v) || versionValue(v) || timestampValue(v) {
+		// where a key is kept: 私钥 ~/.ssh/id_ed25519, a release's
+		// version: token 是 0.15.0-rc1, or a moment: 令牌是
+		// 2026-08-30T11:44:31 (fieldvalue.go)
 		return false
 	}
 	if keyValue(v) {
@@ -367,7 +404,7 @@ func secretValue(v string) bool {
 
 // identPath is a name in code, or a field read through one: Uint8Array,
 // details.2, opts.token2.
-var identPath = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*$`)
+var identPath = lazyre.New(`^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*$`)
 
 // notCode turns away a value at s[a:b] that is code naming a secret, not
 // the secret: a call (privateKey: toBase64Url(…), secretKey =
@@ -576,7 +613,16 @@ func realEmail(v string) bool {
 	if !mailHost(v[:at], host) {
 		return false
 	}
-	if fileHost(host) || docFiles[host] || !mailTLD(host[strings.LastIndexByte(host, '.')+1:]) {
+	if fileHost(host) {
+		// the end of a file's name: an address before its extension
+		// (alice.smith@acme.com.pdf, export-rina.k@fastmail.com.png) is
+		// someone's all the same; a scale or a word (@2x.jpg, @final.pdf)
+		// is no domain
+		if host = fileStem(host); !strings.Contains(host, ".") || fileHost(host) || !mailHost(v[:at], host) {
+			return false
+		}
+	}
+	if docFiles[host] || !mailTLD(host[strings.LastIndexByte(host, '.')+1:]) {
 		return false
 	}
 	for _, fake := range []string{"example.com", "example.org", "example.net", "localhost", ".test", ".invalid", ".example"} {
@@ -664,7 +710,7 @@ var fileExt = map[string]bool{
 // address.
 var scaleExt = map[string]bool{"zip": true, "mov": true, "md": true, "map": true}
 
-var scaleRe = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+)?x$`)
+var scaleRe = lazyre.New(`^[0-9]+(?:\.[0-9]+)?x$`)
 
 // fileHost says host, what follows the @ of what looks like an address,
 // is the end of a file's name: an extension no domain has (fileExt), or a
@@ -673,6 +719,18 @@ func fileHost(host string) bool {
 	dot := strings.LastIndexByte(host, '.')
 	ext := host[dot+1:]
 	return fileExt[ext] || dot > 0 && scaleExt[ext] && scaleRe.MatchString(host[:dot])
+}
+
+// fileStem is host with the file extensions at its end taken off
+// (acme.com.tar.gz is acme.com), for a host fileHost took for a file's.
+func fileStem(host string) string {
+	for {
+		dot := strings.LastIndexByte(host, '.')
+		if dot < 0 || !fileExt[host[dot+1:]] {
+			return host
+		}
+		host = host[:dot]
+	}
 }
 
 func chineseID(v string) bool {
@@ -1116,6 +1174,9 @@ func ruleSpans(s string, o Options) []span {
 			if len(r.markers) > 0 && !containsAny(s, r.markers) {
 				continue
 			}
+			if r.may != nil && !r.may(s) {
+				continue
+			}
 			if len(r.fold) > 0 {
 				if lower == "" {
 					lower = lowerASCII(s)
@@ -1509,7 +1570,7 @@ func (r rule) matches(s, lower string) [][]int {
 // field (fieldMatches).
 func (r rule) findAll(s string) [][]int {
 	if r.field {
-		return fieldMatches(r.re, s)
+		return fieldMatches(r.re.Regexp(), s)
 	}
 	return r.re.FindAllStringSubmatchIndex(s, -1)
 }
@@ -1554,6 +1615,15 @@ func (r rule) takes(s string, a, b int, ok func(string) bool) bool {
 // first and longest where they overlap, nothing inside a placeholder. A
 // value o allows is left as it is, and one of a kind o warns of is left
 // and told. o.Seen, where set, is told of each.
+//
+// The user's Masked words win over Never mask: a value on both lists is
+// masked, and so is a word inside a value Never mask lets go, since of
+// two things the user asked for the one that keeps the value from the
+// vendor is the safe one. Never mask wins over everything else, the
+// user's own rules too: a value it names is the exception to them. It
+// holds from the next text on: a text sent masked on o.Route before
+// keeps its value masked, so a vendor's cache of it still matches
+// (allowkept.go).
 func apply(s string, found []span, put func(kind, v string) string, o Options) (string, int) {
 	if len(found) == 0 {
 		return s, 0
@@ -1579,15 +1649,27 @@ func apply(s string, found []span, put func(kind, v string) string, o Options) (
 	})
 	var b strings.Builder
 	last, next, n := 0, 0, 0 // next: where the next value may start
+	kept := 0                // the end of a value let go; only a word is masked before it
+	// a text sent on a route keeps what was masked in it before, Never
+	// mask added since or not (allowkept.go): its hash, once one is needed
+	remember := o.sent && o.Route != ""
+	var text uint64
+	textOf := func() uint64 {
+		if text == 0 {
+			text = keptText(o.Route, s) | 1
+		}
+		return text
+	}
 	for _, f := range found {
-		if f.start < next {
+		if f.start < next || f.start < kept && f.by != ByWord {
+			continue
+		}
+		v := s[f.start:f.end]
+		if f.by != ByWord && o.allows(v) && (!remember || !maskedBefore(textOf(), v)) {
+			kept = max(kept, f.end)
 			continue
 		}
 		next = f.end
-		v := s[f.start:f.end]
-		if o.allows(v) {
-			continue
-		}
 		act := o.Actions[f.kind]
 		if act != Warn && act != Block {
 			act = ""
@@ -1607,6 +1689,9 @@ func apply(s string, found []span, put func(kind, v string) string, o Options) (
 			b.WriteString(`"` + h.Placeholder + `"`)
 		} else {
 			b.WriteString(h.Placeholder)
+		}
+		if remember {
+			keepMasked(textOf(), v)
 		}
 		if o.Seen != nil {
 			o.Seen(h)
@@ -1640,7 +1725,16 @@ func containsAny(s string, subs []string) bool {
 
 // placeholderBody is a placeholder without its braces, as a model may write
 // one back: API_KEY_k3v9x2mq, phone_b5puzbfv, PHONE_B5PUZBFV.
-var placeholderBody = regexp.MustCompile(`[A-Za-z][A-Za-z0-9_]*_[A-Za-z2-7]{8}`)
+var placeholderBody = lazyre.New(`[A-Za-z][A-Za-z0-9_]*_[A-Za-z2-7]{8}`)
+
+// The ways a model writes a placeholder's braces and the spaces in them
+// back: as given; percent-encoded, in a link's target; as an HTML page's
+// entities; escaped, as Markdown has a brace.
+var (
+	openBraces  = []string{`\{`, "{", "%7B", "%7b", "&#123;", "&#x7b;", "&#x7B;", "&lbrace;", "&lcub;"}
+	closeBraces = []string{`\}`, "}", "%7D", "%7d", "&#125;", "&#x7d;", "&#x7D;", "&rbrace;", "&rcub;"}
+	braceSpaces = []string{" ", "\t", "%20"}
+)
 
 // Restore puts the values back in s. escaped is for text that is itself
 // JSON (a tool call's arguments), where a value goes in escaped.
@@ -1668,7 +1762,10 @@ func restore(s string, escaped bool, put map[string]int) string {
 	last := 0
 	for _, m := range placeholderBody.FindAllStringIndex(s, -1) {
 		a, z := m[0], m[1]
-		if a < last || a > 0 && isWordByte(s[a-1]) || z < len(s) && isWordByte(s[z]) {
+		if a >= 2 && s[a-2] == '%' && s[a-1] == '7' && (s[a] == 'B' || s[a] == 'b') && a+1 < z && isLetter(s[a+1]) {
+			a++ // found from the B of a link's %7B
+		}
+		if a < last || a > 0 && isWordByte(s[a-1]) && !encodedBefore(s[:a]) || z < len(s) && isWordByte(s[z]) {
 			continue
 		}
 		p := canonical(s[a:z])
@@ -1676,7 +1773,7 @@ func restore(s string, escaped bool, put map[string]int) string {
 		if !ok {
 			continue
 		}
-		a, z = braces(s, a, z)
+		a, z, enc := braces(s, a, z)
 		if a < last {
 			continue
 		}
@@ -1684,6 +1781,12 @@ func restore(s string, escaped bool, put map[string]int) string {
 			put[p]++
 		}
 		b.WriteString(s[last:a])
+		switch enc {
+		case '%':
+			v = url.PathEscape(v)
+		case '&':
+			v = html.EscapeString(v)
+		}
 		if escaped {
 			v = jsonEscape(v)
 		}
@@ -1707,34 +1810,83 @@ func isWordByte(c byte) bool {
 	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '_'
 }
 
+// encodedBefore says pre, the text before a placeholder's body, ends in
+// a percent-encoded brace, and the spaces after it, as a link's target
+// has them (%7B%7B%20): they end in a word's letters and digits, and the
+// body after them is a word of its own all the same.
+func encodedBefore(pre string) bool {
+	for strings.HasSuffix(pre, "%20") {
+		pre = pre[:len(pre)-3]
+	}
+	return len(pre) >= 3 && strings.EqualFold(pre[len(pre)-3:], "%7B")
+}
+
 // braces widens s[a:z], a placeholder's body, over the braces the model
 // wrote around it, and the spaces inside them: both of {{ and }}, or one
 // of them dropped ({{X} or {X}}), or just {{ or just }}. A single brace
-// on one side alone is the text's own ({X as in code) and stays.
-func braces(s string, a, z int) (int, int) {
-	la, l := a, 0
-	for la > 0 && (s[la-1] == ' ' || s[la-1] == '\t') {
-		la--
+// on one side alone is the text's own ({X as in code) and stays. A brace
+// may be written in any of openBraces' and closeBraces' ways, Markdown's
+// \{ only with a \} on the other side: alone, its backslash is a Windows
+// path's (C:\dir\{{X}}). enc is how the braces widened over were
+// encoded: '%' percent-encoded, '&' as HTML, so the value goes in the
+// same way, or 0.
+func braces(s string, a, z int) (int, int, byte) {
+	la, l, lenc, lmd := widen(s, a, -1, openBraces)
+	rz, r, renc, rmd := widen(s, z, 1, closeBraces)
+	if lmd && !rmd {
+		la, l, lenc, _ = widen(s, a, -1, openBraces[1:])
 	}
-	for l < 2 && la > 0 && s[la-1] == '{' {
-		la--
-		l++
+	if rmd && !lmd {
+		rz, r, renc, _ = widen(s, z, 1, closeBraces[1:])
 	}
-	rz, r := z, 0
-	for rz < len(s) && (s[rz] == ' ' || s[rz] == '\t') {
-		rz++
-	}
-	for r < 2 && rz < len(s) && s[rz] == '}' {
-		rz++
-		r++
-	}
+	var enc byte
 	if l == 2 || l == 1 && r >= 1 {
-		a = la
+		a, enc = la, lenc
 	}
 	if r == 2 || r == 1 && l >= 1 {
-		z = rz
+		z, enc = rz, max(enc, renc)
 	}
-	return a, z
+	return a, z, enc
+}
+
+// widen goes from i in s, back (dir -1) or on (1), over the spaces
+// inside a placeholder's braces and then up to two of the braces in bs.
+// It says where it ended, how many braces it went over, how they were
+// encoded (encodedAs) and whether one was Markdown's (bs[0]).
+func widen(s string, i, dir int, bs []string) (end, n int, enc byte, md bool) {
+	next := func(ts []string) string {
+		for _, t := range ts {
+			if dir < 0 && strings.HasSuffix(s[:i], t) || dir > 0 && strings.HasPrefix(s[i:], t) {
+				return t
+			}
+		}
+		return ""
+	}
+	for t := next(braceSpaces); t != ""; t = next(braceSpaces) {
+		i += dir * len(t)
+		if len(t) > 1 {
+			enc = '%'
+		}
+	}
+	for ; n < 2; n++ {
+		t := next(bs)
+		if t == "" {
+			break
+		}
+		i += dir * len(t)
+		enc = max(enc, encodedAs(t))
+		md = md || t[0] == '\\'
+	}
+	return i, n, enc, md
+}
+
+// encodedAs is how a brace written as t is encoded: '%', '&' or 0.
+func encodedAs(t string) byte {
+	switch t[0] {
+	case '%', '&':
+		return t[0]
+	}
+	return 0
 }
 
 // maxPlaceholder is the longest placeholder Mask writes: {{, a kind (a
@@ -1747,10 +1899,75 @@ const maxPlaceholder = len("{{") + maxKind + len("_") + 8 + len("}}")
 // no brace before it, a last word that starts as a placeholder this magpie
 // made does (PHO, PHONE_b5pu), or is one whose }} may still come.
 func partialTail(s string) int {
-	if n := braceTail(s); n > 0 {
+	if n := max(braceTail(s), encodedTail(s)); n > 0 {
 		return n
 	}
 	return max(wordTail(s), shapeTail(s))
+}
+
+// encodedTail is braceTail for braces written in another of openBraces'
+// and closeBraces' ways (%7B%7BAPI_, SECRET_k3v9x2mq%7D), read as the
+// braces they are, and for the start of one such brace the next piece
+// finishes (%7, &#12).
+func encodedTail(s string) int {
+	w := s[max(0, len(s)-3*maxPlaceholder-16):]
+	if !strings.ContainsAny(w, `%&\`) {
+		return 0
+	}
+	var plain []byte
+	var at []int // where each byte of plain starts in w
+	part := -1   // where the start of a brace the next piece finishes is
+	tokens := [][]string{openBraces, closeBraces, braceSpaces}
+	for j := 0; j < len(w); {
+		var c byte
+		n := 0
+		for k, ts := range tokens {
+			for _, t := range ts {
+				if len(t) > 1 && strings.HasPrefix(w[j:], t) {
+					c, n = "{} "[k], len(t)
+					break
+				}
+			}
+			if n > 0 {
+				break
+			}
+		}
+		if n == 0 {
+			for _, ts := range tokens[:2] {
+				for _, t := range ts {
+					if len(t) > len(w)-j && strings.HasPrefix(t, w[j:]) {
+						part = j
+					}
+				}
+			}
+			if part >= 0 {
+				break
+			}
+			c, n = w[j], 1
+		}
+		plain = append(plain, c)
+		at = append(at, j)
+		j += n
+	}
+	if part < 0 {
+		if n := braceTail(string(plain)); n > 0 {
+			return len(w) - at[len(plain)-n]
+		}
+		return 0
+	}
+	// the start of a brace held, and what is before it as braceTail
+	// would hold it: {{X} with %7 to come, which may be its last brace
+	hold := len(w) - part
+	if n := braceTail(string(plain)); n > 0 {
+		hold = len(w) - at[len(plain)-n]
+	}
+	at = append(at, part)
+	for _, c := range []byte("{} ") {
+		if n := braceTail(string(append(plain, c))); n > 0 {
+			hold = max(hold, len(w)-at[len(plain)+1-n])
+		}
+	}
+	return hold
 }
 
 // braceTail is a tail from {, or {{, on: then spaces, a placeholder's body

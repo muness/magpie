@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -66,6 +67,12 @@ type place struct {
 	// chmod takes the group's and others' bits off a file under home, where
 	// magpie's own mode doesn't hold (a distro's: see ownerOnly); nil: here
 	chmod func(string) error
+	// dir is the agent's config folder when magpie keeps one of its own
+	// for it (claude-magpie's launch file, claude_launch.go); "": its own
+	dir string
+	// wsl is the distro of an agent there, for one magpie runs there
+	// itself (Claude Science's daemon); nil on this machine
+	wsl *distro
 }
 
 func here(home string) place { return place{home: home} }
@@ -117,6 +124,9 @@ func (p place) codexHome() string {
 // this machine (appdir.ClaudeDir), ~/.claude in a distro, whose variables
 // magpie can't read.
 func (p place) claudeDir() string {
+	if p.dir != "" {
+		return p.dir
+	}
 	if p.spell != nil {
 		return p.join(".claude")
 	}
@@ -216,6 +226,10 @@ type distro struct {
 	// Versions is what the CLIs of wslKinds that ask (version) said their
 	// versions are at the last probe, by the kind's id
 	Versions map[string]string `json:"versions,omitempty"`
+	// Paths is where the probe found each command in the distro, by name
+	// ("opencode": /home/me/.opencode/bin/opencode); a distro probed
+	// before this has none until it is probed again
+	Paths map[string]string `json:"paths,omitempty"`
 	// OmpProfiles are the named omp profiles the probe found under
 	// ~/.omp/profiles there: each is an agent of its own (omp#<name>).
 	// Kept so a stopped distro lists them without being started.
@@ -378,7 +392,19 @@ func (d distro) base() string {
 	if d.Mirrored || d.Gateway == "" {
 		return gateway.URL()
 	}
-	return "http://" + net.JoinHostPort(d.Gateway, gateway.Port())
+	return "http://" + net.JoinHostPort(d.host(), gateway.Port())
+}
+
+// host is Windows as the distro reaches it: Gateway, or under NAT the WSL
+// via (gateway.WSLVia) where a firewall keeps WSL off Gateway (wslFindVia).
+func (d distro) host() string {
+	if d.Gateway == "" || d.Net == "bridged" || wslrun.HostLoopback(d.Net) || !gateway.OnWSLNet(d.Gateway) {
+		return d.Gateway
+	}
+	if v := gateway.WSLVia(); len(v) > 0 {
+		return v[0].String()
+	}
+	return d.Gateway
 }
 
 func (d distro) place(id string) place {
@@ -390,7 +416,7 @@ func (d distro) place(id string) place {
 		kind = k
 	}
 	return place{home: d.local(d.Home), id: id, spell: d.native, sys: d.local, base: d.base, cold: !d.Running, version: d.Versions[kind],
-		reach: d.open, unreached: new(error), chmod: d.chmod}
+		reach: d.open, unreached: new(error), chmod: d.chmod, wsl: &d}
 }
 
 // chmod takes the group's and others' bits off local, a file in the distro
@@ -429,9 +455,24 @@ type wslKind struct {
 	// asleep, when set, is a stopped distro's options for a field, which
 	// must read nothing of its files; nil keeps the live agent's
 	asleep func(key string) func(map[string]string) []Option
+	// ownNotice keeps the agent's own notice: one that reaches the gateway
+	// under NAT by a way of its own (Claude Science's relay)
+	ownNotice bool
+}
+
+// served is k with its agent the plugin's, where a plugin that says wsl
+// serves the built-in now (agentMovers).
+func (k wslKind) served() wslKind {
+	if p := movedAgent(k.id); p != nil && p.Desc.WSL {
+		k.in = func(at place) *Agent { return plugged(at, p) }
+	}
+	return k
 }
 
 var wslKinds = []wslKind{
+	// its daemon, which magpie starts there itself (claudescience_wsl.go):
+	// the probe looks in ~/.local/bin, where its installer puts it
+	{id: ScienceID, name: scienceName, dir: ".claude-science", bin: "claude-science", in: scienceIn, ownNotice: true},
 	{id: "codex", name: "Codex", dir: ".codex", bin: "codex", in: codexIn,
 		restart: newNotice("{agent} in WSL {distro} builds its model list at start-up — restart it, the app-server its sessions share ({command} there) and the Codex app's WSL connection to see this."),
 		asleep: func(key string) func(map[string]string) []Option {
@@ -498,6 +539,17 @@ var wslKinds = []wslKind{
 			}
 			return nil
 		}},
+	// mu, Pi's files in ~/.mu/agent: the distro's variables that move it
+	// and its old ~/.kyrn aren't read. No bin: mu is maildir-utils' too
+	{id: "mu", name: "mu", dir: ".mu/agent", in: muIn,
+		asleep: func(key string) func(map[string]string) []Option {
+			if key == "model" {
+				return func(cur map[string]string) []Option {
+					return withVia(ownOptions("", cur["model"]), "mu", magpieID+"/")
+				}
+			}
+			return nil
+		}},
 	{id: "stepcode", name: "StepCode", dir: ".stepcode", in: stepcodeIn,
 		asleep: wslOwnAsleep("stepcode", "model")},
 	// only its settings.json: its sign-in, sessions and prompt history,
@@ -546,7 +598,9 @@ var wslKinds = []wslKind{
 	// this machine, at their default folders: the distro's variables that
 	// move them (OPENCODE_CONFIG_DIR, KIMI_CODE_HOME, HERMES_HOME, …)
 	// aren't read. Each one's restart advice is its own Notice's.
-	{id: "opencode", name: "OpenCode", dir: ".config/opencode", bin: "opencode", in: opencodeIn,
+	// its version says whether its config is written in OpenCode 2's words
+	// (ocFile)
+	{id: "opencode", name: "OpenCode", dir: ".config/opencode", bin: "opencode", in: opencodeIn, version: true,
 		restart: newNotice("{agent} in WSL {distro} reads its config at start-up — restart open opencode sessions to use this."),
 		asleep:  wslOwnAsleep("opencode", "model", "small")},
 	{id: "mimocode", name: "MiMo Code", dir: ".config/mimocode", bin: "mimo", in: mimocodeIn,
@@ -610,6 +664,18 @@ var wslKinds = []wslKind{
 				return append(grokOwnOptions("", "", cur["model"]), opts...)
 			}
 		}},
+	// Kigi, a fork of Grok Build, with its config.toml in ~/.kigi
+	{id: "kigi", name: "Kigi", dir: ".kigi", bin: "kigi", in: kigiIn,
+		restart: newNotice("{agent} in WSL {distro} reads its settings at start-up — restart open kigi sessions to use this."),
+		asleep: func(key string) func(map[string]string) []Option {
+			if key != "model" {
+				return nil
+			}
+			// its models_cache.json and config.toml are the distro's files
+			return func(cur map[string]string) []Option {
+				return withVia(kigiOwnOptions("", "", cur["model"]), "kigi", magpieID+"/")
+			}
+		}},
 	{id: "droid", name: "Droid", dir: ".factory", bin: "droid", in: droidIn,
 		restart: newNotice("{agent} in WSL {distro} reads its settings at start-up — restart open droid sessions to use this."),
 		asleep: func(key string) func(map[string]string) []Option {
@@ -660,13 +726,20 @@ var wslKinds = []wslKind{
 			}
 			return func(cur map[string]string) []Option {
 				if ref, ok := strings.CutPrefix(cur["model"], magpieID+"/"); ok {
-					return static(dshLevels(ref)...)
+					return static(dshLevels("dsh", ref)...)
 				}
 				return static(dshEfforts...)
 			}
 		}},
 	{id: "empryo", name: "Empryo", dir: ".empryo", bin: "empryo", in: empryoIn,
 		restart: newNotice("{agent} in WSL {distro} reads its config at start-up — restart open empryo sessions to use this.")},
+	// no bin: nanobot is other tools' name too
+	{id: "nanobot", name: "nanobot", dir: ".nanobot", in: nanobotIn,
+		restart: newNotice("{agent} in WSL {distro}: its gateway and WebUI take this at their next reply; restart an open `nanobot agent` chat to use it there.")},
+	{id: "paimon", name: "Paimon", dir: ".config/paimon", bin: "paimon", in: paimonIn,
+		restart: newNotice("{agent} in WSL {distro} reads its model at start-up — restart open paimon sessions there to use this.")},
+	{id: "miniq", name: "miniQ", dir: ".local/share/miniq", bin: "miniq", in: miniqIn,
+		restart: newNotice("{agent} in WSL {distro}: magpie tells its running daemon; if it still answers with the old model, restart miniQ there.")},
 	// Ante ships macOS and Linux builds alone, and suggests WSL on Windows,
 	// so a Windows machine's Ante is usually this one
 	{id: "ante", name: "Ante", dir: ".ante", bin: "ante", in: anteIn,
@@ -696,6 +769,11 @@ var wslKinds = []wslKind{
 				return withVia(atomcodeOwnModels("", cur["model"]), "atomcode", magpieID+"/")
 			}
 		}},
+	// Open Code Review's ~/.opencodereview: no bin, as `ocr` is other
+	// programs' name too; ocr reads its config on every run. A stopped
+	// distro's config.json is looked at once it is started
+	{id: ocrID, name: "Open Code Review", dir: ".opencodereview", in: ocrIn,
+		asleep: wslOwnAsleep(ocrID, "model")},
 	// Snow CLI's ~/.snow, its profiles the distro's own; a stopped
 	// distro's are looked at once it is started
 	{id: "snow", name: "Snow CLI", dir: ".snow", bin: "snow", in: snowIn,
@@ -833,8 +911,12 @@ func wslFound(d distro) bool {
 }
 
 // wslKept is whether magpie keeps a distro it probed: one of wslKinds is
-// there, or the Copilot CLI's folder, whose sign-in it reads (#723).
-func wslKept(d distro) bool { return wslFound(d) || d.Has["dir:"+wslCopilotDir] }
+// there, or the Copilot CLI's folder, whose sign-in it reads (#723), or
+// the Antigravity app's data, whose sessions it reads.
+func wslKept(d distro) bool {
+	return wslFound(d) || d.Has["dir:"+wslCopilotDir] ||
+		slices.ContainsFunc(wslAntigravityDirs, func(dir string) bool { return d.Has["dir:"+dir] })
+}
 
 // ListsFor is whose model lists an agent's are (provider.CatalogFor): its
 // own id's, or, for one in a WSL distro, its Windows twin's (claude for
@@ -888,6 +970,10 @@ func wslAgent(k wslKind, d distro) *Agent {
 				return true // stopped since: never started to be asked
 			}
 			ok, told := wslReach(d.Name, base)
+			if told && !ok && d.Gateway != "" && d.Net != "bridged" && gateway.OnWSLNet(base) {
+				// shut from WSL: another of Windows' addresses may answer
+				wslFindVia(d, base)
+			}
 			return ok || !told // can't tell: taken as answering
 		})
 	}
@@ -898,7 +984,11 @@ func wslAgent(k wslKind, d distro) *Agent {
 	// its requests carry the agent's User-Agent and are counted as its
 	// Windows twin's, so a prompt with none of "its" own seen isn't a bypass
 	a.LastUsed = nil
+	own := a.Notice
 	a.Notice = func() string {
+		if k.ownNotice && own != nil {
+			return own()
+		}
 		if !d.Mirrored {
 			return d.notMirrored(k.name)
 		}
@@ -976,6 +1066,27 @@ func wslAgent(k wslKind, d distro) *Agent {
 			return f()
 		}
 	}
+	// its telemetry is the distro's file's (#7460); one stopped since is
+	// asked first, and isn't started for it
+	if tm := a.Telemetry; tm != nil {
+		stopped := func() error {
+			return fmt.Errorf("WSL %s isn't running; start it to change %s's telemetry", d.Name, k.name)
+		}
+		a.Telemetry = &Telemetry{all: tm.all,
+			Get: func() (TelemetryState, error) {
+				if !d.live() {
+					return TelemetryState{}, stopped()
+				}
+				return tm.Get()
+			},
+			Set: func(off bool) error {
+				if !d.live() {
+					return stopped()
+				}
+				return tm.Set(off)
+			},
+		}
+	}
 	// what a set leaves is kept at once, in case the distro stops before
 	// the next look
 	for i := range a.Fields {
@@ -1000,6 +1111,7 @@ func wslAgent(k wslKind, d distro) *Agent {
 func unreached(a *Agent, err error) *Agent {
 	a.unreached = err
 	a.Notice = func() string { return err.Error() }
+	a.Telemetry = nil // its file can't be opened
 	for i := range a.Fields {
 		if a.Fields[i].Set != nil {
 			a.Fields[i].Set = func(string) error { return err }
@@ -1051,7 +1163,7 @@ func asleep(live *Agent, k wslKind, d distro) *Agent {
 		}}
 	for _, lf := range live.Fields {
 		key := lf.Key
-		f := Field{Key: key, Label: lf.Label, Quiet: lf.Quiet, Live: lf.Live, Follows: lf.Follows, Options: lf.Options,
+		f := Field{Key: key, Label: lf.Label, Quiet: lf.Quiet, Live: lf.Live, Follows: lf.Follows, Own: lf.Own, Options: lf.Options,
 			Get: func() string { return wslLastSeen(d.Name, k.memo(key)) },
 			Set: func(v string) error {
 				// opening a stopped distro's files is aborted rather than
@@ -1109,7 +1221,7 @@ func wslAgentsOf(ds []distro) []*Agent {
 		// distro's files opened start it again (#3896)
 		for _, k := range wslKinds {
 			if k.found(d) {
-				out = append(out, wslAgent(k, d))
+				out = append(out, wslAgent(k.served(), d))
 			}
 		}
 		// the named omp profiles the probe remembered: the row is made
@@ -1128,7 +1240,8 @@ func wslAgentsOf(ds []distro) []*Agent {
 	return out
 }
 
-// wslHomes are the distros agents (or the Copilot CLI's folder, wslKept)
+// wslHomes are the distros agents (or the Copilot CLI's folder, or the
+// Antigravity app's data, wslKept)
 // were found in, each user's home as magpie
 // opens it, for internal/sessions to read their sessions in; none off
 // Windows. A stopped distro's is its home as last probed.
@@ -1136,8 +1249,12 @@ func wslHomes() []sessions.WSLHome {
 	if !wslLooks() {
 		return nil
 	}
+	return wslHomesOf(wslDistros())
+}
+
+func wslHomesOf(ds []distro) []sessions.WSLHome {
 	var out []sessions.WSLHome
-	for _, d := range wslDistros() {
+	for _, d := range ds {
 		if d.Root == "" || d.Home == "" {
 			continue
 		}
@@ -1152,18 +1269,43 @@ func wslHomes() []sessions.WSLHome {
 	return out
 }
 
+// wslAnswered is whether wsl.exe answered the last list of distros, so an
+// empty wslHomes means no distro has an agent (sessions.WSLListed).
+func wslAnswered() bool {
+	wslDistros()
+	wsl.Lock()
+	defer wsl.Unlock()
+	return wsl.listed
+}
+
 // wslCopilotDir is the Copilot CLI's folder under a distro's $HOME: not an
 // agent magpie sets up, but a sign-in it uses (provider.CopilotWSLDirs),
 // so a distro that has only it is kept as one agents are found in (#723).
 const wslCopilotDir = ".copilot"
 
+// wslAntigravityDirs are the Antigravity app's data folders under a
+// distro's $HOME. The Windows app connected to a WSL distro runs its
+// language server there (`$HOME/.antigravity-server/bin/<version>/
+// language_server`, started through wsl.exe with --app_data_dir
+// antigravity, Antigravity 2.x's dist/wsl.js), which keeps the
+// conversations in the distro's ~/.gemini/antigravity, not Windows'
+// (@guyng35955 on X: no usage for Antigravity connected to WSL Ubuntu).
+// Not an agent magpie sets up, but sessions it reads
+// (sessions.wslAgents), so a distro that has only them is kept as one
+// agents are found in.
+var wslAntigravityDirs = []string{".gemini/antigravity", ".gemini/antigravity-insiders"}
+
 // copilotWSLDirs are the Copilot CLI's folders, as magpie opens them (where
 // a link leads, #4502), in the running distros it was found in, for
 // provider to read its sign-in in; none off Windows. A stopped distro is
-// left out: reading it would start it.
+// left out: reading it would start it. It is asked on a request's path
+// (provider's accounts), so it waits for WSL at most wslRunningWait.
 func copilotWSLDirs() []string {
+	if !wslLooks() {
+		return nil
+	}
 	var out []string
-	for _, h := range wslHomes() {
+	for _, h := range wslHomesOf(wslDistrosWithin(wslRunningWait)) {
 		if h.Running && wslHasCopilot(h.Distro) {
 			out = append(out, h.Open(filepath.Join(h.Home, wslCopilotDir)))
 		}
@@ -1206,8 +1348,7 @@ const (
 	// which would start it again (TJHHHH on Discord)
 	wslRunningAge = 3 * time.Second
 	// wslRunningFailedAge is how long wsl.exe failing to say is kept: each
-	// ask that times out holds wsl's lock, and so the GUI, for 10s, and
-	// leaves a wsl.exe behind (#2341)
+	// ask that times out takes 10s and leaves a wsl.exe behind (#2341)
 	wslRunningFailedAge = 30 * time.Second
 )
 
@@ -1216,7 +1357,7 @@ var wslOn = runtime.GOOS == "windows"
 
 // wslLooks is whether magpie looks in WSL on its own: there is WSL, and
 // Settings' Detect agents in WSL is on (#1264).
-func wslLooks() bool { return wslOn && !settings.Load().NoWSLAgents }
+func wslLooks() bool { return wslOn && !settings.Shared().NoWSLAgents }
 
 // wslRun runs wsl.exe; a var for tests.
 // wslReachScript asks, inside a distro, whether anything answers at $1
@@ -1270,15 +1411,40 @@ var wslRun = func(timeout time.Duration, args ...string) ([]byte, error) {
 	cmd := proc.CommandContext(ctx, "wsl.exe", args...)
 	// wsl.exe speaks UTF-16 unless told otherwise; either is read
 	cmd.Env = append(os.Environ(), "WSL_UTF8=1")
-	return cmd.Output()
+	out, err := cmd.Output()
+	// one that says WSL must be updated isn't run again for hours
+	proc.WSLSaid(out, err)
+	return out, err
 }
 
-// wslRoot is where magpie opens a running distro's / from; a var for tests.
+// wslRootWait is how long wslRoot waits for Windows to open a distro's
+// /: a stat of WSL's file share can't be cancelled, and hangs while WSL
+// does. A var for tests.
+var wslRootWait = 5 * time.Second
+
+// wslStat is os.Stat, for wslRoot; a var for tests.
+var wslStat = os.Stat
+
+// wslRoot is where magpie opens a running distro's / from, "" when
+// Windows didn't open it within wslRootWait (the probe failed, and is
+// tried again in wslRetryAge); a var for tests.
 var wslRoot = func(name string) string {
-	if _, err := os.Stat(`\\wsl.localhost\` + name + `\`); err == nil {
-		return `\\wsl.localhost\` + name
+	ok, stat := make(chan bool, 1), wslStat
+	go func() {
+		_, err := stat(`\\wsl.localhost\` + name + `\`)
+		ok <- err == nil
+	}()
+	t := time.NewTimer(wslRootWait)
+	defer t.Stop()
+	select {
+	case found := <-ok:
+		if found {
+			return `\\wsl.localhost\` + name
+		}
+		return `\\wsl$\` + name // before Windows 11 / WSL 0.50
+	case <-t.C:
+		return ""
 	}
-	return `\\wsl$\` + name // before Windows 11 / WSL 0.50
 }
 
 // wslHungPath, while recent, says a wsl.exe listing timed out: each
@@ -1307,39 +1473,48 @@ func wslHung(hung bool) {
 
 func wslStatePath() string { return filepath.Join(filepath.Dir(provider.Path()), "wsl.json") }
 
-func wslDistros() []distro {
+// wslRefreshMu is held by the one refresh of what magpie knows of WSL
+// (wslRefresh) at a time. wsl.exe and the distros' files are asked while
+// it is held, never under wsl's own lock: that is taken only to read and
+// write what they said. A probe, a listing or an open of a distro's /
+// that hangs held wsl's lock before, so the GUI listing agents, a
+// request's stand-in and Copilot's sign-in all waited on a hung wsl.exe,
+// and the gateway sent 504s after 30s (vsoullai on X, #6167).
+var wslRefreshMu sync.Mutex
+
+// wslRefresh lists the distros again when the list is older than
+// wslListAge, asks which run, and probes the running ones not probed yet.
+func wslRefresh() {
+	wslRefreshMu.Lock()
+	defer wslRefreshMu.Unlock()
 	wsl.Lock()
-	defer wsl.Unlock()
-	if wsl.seen == nil {
-		wsl.seen, wsl.probed, wsl.failed = map[string]*distro{}, map[string]bool{}, map[string]time.Time{}
-		if b, err := os.ReadFile(wslStatePath()); err == nil {
-			json.Unmarshal(b, &wsl.seen)
-		}
-		wslForgetOldBins()
-	}
-	if time.Since(wsl.at) > wslListAge {
-		if wsl.at.IsZero() && wslHungLately() {
-			// another magpie waited out a hung wsl.exe moments ago: a
-			// command doesn't wait 10s more (this one lists again in a minute)
-			wsl.names, wsl.listed = nil, false
-		} else {
+	wslLoadLocked()
+	list := time.Since(wsl.at) > wslListAge
+	// another magpie waited out a hung wsl.exe moments ago: a command
+	// doesn't wait 10s more (this one lists again in a minute)
+	skip := list && wsl.at.IsZero() && wslHungLately()
+	wsl.Unlock()
+	if list {
+		var names []string
+		var listed bool
+		if !skip {
 			start := time.Now()
-			wsl.names, wsl.listed = wslList("-l", "-q")
-			wslHung(!wsl.listed && time.Since(start) >= wslHungAfter)
+			names, listed = wslList("-l", "-q")
+			wslHung(!listed && time.Since(start) >= wslHungAfter)
 		}
-		wsl.at = time.Now()
-		if !wsl.listed || len(wsl.names) == 0 {
+		wsl.Lock()
+		wsl.names, wsl.listed, wsl.at = names, listed, time.Now()
+		if !listed || len(names) == 0 {
 			// none to run: a wsl.exe that couldn't list them isn't asked
-			// again which run, another timeout under the lock the GUI waits on
-			wsl.running, wsl.runOK, wsl.runAt = map[string]bool{}, wsl.listed, time.Now()
+			// again which run
+			wsl.running, wsl.runOK, wsl.runAt = map[string]bool{}, listed, time.Now()
 		}
+		wsl.Unlock()
 	}
-	wslRunningLocked()
-	installed := map[string]bool{}
-	cfg := wslConfig()
-	var out []distro
+	wslRunningWithin(-1)
+	wsl.Lock()
+	var probe []string
 	for _, n := range wsl.names {
-		installed[n] = true
 		// a distro that stopped is probed again once it runs: WSL may have
 		// been restarted meanwhile in another networking mode
 		if !wsl.running[n] {
@@ -1347,41 +1522,126 @@ func wslDistros() []distro {
 		}
 		if wsl.running[n] && !wsl.probed[n] {
 			if t, ok := wsl.failed[n]; !ok || time.Since(t) > wslRetryAge {
-				if d := wslProbe(n); d == nil {
-					wsl.failed[n] = time.Now()
-				} else {
-					wsl.probed[n] = true
-					if wslKept(*d) {
-						if old := wsl.seen[n]; old != nil {
-							d.Values = old.Values
-							d.Was = wslWas(old.Was, old.Gateway, d.Gateway)
-						}
-						wsl.seen[n] = d
-					} else {
-						delete(wsl.seen, n)
-					}
-					wsl.dirty = true
-				}
+				probe = append(probe, n)
 			}
 		}
+	}
+	wsl.Unlock()
+	for _, n := range probe {
+		d := wslProbe(n)
+		wsl.Lock()
+		if d == nil {
+			wsl.failed[n] = time.Now()
+		} else {
+			wsl.probed[n] = true
+			if wslKept(*d) {
+				if old := wsl.seen[n]; old != nil {
+					d.Values = old.Values
+					d.Was = wslWas(old.Was, old.Gateway, d.Gateway)
+				}
+				wsl.seen[n] = d
+			} else {
+				delete(wsl.seen, n)
+			}
+			wsl.dirty = true
+		}
+		wsl.Unlock()
+	}
+	wsl.Lock()
+	defer wsl.Unlock()
+	// an unregistered distro is forgotten
+	if wsl.listed {
+		installed := map[string]bool{}
+		for _, n := range wsl.names {
+			installed[n] = true
+		}
+		for n := range wsl.seen {
+			if !installed[n] {
+				delete(wsl.seen, n)
+				wsl.dirty = true
+			}
+		}
+	}
+	wslSaveLocked()
+}
+
+// wslLoadLocked reads wsl.json the first time it is wanted.
+func wslLoadLocked() {
+	if wsl.seen != nil {
+		return
+	}
+	wsl.seen, wsl.probed, wsl.failed = map[string]*distro{}, map[string]bool{}, map[string]time.Time{}
+	if b, err := os.ReadFile(wslStatePath()); err == nil {
+		json.Unmarshal(b, &wsl.seen)
+	}
+	wslForgetOldBins()
+}
+
+// wslDistros are the distros agents were found in, after a refresh
+// (wslRefresh), which this waits for: for the GUI and what runs in the
+// background. A request's path takes wslDistrosWithin.
+func wslDistros() []distro {
+	wslRefresh()
+	return wslKnown()
+}
+
+// wslBg is the refresh wslDistrosWithin started, while it runs.
+var wslBg struct {
+	sync.Mutex
+	done chan struct{}
+}
+
+// wslDistrosWithin is wslDistros waiting at most wait for the refresh,
+// one at a time in the background: what is known then is answered, and
+// a distro whose running wsl.exe hasn't said in time is taken as stopped.
+func wslDistrosWithin(wait time.Duration) []distro {
+	wslBg.Lock()
+	if wslBg.done == nil {
+		done := make(chan struct{})
+		wslBg.done = done
+		go func() {
+			wslRefresh()
+			wslBg.Lock()
+			wslBg.done = nil
+			wslBg.Unlock()
+			close(done)
+		}()
+	}
+	done := wslBg.done
+	wslBg.Unlock()
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+	}
+	return wslKnown()
+}
+
+// wslKnown are the distros as last refreshed, each with whether it runs:
+// none does while wsl.exe is being asked and its last answer is older
+// than wslRunningAge.
+func wslKnown() []distro {
+	asking := wslRunAsking()
+	cfg := wslConfig()
+	wsl.Lock()
+	wslLoadLocked()
+	known := !asking || wslRunFreshLocked()
+	var out []distro
+	for _, n := range wsl.names {
 		d := wsl.seen[n]
 		if d == nil {
 			continue
 		}
 		c := *d
-		c.Running = wsl.running[n]
+		c.Running = known && wsl.running[n]
 		c.up = func() bool { return wslUp(n) }
-		c.mirror(cfg)
 		out = append(out, c)
 	}
-	// an unregistered distro is forgotten
-	for n := range wsl.seen {
-		if wsl.listed && !installed[n] {
-			delete(wsl.seen, n)
-			wsl.dirty = true
-		}
+	wsl.Unlock()
+	for i := range out {
+		out[i].mirror(cfg)
 	}
-	wslSaveLocked()
 	return out
 }
 
@@ -1424,25 +1684,86 @@ func wslForgetOldBins() {
 	}
 }
 
-// wslRunningLocked lists the running distros again (wsl.exe -l --running,
-// which starts none) when the last list is older than wslRunningAge. When
-// wsl.exe can't say, none is taken to run: a distro is never opened on a
-// guess.
-func wslRunningLocked() {
+// wslRunAsk is the wsl.exe -l --running in flight, and when it started.
+// It is asked outside wsl's lock, once at a time however many wait on it.
+var wslRunAsk struct {
+	sync.Mutex
+	done  chan struct{}
+	start time.Time
+}
+
+// wslRunningWait is how long what reads a distro's files waits for
+// wsl.exe to say which run, from when it was asked: one that hangs is
+// taken as running none, and a stand-in, a request's or Copilot's
+// sign-in, goes without the distro's files rather than waiting out its
+// 10s (vsoullai on X, #6167). A var for tests.
+var wslRunningWait = 2 * time.Second
+
+// wslRunFreshLocked is whether which distros run is as wsl.exe said at
+// most wslRunningAge ago (wslRunningFailedAge when it couldn't say).
+func wslRunFreshLocked() bool {
 	age := wslRunningAge
 	if !wsl.runOK {
 		age = wslRunningFailedAge
 	}
-	if !wsl.runAt.IsZero() && time.Since(wsl.runAt) <= age {
-		return
+	return !wsl.runAt.IsZero() && time.Since(wsl.runAt) <= age
+}
+
+// wslRunAsking is whether wsl.exe is being asked which distros run.
+func wslRunAsking() bool {
+	wslRunAsk.Lock()
+	defer wslRunAsk.Unlock()
+	return wslRunAsk.done != nil
+}
+
+// wslRunningWithin lists the running distros again (wsl.exe -l
+// --running, which starts none) when the last list is older than
+// wslRunningAge, and waits for the answer at most wait from when it was
+// asked (a negative wait: until wsl.exe answers or times out). false:
+// wsl.exe hasn't said in time, and none is to be taken to run. When
+// wsl.exe can't say, none is taken to run either: a distro is never
+// opened on a guess. Never called under wsl's lock.
+func wslRunningWithin(wait time.Duration) bool {
+	wsl.Lock()
+	fresh := wslRunFreshLocked()
+	wsl.Unlock()
+	if fresh {
+		return true
 	}
-	run, ok := wslList("-l", "--running", "-q")
-	wsl.runOK = ok
-	wsl.running = map[string]bool{}
-	for _, n := range run {
-		wsl.running[n] = true
+	wslRunAsk.Lock()
+	if wslRunAsk.done == nil {
+		done := make(chan struct{})
+		wslRunAsk.done, wslRunAsk.start = done, time.Now()
+		go func() {
+			run, ok := wslList("-l", "--running", "-q")
+			wsl.Lock()
+			wsl.runOK = ok
+			wsl.running = map[string]bool{}
+			for _, n := range run {
+				wsl.running[n] = true
+			}
+			wsl.runAt = time.Now()
+			wsl.Unlock()
+			wslRunAsk.Lock()
+			wslRunAsk.done = nil
+			wslRunAsk.Unlock()
+			close(done)
+		}()
 	}
-	wsl.runAt = time.Now()
+	done, start := wslRunAsk.done, wslRunAsk.start
+	wslRunAsk.Unlock()
+	if wait < 0 {
+		<-done
+		return true
+	}
+	t := time.NewTimer(time.Until(start.Add(wait)))
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 // wslUp is whether distro runs, as wsl.exe said at most wslRunningAge ago:
@@ -1450,9 +1771,11 @@ func wslRunningLocked() {
 // catalog synced, requests counted, sessions listed) asks it first, so a
 // distro stopped since its agent was made isn't started again.
 func wslUp(distro string) bool {
+	if !wslRunningWithin(wslRunningWait) {
+		return false
+	}
 	wsl.Lock()
 	defer wsl.Unlock()
-	wslRunningLocked()
 	return wsl.running[distro]
 }
 
@@ -1525,11 +1848,19 @@ func wslLastSeen(name, key string) string {
 
 // wslReady are the distros running now that the probe found kind in, each
 // with its mirrored networking settled, ready for a read of its files.
-// Only magpie's memory of them and which run (wslRunningLocked) are
+// Only magpie's memory of them and which run (wslRunningWithin) are
 // asked — nothing is probed, and a stopped distro is never opened.
+// Detection off (wslLooks) reads none: a request's stand-in asks wsl.exe
+// nothing, which on a machine without WSL would answer with a console
+// window asking to install it (#4872).
 func wslReady(kind string) []distro {
+	if !wslLooks() {
+		return nil
+	}
+	if !wslRunningWithin(wslRunningWait) {
+		return nil
+	}
 	wsl.Lock()
-	wslRunningLocked()
 	var ds []distro
 	for _, n := range wsl.names {
 		if d := wsl.seen[n]; d != nil && wsl.running[n] && wslKindOf(kind).found(*d) {
@@ -1558,10 +1889,22 @@ func wslClaudeStandIn(model string) string {
 }
 
 // wslClaudeClassifier is ClassifierStandIn for a Claude Code in a running
-// distro, known by the same User-Agent.
+// distro, known by the same User-Agent. Detection off reads none (#4872).
 func wslClaudeClassifier(model string) string {
+	return wslClaudeFirst(func(at place) string { return claudeClassifierIn(at, model) })
+}
+
+// wslClaudeFirst is the first answer of read for the Claude Code of a
+// running distro, its files mirrored first; "" with detection off (#4872)
+// or none running.
+func wslClaudeFirst(read func(place) string) string {
+	if !wslLooks() {
+		return ""
+	}
+	if !wslRunningWithin(wslRunningWait) {
+		return ""
+	}
 	wsl.Lock()
-	wslRunningLocked()
 	var ds []distro
 	for _, n := range wsl.names {
 		if d := wsl.seen[n]; d != nil && wsl.running[n] && wslKindOf("claude").found(*d) {
@@ -1572,7 +1915,7 @@ func wslClaudeClassifier(model string) string {
 	cfg := wslConfig()
 	for _, d := range ds {
 		d.mirror(cfg)
-		if m := claudeClassifierIn(d.place("claude@wsl:"+d.Name), model); m != "" {
+		if m := read(d.place("claude@wsl:" + d.Name)); m != "" {
 			return m
 		}
 	}
@@ -1593,22 +1936,28 @@ func wslCodexStandIn() string {
 }
 
 // wslList is the names wsl.exe lists with args; ok is false when it
-// couldn't say (no WSL, or none installed).
+// couldn't say (no WSL, or none installed). With no distro registered at
+// all wsl.exe isn't run (proc.ErrNoWSLDistro), and that is an answer:
+// none. One refused while WSL asks to be updated is not, so nothing
+// remembered of a distro is forgotten for it.
 func wslList(args ...string) (names []string, ok bool) {
 	b, err := wslRun(10*time.Second, args...)
+	if errors.Is(err, proc.ErrNoWSLDistro) {
+		return nil, true
+	}
 	if err != nil {
 		return nil, false
 	}
 	return parseDistros(b), true
 }
 
-// wslProbeVersion is that of wslProbeScript: 2 says where each command is,
+// wslProbeVersion is that of wslProbeScript(): 2 says where each command is,
 // so one from Windows' drives isn't taken for the distro's own.
 // (wslinfo's networking mode came without a new version: a probe that
 // didn't ask leaves Net "", read as .wslconfig says, as before.)
 const wslProbeVersion = 2
 
-// wslProbeScript prints the distro's home, what of each of wslKinds it
+// wslProbeScript() prints the distro's home, what of each of wslKinds it
 // has (each command with where it is), where Windows' drives are mounted,
 // its default route (the Windows host under NAT), and WSL's networking
 // mode as wslinfo (WSL 2.0 on) says it; and the version of each that asks
@@ -1626,18 +1975,39 @@ const wslProbeVersion = 2
 // highest first. The glob this replaced took them in name order, so a
 // command under v18 was found before the default v22's, and v9's after
 // both (as proc.UserPath did on a Mac or Linux, 9f407cafa).
-var wslProbeScript = func() string {
+//
+// The folders are those of proc.UserBinDirs: fnm's default and then its
+// versions, mise's installs, ~/.npmrc's prefix and Homebrew's among them
+// (千里不再 on Discord: a WSL Pi from fnm, not run yet so with no ~/.pi,
+// wasn't found). The shell isn't asked interactively for the PATH ~/.bashrc
+// builds: under timeout(1) an interactive bash stops itself on the
+// terminal (state T) and outlived its timeout on WSL (Ubuntu 24.04).
+//
+// A command on Windows' drives isn't the distro's (parseProbe), so one
+// there is looked past (wslwin): WSL puts Windows' PATH on the distro's,
+// and a Pi npm installed on Windows hid the distro's own from wslbin.
+var wslProbeScript = sync.OnceValue(func() string {
 	s := `nv="${NVM_DIR:-$HOME/.nvm}"; nd=; [ -s "$nv/nvm.sh" ] && command -v bash >/dev/null 2>&1 && nd=$(NVM_DIR="$nv" timeout 10 bash -c '. "$NVM_DIR/nvm.sh" --no-use >/dev/null 2>&1; nvm_version default 2>/dev/null' </dev/null 2>/dev/null); ` +
+		// Windows' drives, as /proc/mounts has them (C:\ written C:\134)
+		`wm=$(awk '$1 ~ /^[A-Za-z]:/ {print $2}' /proc/mounts 2>/dev/null); ` +
+		`wslwin() { case "$1" in /mnt/[A-Za-z]/*) return 0;; esac; for m in $wm; do case "$1/" in "$m"/*) return 0;; esac; done; return 1; }; ` +
+		`inpath() { o=$IFS; IFS=:; r=; for d in $2; do case "$d" in /*) wslwin "$d" || { [ -f "$d/$1" ] && [ -x "$d/$1" ] && { r="$d/$1"; break; }; };; esac; done; IFS=$o; [ -n "$r" ] && echo "$r"; }; ` +
+		`np=$(sed -n 's/^[[:space:]]*prefix[[:space:]]*=[[:space:]]*//p' "$HOME/.npmrc" 2>/dev/null | head -n1 | tr -d "\"'\r"); case "$np" in "~/"*) np="$HOME/${np#??}";; /*) ;; *) np=;; esac; ` +
+		`fr=; for r in "$FNM_DIR" "${XDG_DATA_HOME:-$HOME/.local/share}/fnm" "$HOME/.fnm"; do case "$r" in /*) [ -d "$r/node-versions" ] && { fr=$r; break; };; esac; done; ` +
+		`vs() { ls "$1" 2>/dev/null | sed 's/^v*\(.*\)$/\1 &/' | sort -t. -k1,1nr -k2,2nr -k3,3nr | cut -d' ' -f2; }; ` +
 		`wslbin() { for d in "$HOME/.bun/bin" "$HOME/.local/bin" "$HOME/.npm-global/bin" "$HOME/.volta/bin" "$HOME/.local/share/pnpm"; do [ -x "$d/$1" ] && { echo "$d/$1"; return 0; }; done; ` +
 		`for v in $nd $(ls "$nv/versions/node" 2>/dev/null | sort -t. -k1.2,1nr -k2,2nr -k3,3nr); do d="$nv/versions/node/$v/bin"; [ -x "$d/$1" ] && { echo "$d/$1"; return 0; }; done; ` +
-		`for d in "$HOME/.local/share/mise/shims" "$HOME/.asdf/shims"; do [ -x "$d/$1" ] && { echo "$d/$1"; return 0; }; done; return 1; }; `
+		`if [ -n "$fr" ]; then for d in "$fr/aliases/default/bin" $(vs "$fr/node-versions" | sed "s|.*|$fr/node-versions/&/installation/bin|"); do [ -x "$d/$1" ] && { echo "$d/$1"; return 0; }; done; fi; ` +
+		`for d in $(vs "$HOME/.local/share/mise/installs/node" | sed "s|.*|$HOME/.local/share/mise/installs/node/&/bin|"); do [ -x "$d/$1" ] && { echo "$d/$1"; return 0; }; done; ` +
+		`for d in "$HOME/.local/share/mise/shims" "$HOME/.asdf/shims" "$HOME/.npm/bin" ${np:+"$np/bin"} "$HOME/.cargo/bin" "$HOME/.deno/bin" /home/linuxbrew/.linuxbrew/bin "$HOME/.linuxbrew/bin"; do [ -x "$d/$1" ] && { echo "$d/$1"; return 0; }; done; return 1; }; ` +
+		`wslcmd() { p=$(command -v "$1" 2>/dev/null) && case "$p" in /*) wslwin "$p" || { echo "$p"; return 0; };; esac; inpath "$1" "$PATH" || wslbin "$1"; }; `
 	s += `echo "home:$HOME"; `
 	for _, k := range wslKinds {
 		if k.dir != "" {
 			s += `[ -d "$HOME/` + k.dir + `" ] && echo dir:` + k.dir + `; `
 		}
 		if k.bin != "" {
-			s += `p=$(command -v ` + k.bin + ` 2>/dev/null || wslbin ` + k.bin + `) && echo "bin:` + k.bin + ` $p"`
+			s += `p=$(wslcmd ` + k.bin + `) && echo "bin:` + k.bin + ` $p"`
 			if k.version {
 				// not one on Windows' drives (WSL's /mnt/c), which isn't the distro's
 				s += ` && case "$p" in /mnt/*) ;; *) echo "ver:` + k.id + ` $(PATH="${p%/*}:$PATH" timeout 10 "$p" --version </dev/null 2>&1 | head -n1)";; esac`
@@ -1646,6 +2016,9 @@ var wslProbeScript = func() string {
 		}
 	}
 	s += `[ -d "$HOME/` + wslCopilotDir + `" ] && echo dir:` + wslCopilotDir + `; `
+	for _, dir := range wslAntigravityDirs {
+		s += `[ -d "$HOME/` + dir + `" ] && echo dir:` + dir + `; `
+	}
 	// where each agent folder that leads elsewhere leads (distro.open):
 	// "link:.codex /mnt/c/Users/me/.codex", or "link:.codex" alone where
 	// readlink -f couldn't say
@@ -1661,7 +2034,7 @@ var wslProbeScript = func() string {
 	return s + `ip route show default 2>/dev/null | head -n1 | sed 's/^/route:/'; ` +
 		`grep -m1 '^nameserver' /etc/resolv.conf 2>/dev/null | sed 's/^/ns:/'; ` +
 		`command -v wslinfo >/dev/null 2>&1 && echo "net:$(wslinfo --networking-mode 2>/dev/null)"; true`
-}()
+})
 
 // wslLinkPaths are the paths under a distro's $HOME the probe asks where
 // they lead (distro.Links): each agent's folder and its skills, and the
@@ -1678,7 +2051,7 @@ func wslLinkPaths() []string {
 }
 
 func wslProbe(name string) *distro {
-	b, err := wslRun(30*time.Second, "-d", name, "-e", "sh", "-lc", wslProbeScript)
+	b, err := wslRun(30*time.Second, "-d", name, "-e", "sh", "-lc", wslProbeScript())
 	if err != nil {
 		return nil
 	}
@@ -1687,12 +2060,14 @@ func wslProbe(name string) *distro {
 		return nil
 	}
 	if wslKept(*d) {
-		d.Root = wslRoot(name)
+		if d.Root = wslRoot(name); d.Root == "" {
+			return nil
+		}
 	}
 	return d
 }
 
-// parseProbe reads wslProbeScript's output. A command on one of Windows'
+// parseProbe reads wslProbeScript()'s output. A command on one of Windows'
 // drives — WSL puts Windows' PATH on its own, so Windows npm's pi is
 // /mnt/c/Users/me/AppData/Roaming/npm/pi there — is Windows', not the
 // distro's.
@@ -1780,6 +2155,12 @@ func parseProbe(name, out string) *distro {
 	for bin, path := range bins {
 		if !onWindowsDrive(path, win) {
 			d.Has["bin:"+bin] = true
+			if strings.HasPrefix(path, "/") {
+				if d.Paths == nil {
+					d.Paths = map[string]string{}
+				}
+				d.Paths[bin] = path
+			}
 		}
 	}
 	if d.Gateway == "" {
@@ -1788,10 +2169,11 @@ func parseProbe(name, out string) *distro {
 	// the default route of a distro whose 127.0.0.1 is Windows' is
 	// Windows' own next hop (consomme: 198.18.0.2 under a TUN proxy,
 	// #1230), not Windows: an agent left on it is moved to 127.0.0.1
-	// (wslMovedFrom)
-	if wslrun.HostLoopback(d.Net) {
-		d.Gateway = ""
-	}
+	// (wslMovedFrom). A bridged distro's is the LAN's router: Windows is
+	// at its address on the bridge's adapter (wslrun.HostAt), and an agent
+	// an older magpie pointed at the router is written over on the next
+	// sync, the router being among the addresses it was seen at (Was)
+	d.Gateway = wslrun.HostAt(d.Net, d.Gateway, gateway.WSLNets())
 	return d
 }
 
@@ -1912,3 +2294,204 @@ var (
 	noticeWSLNoRelay     = newNotice("WSL {distro} is in {net} networking with localhostForwarding=false in %UserProfile%\\.wslconfig, so 127.0.0.1 there, where its {agent} was pointed, isn't relayed to Windows, where magpie listens. Remove localhostForwarding=false under [wsl2] (it is on by default) and run wsl --shutdown.")
 	noticeWSLAsleep      = newNotice("WSL {distro} isn't running: magpie shows what it last saw there, and starts it only to change something.")
 )
+
+// H1_B1_K1 on X: a company's firewall (火绒企业版), which its user can't
+// open, kept a distro under NAT off Windows' address on vEthernet (WSL),
+// while Windows' own address on the LAN answered from WSL. Where the
+// gateway's address on the WSL network (or the WSL via in its place) is
+// found shut from inside a distro under NAT, magpie asks the gateway to
+// listen at each of Windows' other addresses as well (gateway.SetWSLVia,
+// let in only from Windows itself or WSL), asks from the distro which of
+// them answers, keeps that one as the via and lets the others go. Every
+// NAT distro's agents on magpie are then set again to reach it there
+// (distro.host, Rewire), the address they were on being magpie's to move
+// (wslHost, wslMovedFrom). Where the via is found shut later and the WSL
+// network's address answers again, the via is dropped. A setting isn't
+// needed: what answers is found.
+
+// wslViaCandidates are Windows' own IPv4 addresses off the WSL networks:
+// its LAN's first, other vEthernet adapters' (Hyper-V's Default Switch)
+// last. None off Windows. A var for the tests.
+var wslViaCandidates = func() []string {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var first, last []string
+	for _, i := range ifs {
+		if i.Flags&net.FlagUp == 0 || i.Flags&net.FlagLoopback != 0 || strings.Contains(i.Name, "(WSL") {
+			continue
+		}
+		addrs, _ := i.Addrs()
+		for _, a := range addrs {
+			n, ok := a.(*net.IPNet)
+			if !ok || n.IP.To4() == nil || n.IP.IsLinkLocalUnicast() || n.IP.IsLoopback() || gateway.OnWSLNet(n.IP.String()) {
+				continue
+			}
+			if strings.HasPrefix(i.Name, "vEthernet") {
+				last = append(last, n.IP.String())
+			} else {
+				first = append(first, n.IP.String())
+			}
+		}
+	}
+	return append(first, last...)
+}
+
+// wslViaListening waits until the gateway listens at ip, as told from here
+// (a connection from Windows itself is let in there); the gateway in
+// another process looks for new vias every 10s. A var for the tests.
+var wslViaListening = func(ip string) bool {
+	addr := net.JoinHostPort(ip, gateway.Port())
+	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
+		if c, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+			c.Close()
+			return true
+		}
+	}
+	return false
+}
+
+// wslViaMu lets one search for a via run at a time.
+var wslViaMu sync.Mutex
+
+// wslFindVia looks for a way from distro d to the gateway, once shut, the
+// address it found shut: the WSL network's again, else another of
+// Windows' addresses (see above), tried one by one while the gateway
+// listens at all of them. The one that answers is kept; the agents of
+// every distro under NAT on magpie then are set again to reach it there.
+func wslFindVia(d distro, shut string) {
+	wslViaMu.Lock()
+	defer wslViaMu.Unlock()
+	port := gateway.Port()
+	url := func(ip string) string { return "http://" + net.JoinHostPort(ip, port) }
+	var old []string
+	for _, ip := range gateway.WSLVia() {
+		old = append(old, ip.String())
+	}
+	keep := func(via []string) {
+		if slices.Equal(via, old) {
+			if err := gateway.SetWSLVia(old, nil); err != nil {
+				log.Printf("wsl: can't keep the way to magpie from WSL: %v", err)
+			}
+			return
+		}
+		on := wslOnGateway()
+		from := make([]string, len(on))
+		for i, a := range on {
+			from[i] = a.pointedAt()
+		}
+		if err := gateway.SetWSLVia(via, nil); err != nil {
+			log.Printf("wsl: can't keep the way to magpie from WSL: %v", err)
+			return
+		}
+		if len(old) > 0 {
+			wslViaLeft(old[0])
+		}
+		// one that moves its own addresses (Codex's two URLs) is moved;
+		// the others are set again
+		var rest []*Agent
+		var moved []string
+		var errs []error
+		for i, a := range on {
+			to := ""
+			if a.Gateway != nil {
+				to = a.Gateway()
+			}
+			if a.move == nil || from[i] == "" || to == "" || from[i] == to {
+				rest = append(rest, a)
+				continue
+			}
+			if err := a.move(from[i], to); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			moved = append(moved, a.Name)
+		}
+		m, err := Rewire(rest)
+		moved = append(moved, m...)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if len(moved) > 0 || len(errs) > 0 {
+			log.Printf("wsl: set again to reach magpie from WSL: %v %v", moved, joinErrs(errs))
+		}
+	}
+	if len(old) > 0 && shut != url(old[0]) {
+		// found already, by another agent's ask
+		if ok, told := wslReach(d.Name, url(old[0])); ok && told {
+			return
+		}
+	}
+	if len(old) > 0 && shut != url(d.Gateway) {
+		// the via shut: the WSL network's address may answer again
+		if ok, told := wslReach(d.Name, url(d.Gateway)); ok && told {
+			log.Printf("wsl: WSL %s reaches magpie at %s again", d.Name, url(d.Gateway))
+			keep(nil)
+			return
+		}
+	}
+	var cands []string
+	for _, c := range wslViaCandidates() {
+		if url(c) != shut {
+			cands = append(cands, c)
+		}
+	}
+	if len(cands) == 0 {
+		return
+	}
+	if err := gateway.SetWSLVia(old, cands); err != nil {
+		log.Printf("wsl: can't listen for WSL beyond its network: %v", err)
+		return
+	}
+	for _, c := range cands {
+		if !wslViaListening(c) {
+			continue
+		}
+		if ok, told := wslReach(d.Name, url(c)); ok && told {
+			log.Printf("wsl: WSL %s can't reach magpie at %s; it reaches it at %s", d.Name, shut, c)
+			keep([]string{c})
+			return
+		}
+	}
+	keep(old)
+}
+
+// wslOnGateway are the agents on magpie in distros under NAT, taken
+// before their way to Windows moves (as OnGateway before a port change).
+// A var for the tests, set in init: its agents' probes find vias.
+var wslOnGateway func() []*Agent
+
+func init() { wslOnGateway = wslOnGatewayNow }
+
+func wslOnGatewayNow() []*Agent {
+	var out []*Agent
+	for _, a := range wslAgents() {
+		if len(a.Fields) == 0 || !a.Wired() {
+			continue
+		}
+		if dr := a.Drift(); dr != nil && dr.Kind == "unwired" {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// wslViaLeft notes a via let go as an address every NAT distro reached
+// Windows at before (Was), so an agent still on it is magpie's to move.
+func wslViaLeft(via string) {
+	wsl.Lock()
+	defer wsl.Unlock()
+	for _, d := range wsl.seen {
+		if d == nil || d.Gateway == "" || d.Net == "bridged" || wslrun.HostLoopback(d.Net) || slices.Contains(d.Was, via) {
+			continue
+		}
+		d.Was = append(d.Was, via)
+		wsl.dirty = true
+	}
+	wslSaveLocked()
+}

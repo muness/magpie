@@ -3,7 +3,8 @@
 // plugin's part of Settings). Run after app.js, whose helpers it shares
 // (el, icon, openPicker, modelOpt, prefWrite, api), and before start.js
 // draws Settings. It wraps renderRedact, so app.js carries none of it: the row
-// shows while anything is masked, after the masked-words rows.
+// shows while anything is masked, after the masked-words rows, and then
+// the providers sent unmasked (unmaskedRow).
 
 // redactRouteRow: where a request masking would change goes instead
 // (redactRouteTo, jessyoungyu on X): Off masks it as before; a model whose
@@ -37,6 +38,28 @@ function redactRouteRow(s) {
   r.append(who, val);
   r.id = "redactRouteRow";
   const after = $("#redactWordsWholeRow");
+  if (after) after.after(r); else $("#redactList").append(r);
+}
+// unmaskedRow: the providers the user set to Send requests unmasked
+// (unmaskedProviders), each opening its editor, where the switch is under
+// Advanced; none, it says where the switch is (CrazyMouse_TT on X wanted
+// masking off for their own model and found no way to)
+function unmaskedRow(s) {
+  const ps = s.unmaskedProviders || [];
+  const r = el("div", "row pref"), who = el("div", "who"), val = el("div", "val unmasked-list");
+  who.append(el("div", "name", t("Sent unmasked")), el("div", "sub", ps.length
+    ? t("Requests to these providers go as written. Open one to change it")
+    : t("None. For your own model, turn on Send requests unmasked in its provider's editor, under Advanced")));
+  for (const p of ps) {
+    const b = el("button", "rt-cond on");
+    b.type = "button";
+    b.append(icon(p.icon || "generic"), el("span", "", p.name || p.id));
+    b.onclick = () => openProvider(p.id);
+    val.append(b);
+  }
+  r.append(who, val);
+  r.id = "unmaskedRow";
+  const after = $("#redactRouteRow") || $("#redactWordsWholeRow");
   if (after) after.after(r); else $("#redactList").append(r);
 }
 // wordList: Masked words and Never mask as a list, one row a value
@@ -224,10 +247,145 @@ function redactWordsHidden(r) {
   set();
   r.querySelector(".val").append(eye);
 }
+// rulesOf: the masking rules pasted into Import… (hgk0x on X: many fields
+// to mask, added one by one). JSON as Copy writes it keeps each rule's
+// prefix or regex; otherwise a rule a line, its pattern a prefix or a
+// regex as the box's own choice says, after a name and a tab, =, : or
+// comma when the line starts with one (API_KEY=oc_sk_, a table pasted
+// from a sheet). What each line was read as is listed before Import.
+const RULE_NAME = /^[\p{L}_][\p{L}\p{N}_ .-]{0,39}$/u;
+function rulesOf(text, by) {
+  const s = text.trim();
+  if (/^[[{]/.test(s)) {
+    try {
+      let j = JSON.parse(s);
+      if (!Array.isArray(j)) j = j.redactRules || j.rules || [j];
+      const str = (v) => (typeof v === "string" ? v.trim() : "");
+      return j.filter((r) => r && (str(r.regex) || str(r.prefix)))
+        .map((r) => (str(r.regex) ? { kind: str(r.kind), regex: str(r.regex) } : { kind: str(r.kind), prefix: str(r.prefix) }));
+    } catch {}
+  }
+  const out = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const l = raw.trim();
+    if (!l) continue;
+    const m = /^([^\t=:,，：]+?)\s*[\t=:,，：]\s*(\S.*)$/.exec(l);
+    const named = m && RULE_NAME.test(m[1].trim());
+    out.push({ kind: named ? m[1].trim() : "", [by]: named ? m[2].trim() : l });
+  }
+  return out;
+}
+// ruleBulk: Import… and Copy on the Masking rules row, as Masked words
+// has them. The box takes many rules at once, a rule the list has or one
+// pasted twice passed over; a list magpie refuses (a regex that doesn't
+// compile, too many) is said in the box and nothing is saved, what was
+// pasted kept. The box open, what it holds and its Prefix or Regex
+// outlive a redraw. Copy writes the rules as JSON, as Import takes them.
+let ruleImport = null;
+function ruleBulk(s, sel) {
+  const row = $("#redactList input.rule-kind:not(.editing)")?.closest(".row");
+  if (!row) return;
+  const rules = s.redactRules || [];
+  const key = (r) => maskRuleKind(r.kind) + "\n" + (r.regex ? "r" + r.regex : "p" + r.prefix);
+  const st = ruleImport || { text: "", by: "regex", err: "" };
+  // in the row only while open, so the row is as before until asked for
+  const imp = el("div", "word-import rule-import");
+  const area = el("textarea", "word-import-in");
+  area.rows = 5;
+  area.spellcheck = false;
+  area.value = st.text;
+  area.placeholder = t("Paste rules, one a line: a name, then = and the pattern. JSON as Copy writes it works too");
+  area.setAttribute("aria-label", t("Rules to import"));
+  const list = el("div", "rule-import-list");
+  const count = el("span", "hint word-import-count");
+  const bring = el("button", "text primary", t("Import"));
+  bring.type = "button";
+  const fresh = () => {
+    const have = new Set(rules.map(key)), out = [];
+    for (const r of rulesOf(area.value, st.by)) {
+      if (have.has(key(r))) continue;
+      have.add(key(r));
+      out.push(r);
+    }
+    return out;
+  };
+  const counted = () => {
+    const add = fresh();
+    list.replaceChildren(...add.slice(0, 8).map((r) => {
+      const line = el("div", "rule-import-line");
+      line.append(el("b", "", maskRuleKind(r.kind)), el("code", "", r.regex ? r.regex : r.prefix + "…"));
+      return line;
+    }));
+    if (add.length > 8) list.append(el("div", "hint", t("and {n} more rules", { n: add.length - 8 })));
+    count.classList.toggle("err", !!st.err);
+    count.textContent = st.err || (area.value.trim() ? (add.length ? t("New rules: {n}", { n: add.length }) : t("No new rules: each is in the list already")) : "");
+    bring.disabled = !add.length;
+  };
+  const by = segs([["prefix", t("Prefix")], ["regex", t("Regex")]], st.by, (v) => { st.by = v; st.err = ""; counted(); });
+  const close = () => { ruleImport = null; renderSettings(); };
+  area.oninput = () => { st.text = area.value; st.err = ""; ruleImport = st; counted(); };
+  const bringIn = () => {
+    const add = fresh();
+    if (!add.length) return;
+    bring.disabled = true;
+    writingPrefs(api("settings/redact-rules", { rules: [...rules, ...add] })).then((ns) => {
+      prefs = ns;
+      ruleImport = null;
+      renderSettings();
+      status(t("Rules added: {n}", { n: add.length }), "ok");
+    }, (e) => {
+      st.err = t(e.message);
+      ruleImport = st;
+      statusTErr(e);
+      renderSettings();
+    });
+  };
+  area.onkeydown = (e) => {
+    e.stopPropagation();
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); bringIn(); }
+    else if (e.key === "Escape") close();
+  };
+  bring.onclick = bringIn;
+  const no = el("button", "text", t("Cancel"));
+  no.type = "button";
+  no.onclick = close;
+  const bar = el("div", "word-import-bar");
+  bar.append(by, count, el("span", "grow"), no, bring);
+  imp.append(area, list, bar);
+  counted();
+
+  const open = el("button", "text word-import-open", t("Import…"));
+  open.type = "button";
+  open.title = t("Add many rules at once, pasted one a line");
+  open.onclick = () => {
+    if (ruleImport) return close();
+    ruleImport = st;
+    row.append(imp);
+    area.focus(NO_SCROLL);
+  };
+  const out = el("button", "text word-copy", t("Copy"));
+  out.type = "button";
+  out.title = t("Copy the rules as JSON, as Import takes them");
+  out.disabled = !rules.length;
+  out.onclick = () => copy("[\n" + rules.map((r) => JSON.stringify(r.regex ? { kind: r.kind, regex: r.regex } : { kind: r.kind, prefix: r.prefix })).join(",\n") + "\n]", "", out, t("Rules copied: {n}", { n: rules.length }));
+  const tools = el("div", "rule-tools");
+  tools.append(open, out);
+  row.classList.add("rule-bulk");
+  row.querySelector(".who").after(tools);
+  if (ruleImport) row.append(imp);
+  // typed in before a redraw, it is typed in after it
+  if (sel && ruleImport) {
+    area.focus(NO_SCROLL);
+    try { area.setSelectionRange(...sel); } catch {}
+  }
+}
 {
   const draw = renderRedact;
   renderRedact = function (s, keep) {
     const f = wordFocusOf();
+    const ra = document.activeElement?.matches?.(".rule-import textarea") ? document.activeElement : null;
+    const rsel = ra && [ra.selectionStart, ra.selectionEnd];
     wordsRedrawing = true;
     try { draw(s, keep); } finally { wordsRedrawing = false; }
     const wl = wordList("words", s.redactWords || [], t("names, codenames, hosts"), t("Masked words"), (redactWords) => savePrefs({ ...keep, redactWords }), () => prefs?.redactWords);
@@ -236,6 +394,26 @@ function redactWordsHidden(r) {
     if (at) at.before(words); else $("#redactList").append(words);
     redactWordsHidden(words);
     const acts = $("#maskActList");
+    // the Masking alert (Must2333 on X) first, with what else happens when
+    // a value is found: it was on the Masking page, away from every other
+    // masking setting (the scattered settings audit after netube99 on X),
+    // and in Settings › Usage before that (nb5p). Gateway mode leaves it
+    // out, as it does the other alerts its desktop would show
+    if (acts && !gatewayMode) {
+      const r = el("div", "row pref");
+      r.id = "maskAlertRow";
+      const who = el("div", "who");
+      const sub = el("div", "sub wraps", t("A notification when masking swaps a value for the first time: its kind and how many, never the value itself"));
+      // and why it wouldn't be seen, as Settings › Usage's alerts say it
+      const warn = notifyWarn(s);
+      if (warn) sub.append(" · ", el("span", "warn", warn));
+      who.append(el("div", "name", t("Masking alert")), sub);
+      const v = el("div", "val");
+      v.id = "maskAlertSegs";
+      v.append(segs([["off", t("Off")], ["on", t("On")]], s.maskAlert ? "on" : "off", (x) => savePrefs({ ...keep, maskAlert: x === "on" })));
+      r.append(who, v);
+      acts.prepend(r);
+    }
     if (acts) {
       const al = wordList("allow", s.redactAllow || [], t("ops@company.com, build-01"), t("Never mask"), (allow) => writingPrefs(api("settings/redact-allow", { allow }))
         .then((ns) => { prefs = ns; renderSettings(); status(t("Saved"), "ok", 1500); })
@@ -243,6 +421,30 @@ function redactWordsHidden(r) {
       acts.append(wordRow(t("Never mask"), t("Values that always go as written, each whole and in any case, one on each row: a team address, a test key"), al, ...al.tools));
     }
     wordFocusBack(f);
+    ruleBulk(s, rsel);
     if (s.redact || s.redactPersonal || (s.redactWords || []).length) redactRouteRow(s);
+    unmaskedRow(s);
   };
+}
+
+// Plugins › Built-in › Masking's own line (featGo): on, with nothing
+// chosen to mask, it says so beside the way to Settings › Privacy, where
+// what to mask is chosen (the scattered settings audit after netube99 on X)
+featWho.redact = (line, f) => {
+  if (!f.on) return;
+  // Settings' own read: /api/state's has no masking fields
+  const say = () => { const s = prefs; if (s && !(s.redact || s.redactPersonal || s.redactWords?.length)) line.prepend(el("span", "warn", t("Nothing is masked yet")), line.childNodes.length ? " · " : ""); };
+  if (prefs) say(); else loadSettings().then(say, () => {});
+};
+
+// pmModelOption is a local model in app.js's pmPick menu: a built-in one
+// with what it is, its size and whether it is downloaded; a plugin's
+// (pii/external.go) by the name its options give, its files the user's.
+function pmModelOption(x) {
+  const [name, about] = PM_MODELS[x.model] || [x.model];
+  let note = "";
+  if (x.managedWeights === false) note = x.installed ? "" : t("Not available: its plugin is off, or its files are gone");
+  else if (!x.supported && !x.installed) note = t("Not available on this system yet");
+  else note = t(about || "") + " · " + fmtBytes(x.size) + (x.installed ? " · " + t("downloaded") : "");
+  return { v: x.model, name: x.name || name, literalName: true, note };
 }

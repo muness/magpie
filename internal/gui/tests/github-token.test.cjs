@@ -4,7 +4,8 @@
 // row: a token typed is saved on its own and shown masked, with Remove; one
 // GITHUB_TOKEN / GH_TOKEN gives is said; one refused is said in the row,
 // what was typed kept; nothing scrolls. And a check GitHub limited says so
-// in the page's words: until when, and that a token in Settings raises it.
+// in the page's words: until when, and that a token in Settings raises it,
+// and its tag opens the token's row there.
 // In English and Chinese, with the API faked.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
@@ -18,10 +19,10 @@ const HOME = "/Users/aimer";
 const TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz0123";
 const words = {
   en: { head: "GitHub", name: "GitHub token", save: "Save", remove: "Remove", env: "Using GH_TOKEN from the environment",
-    refused: "a GitHub token is one word, without spaces", limited: "GitHub allows 60 requests an hour without a token, used up until {time}. Add a GitHub token in Settings → Network and sharing to raise it to 5,000.",
+    refused: "a GitHub token is one word, without spaces", limited: "GitHub allows 60 requests an hour without a token, used up until {time}. Add a GitHub token in Settings › Network and sharing to raise it to 5,000.",
     withToken: "GitHub's rate limit for your GitHub token is used up until {time}", check: "Check for updates" },
   zh: { head: "GitHub", name: "GitHub 令牌", save: "保存", remove: "移除", env: "正在使用环境变量 GH_TOKEN",
-    refused: "GitHub 令牌是一串不含空格的字符", limited: "GitHub 不带令牌每小时仅允许 60 次请求，已用完，{time} 恢复。在 设置 → 网络与共享 添加 GitHub 令牌可提高到 5000 次。",
+    refused: "GitHub 令牌是一串不含空格的字符", limited: "GitHub 不带令牌每小时仅允许 60 次请求，已用完，{time} 恢复。在 设置 › 网络与共享 添加 GitHub 令牌可提高到 5000 次。",
     withToken: "你的 GitHub 令牌的请求额度已用完，{time} 恢复", check: "检查更新" },
 };
 const UNTIL = "2030-01-02T03:04:00Z";
@@ -134,12 +135,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       for (const st of [{ mask: "", from: "" }, { mask: "ghp_…0123", from: "settings" }]) {
-        await page.unroute("**/*");
+        // a click before can leave a file being served: let it go
+        await page.unrouteAll({ behavior: "ignoreErrors" });
         await page.route("**/*", serve(lang, [], st));
         await watchSettingsReads(page);
         await page.goto("http://magpie.test/?view=library");
         await settingsDrawn(page); // rows found are the ones that stay (#1659)
-        const check = page.locator("#view-library button.lib-updall", { hasText: w.check });
+        // Check for updates waits under the Skills heading's ⋯ (library-bar-more)
+        await page.locator("#view-library .lib-skillshead .lib-barmore").click();
+        const check = page.locator(".row-menu .rm-item.lib-check", { hasText: w.check });
         await check.waitFor();
         await check.click();
         await page.waitForFunction(() => document.querySelector("#view-library .lib-unchecked"));
@@ -147,6 +151,11 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const want = (st.from ? w.withToken : w.limited).replace("{time}", time);
         assert((await page.locator("#status").textContent()).includes(want), `status: ${await page.locator("#status").textContent()}`);
         assert.equal(await page.locator("#view-library .lib-unchecked").getAttribute("title"), want);
+        // without a token the tag leads to the GitHub token's row
+        if (!st.from) {
+          await page.locator("#view-library .lib-unchecked").click();
+          await page.locator("#view-settings #githubList .row.flash").waitFor();
+        } else assert.equal(await page.locator("#view-library .lib-unchecked.link").count(), 0, "a token's own limit has nothing to add");
       }
       assert.deepEqual(errors, []);
     });

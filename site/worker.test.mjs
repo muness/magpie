@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker, { served, goTarget, sponsorTarget } from "./worker.js";
+import { bucket, sha } from "./r2stub.mjs";
 
 const EN = "### Features\n\n- One thing (#1)\n\n### Install\n\nDownload it.";
 const ZH = "### 新功能\n\n- 一件事 (#1)";
@@ -23,7 +24,11 @@ globalThis.caches = {
 // pagesDown for github.com itself failing too. seen keeps each API ask's
 // headers.
 let apiDown = false, pagesDown = false;
+// downloadsDown: github.com's download address answering 504 while the
+// API serves the same files (2026-11-08)
+let downloadsDown = false;
 const seen = [];
+const SIG64 = "OT7nCVnsnONdQsBC4rfHcpqouwWLfavkbv3FCdPOBjGTBdHTefDVHQdZe8w1T5nOwlvA/S5a2EiI9zC9yOOcBQ==";
 const FEED = `<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <entry>
@@ -69,14 +74,27 @@ globalThis.fetch = async (u, init = {}) => {
   if (u.startsWith("https://api.github.com/")) {
     seen.push(new Headers(init.headers));
     if (apiDown) return new Response('{"message":"API rate limit exceeded"}', { status: 403 });
+    const asset = u.match(/\/releases\/assets\/(\d+)$/);
+    if (asset) {
+      if (new Headers(init.headers).get("Accept") !== "application/octet-stream") return Response.json({ id: +asset[1] });
+      return new Response(null, { status: 302, headers: { Location: `https://release-assets.githubusercontent.com/a/${asset[1]}?sig=1` } });
+    }
   } else if (pagesDown) return new Response("unicorn", { status: 503 });
+  if (downloadsDown && u.includes("/releases/download/")) return new Response("", { status: 504 });
+  if (u === "https://release-assets.githubusercontent.com/a/2?sig=1") return new Response("abc  magpie-linux-amd64\n");
   if (u === "https://github.com/yetone/magpie-releases/releases/latest")
     return new Response(null, { status: 302, headers: { Location: "https://github.com/yetone/magpie-releases/releases/tag/v0.1.3" } });
   if (u.endsWith("/releases.atom")) return new Response(FEED);
-  const gh = (tag) => ({ tag_name: tag, body: BODIES[tag], html_url: "https://github.com/r/" + tag, published_at: "2026-10-01T00:00:00Z", draft: false, prerelease: false, assets: [{ name: "magpie-linux-amd64", size: 1, browser_download_url: "https://dl/x" }] });
+  const gh = (tag) => ({ tag_name: tag, body: BODIES[tag], html_url: "https://github.com/r/" + tag, published_at: "2026-10-01T00:00:00Z", draft: false, prerelease: false, assets: [
+      { name: "magpie-linux-amd64", size: 1, browser_download_url: "https://dl/x", url: "https://api.github.com/repos/yetone/magpie-releases/releases/assets/1" },
+      { name: "SHA256SUMS", size: 1, browser_download_url: "https://dl/sums", url: "https://api.github.com/repos/yetone/magpie-releases/releases/assets/2" },
+      { name: "SHA256SUMS.sig", size: 88, browser_download_url: "https://dl/sig", url: "https://api.github.com/repos/yetone/magpie-releases/releases/assets/3" },
+    ] });
+  if (u.endsWith("/releases/tags/v0.1.3")) return Response.json(gh("v0.1.3"));
   if (u.endsWith("/releases/latest")) return Response.json(gh("v0.1.3"));
   if (u.includes("/releases?per_page=")) return Response.json(Object.keys(BODIES).map(gh));
   if (u.endsWith("/SHA256SUMS")) return new Response("abc  magpie-linux-amd64\n");
+  if (u.endsWith("/SHA256SUMS.sig")) return new Response(SIG64 + "\n");
   return new Response("not found", { status: 404 });
 };
 
@@ -99,6 +117,15 @@ test("latest: the English alone without lang, the Chinese with zh", async () => 
   }
   // asked in Chinese first, the edge's copy still has both
   assert.equal((await get("/api/latest")).body.notes, EN);
+});
+
+// The app checks the signature itself (internal/update/signed.go); the feed
+// only carries the signed list and the signature, and never lists the
+// signature as a file to download.
+test("latest: carries SHA256SUMS and its signature, and the signature is no file", async () => {
+  const { body } = await get("/api/latest");
+  assert.deepEqual(body.signed, { sums: "abc  magpie-linux-amd64\n", sig: SIG64 });
+  assert.deepEqual(Object.keys(body.assets), ["magpie-linux-amd64"]);
 });
 
 test("notes: each release in the language, English where it has no Chinese", async () => {
@@ -134,7 +161,7 @@ test("i18n: every string the home page marks has its Chinese, and no other", asy
   }
 });
 
-test("home: / sends a browser that prefers Chinese, Japanese or German to its page, until a language is picked", async () => {
+test("home: / sends a browser that prefers Chinese (Simplified or Traditional), Japanese or German to its page, until a language is picked", async () => {
   const env = { ASSETS: { fetch: async () => new Response("<html></html>", { headers: { "Content-Type": "text/plain" } }) } };
   const home = (headers) => worker.fetch(new Request("https://usemagpie.ai/", { headers }), env, ctx);
   const to = async (headers) => {
@@ -145,7 +172,11 @@ test("home: / sends a browser that prefers Chinese, Japanese or German to its pa
   assert.equal(await to({}), null);
   assert.equal(await to({ "Accept-Language": "en-US,en;q=0.9,zh;q=0.8" }), null);
   assert.equal(await to({ "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8" }), "/zh/");
-  assert.equal(await to({ "Accept-Language": "zh-TW" }), "/zh/");
+  for (const tag of ["zh-TW", "zh-tw,zh;q=0.9", "zh-HK", "zh-MO", "zh-Hant", "zh-Hant-TW,en;q=0.5"]) assert.equal(await to({ "Accept-Language": tag }), "/zh-tw/", tag);
+  for (const tag of ["zh", "zh-SG", "zh-Hans-CN"]) assert.equal(await to({ "Accept-Language": tag }), "/zh/", tag);
+  assert.equal(await to({ Cookie: "lang=zh-tw" }), "/zh-tw/");
+  assert.equal(await to({ "Accept-Language": "zh-TW", Cookie: "lang=zh" }), "/zh/");
+  assert.equal(await to({ "Accept-Language": "zh-CN", Cookie: "lang=zh-tw" }), "/zh-tw/");
   assert.equal(await to({ "Accept-Language": "fr-FR,zh;q=0.5,en;q=0.4" }), "/zh/");
   assert.equal(await to({ "Accept-Language": "en;q=0.2,zh;q=0.8" }), "/zh/");
   assert.equal(await to({ "Accept-Language": "zh-CN", Cookie: "a=b; lang=en" }), null);
@@ -157,10 +188,10 @@ test("home: / sends a browser that prefers Chinese, Japanese or German to its pa
   assert.equal(await to({ "Accept-Language": "de-AT" }), "/de/");
   assert.equal(await to({ "Accept-Language": "de", Cookie: "lang=en" }), null);
   assert.equal(await to({ Cookie: "lang=de" }), "/de/");
-  for (const lang of ["zh", "de"]) {
-    const res = await worker.fetch(new Request("https://usemagpie.ai/" + lang), env, ctx);
-    assert.equal(res.status, 301);
-    assert.equal(new URL(res.headers.get("Location")).pathname, `/${lang}/`);
+  for (const [from, lang] of [["zh", "zh"], ["de", "de"], ["zh-tw", "zh-tw"], ["zh-TW/", "zh-tw"], ["zh-TW", "zh-tw"]]) {
+    const res = await worker.fetch(new Request("https://usemagpie.ai/" + from), env, ctx);
+    assert.equal(res.status, 301, from);
+    assert.equal(new URL(res.headers.get("Location")).pathname, `/${lang}/`, from);
   }
 });
 
@@ -170,6 +201,13 @@ test("docs: the bare docs paths open each language's guide", async () => {
     const res = await worker.fetch(new Request("https://usemagpie.ai" + from), env, ctx);
     assert.equal(new URL(res.headers.get("Location"), "https://usemagpie.ai").pathname, to, from);
   }
+});
+
+test("site: /favicon.ico goes to the icon the pages link", async () => {
+  const env = { ASSETS: { fetch: async () => new Response("asset") } };
+  const res = await worker.fetch(new Request("https://usemagpie.ai/favicon.ico"), env, ctx);
+  assert.equal(res.status, 301);
+  assert.equal(res.headers.get("Location"), "https://usemagpie.ai/favicon.png");
 });
 
 test("docs: the MCP hub's old pages go to the MCP router's, keeping the query", async () => {
@@ -351,6 +389,8 @@ test("docs: an English docs page sends a browser that prefers Chinese or Japanes
   assert.equal(await to("/docs/start", {}), 200);
   assert.equal(await to("/docs/start", { "Accept-Language": "en-US,en;q=0.9,zh;q=0.8" }), 200);
   assert.equal(await to("/docs/start", { "Accept-Language": "zh-CN,zh;q=0.9" }), "/docs/zh/start");
+  assert.equal(await to("/docs/start", { "Accept-Language": "zh-TW" }), "/docs/zh/start");
+  assert.equal(await to("/docs/start", { Cookie: "lang=zh-tw" }), "/docs/zh/start");
   assert.equal(await to("/docs/start?omarchy=1", { "Accept-Language": "ja-JP" }), "/docs/ja/start?omarchy=1");
   assert.equal(await to("/docs/start", { "Accept-Language": "zh-CN", Cookie: "lang=en" }), 200);
   assert.equal(await to("/docs/start", { Cookie: "lang=ja" }), "/docs/ja/start");
@@ -373,14 +413,21 @@ test("partners", async () => {
   assert.equal(res.headers.get("Cache-Control"), "public, max-age=600");
   const { partners } = await res.json();
   assert.deepEqual(partners, served(PARTNERS, Date.now()));
-  assert(partners.length <= 12);
+  // each kind, the add sheet's and the Plugins page's, at most 12
+  assert(partners.filter((p) => !p.plugin).length <= 12);
+  assert(partners.filter((p) => p.plugin).length <= 12);
   const ids = new Set();
   for (const p of PARTNERS) {
     assert.match(p.id, /^[a-z0-9][a-z0-9-]{1,40}$/, p.id);
     assert(!ids.has(p.id), p.id + " twice");
     ids.add(p.id);
     assert(p.name?.trim(), p.id + " has no name");
-    assert(p.chat || p.responses || p.anthropic || p.regions?.length, p.id + " has no endpoint");
+    if (p.plugin) {
+      // a plugin's partner: an npm package's name and no endpoint
+      assert.match(p.plugin, /^(@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/, p.id + ": " + p.plugin);
+      assert(p.plugin.length <= 214, p.id);
+      assert(!p.chat && !p.responses && !p.anthropic && !p.regions, p.id + " is a plugin's partner with an endpoint");
+    } else assert(p.chat || p.responses || p.anthropic || p.regions?.length, p.id + " has no endpoint");
     const urls = [p.chat, p.responses, p.anthropic, p.website, p.keysUrl, p.iconUrl, ...(p.regions || []).flatMap((r) => [r.chat, r.responses, r.anthropic, r.keysUrl, r.website])];
     for (const u of urls.filter(Boolean)) assert.equal(new URL(u).protocol, "https:", p.id + ": " + u);
     for (const t of [p.from, p.until].filter(Boolean)) assert(!isNaN(Date.parse(t)), p.id + ": " + t);
@@ -417,6 +464,18 @@ test("partners: links go through /go", () => {
   // partners.js itself is left as it is
   assert.equal(LIST[0].keysUrl, "https://acme.example/keys");
   assert.equal(served([{ ...LIST[0], until: "2026-10-10T00:00:01Z" }], NOW).length, 1);
+});
+
+// a plugin's partner is served as the rest: its website a /go link that
+// counts the click, its package as it is
+test("partners: a plugin's partner", () => {
+  const notes = { id: "notes", name: "Notes", plugin: "@notes/magpie-sync", website: "https://notes.example/?aff=1", iconUrl: "https://notes.example/i.png", notes: { en: "Notes" } };
+  const [p] = served([notes], NOW);
+  assert.equal(p.plugin, "@notes/magpie-sync");
+  assert.equal(p.website, "https://usemagpie.ai/go/notes/site");
+  assert.equal(p.siteHost, "notes.example");
+  assert.equal(goTarget([notes], "notes", "site"), "https://notes.example/?aff=1&ref=magpie");
+  assert.equal(goTarget([notes], "notes", "keys"), "");
 });
 
 test("partners: /go sends the browser on, saying it came from magpie", () => {
@@ -458,6 +517,7 @@ test("partners: /go counts the click", async () => {
   assert.equal(captured[0].properties.id, p.id);
   assert.equal(captured[0].properties.what, what);
   assert.equal(captured[0].properties.$process_person_profile, false);
+  assert.equal(captured[0].properties.slot, p.plugin ? "plugins" : "providers");
   // a HEAD goes on but isn't counted
   captured.length = 0;
   const head = await worker.fetch(new Request("https://usemagpie.ai/go/" + p.id + "/" + what, { method: "HEAD" }), {}, ctx);
@@ -574,7 +634,8 @@ test("sponsors: the home page and the READMEs link every sponsor through /go", a
         if (s[where]) assert.equal(text.includes(s[where]), false, `${f.pathname} links ${s.id} directly`);
         // the home page links its own /go; a README, on GitHub, the site's
         const go = (where === "home" ? "" : "https://usemagpie.ai") + `/go/${s.id}/${where}`;
-        if (text.includes(`/go/${s.id}/`)) assert.ok(s[where] && text.includes(`href="${go}"`), `${f.pathname}: ${go}`);
+        // as an <a href> or a Markdown link (Kimi's thanks line, e6b9d1199)
+        if (text.includes(`/go/${s.id}/`)) assert.ok(s[where] && (text.includes(`href="${go}"`) || text.includes(`](${go})`)), `${f.pathname}: ${go}`);
       }
     }
   const home = readFileSync(pages.home[0], "utf8");
@@ -631,7 +692,8 @@ test("contributors: each language's page gets its own table, and keeps its line 
       assert.match(html, /<div id="wall"><div class="table-wrap"><table class="cw">/, path);
       assert.ok(html.includes(head), `${path} has the ${lang} table`);
       assert.ok(html.includes("packinggoodsllc_07668") && html.includes("v0.1.2581"), path);
-      assert.match(html, /static\.cloudflareinsights\.com/, `${path} keeps the beacon`);
+      assert.match(html, /posthog\.init\(/, `${path} keeps the analytics`);
+      assert.doesNotMatch(html, /cloudflareinsights/, `${path} leaves Cloudflare's beacon to Cloudflare`);
     }
     fragments = false;
     const bare = await get("/docs/zh/contributors");
@@ -699,6 +761,30 @@ test("seo: robots.txt names the sitemap and keeps crawlers off the counted links
   for (const p of ["/api/", "/go/", "/r/", "/download"]) assert.match(txt, new RegExp(`^Disallow: ${p}$`, "m"));
 });
 
+test("seo: llms.txt lists every English docs page and links only to listed pages", async () => {
+  const { readFile, readdir } = await import("node:fs/promises");
+  const pub = new URL("./public/", import.meta.url);
+  const txt = await readFile(new URL("llms.txt", pub), "utf8");
+  const xml = await readFile(new URL("sitemap.xml", pub), "utf8");
+  const listed = new Set([...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]));
+  assert.match(txt, /^# magpie\n\n> /);
+  const links = [...txt.matchAll(/\]\((https:\/\/usemagpie\.ai\/[^)]*)\)/g)].map((m) => m[1]);
+  for (const u of links) assert.ok(listed.has(u), `llms.txt links ${u}, which the sitemap doesn't list`);
+  const docs = (await readdir(new URL("docs/", pub))).filter((f) => f.endsWith(".html") && f !== "contributors.html");
+  for (const f of docs) assert.ok(links.includes(`https://usemagpie.ai/docs/${f.slice(0, -5)}`), `llms.txt misses docs/${f}`);
+});
+
+test("seo: llms-full.txt is current and holds every English docs page", async () => {
+  const { readFile, readdir } = await import("node:fs/promises");
+  const { build } = await import("./llms-full.mjs");
+  const pub = new URL("./public/", import.meta.url);
+  const txt = await readFile(new URL("llms-full.txt", pub), "utf8");
+  assert.equal(txt, await build(), "public/llms-full.txt is stale: run `node llms-full.mjs` in site/");
+  const docs = (await readdir(new URL("docs/", pub))).filter((f) => f.endsWith(".html") && f !== "contributors.html");
+  for (const f of docs) assert.ok(txt.includes(`Source: https://usemagpie.ai/docs/${f.slice(0, -5)}\n`), `llms-full.txt misses docs/${f}`);
+  assert.doesNotMatch(txt.replace(/^```\n[\s\S]*?\n```$/gm, ""), /<\/?(p|div|span|li|td|code|a)\b/, "llms-full.txt has HTML left outside its code blocks");
+});
+
 test("seo: the home page's structured data parses and its title is in every language", async () => {
   const { readFile } = await import("node:fs/promises");
   const { LANGS } = await import("./i18n.js");
@@ -708,4 +794,223 @@ test("seo: the home page's structured data parses and its title is in every lang
   assert.equal(app.offers.price, "0");
   assert.match(html, /<title data-i18n="meta.title">[^<]{20,70}<\/title>/);
   for (const [l, { dict }] of Object.entries(LANGS)) assert.ok(dict["meta.title"].startsWith("magpie"), l);
+});
+
+// 2026-11-08: github.com answered 504 for every release file for hours,
+// while GitHub's API served the same ones. The feed then reads the
+// checksums through the API and sends each file by the site's /dl, which
+// an app too old to know the api field follows; it is kept a minute, so
+// github.com's own address comes back as soon as it answers.
+test("latest: github.com's downloads failing, the files go by /dl, through GitHub's API", async () => {
+  store.clear();
+  downloadsDown = true;
+  try {
+    const res = await ask("/api/latest");
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("Cache-Control"), "public, max-age=60");
+    const a = (await res.json()).assets["magpie-linux-amd64"];
+    assert.deepEqual(a, {
+      url: "https://usemagpie.ai/dl/v0.1.3/magpie-linux-amd64",
+      api: "https://api.github.com/repos/yetone/magpie-releases/releases/assets/1",
+      size: 1,
+      sha256: "abc",
+    });
+    seen.length = 0;
+    // each ask's writes to the edge's cache are waited for before the next
+    const pending = [];
+    const keeping = { waitUntil: (p) => void pending.push(p) };
+    for (let i = 0; i < 2; i++) {
+      const dl = await worker.fetch(new Request("https://usemagpie.ai/dl/v0.1.3/magpie-linux-amd64"), {}, keeping);
+      await Promise.all(pending);
+      assert.equal(dl.status, 302);
+      assert.equal(dl.headers.get("Location"), "https://release-assets.githubusercontent.com/a/1?sig=1");
+      assert.equal(dl.headers.get("Cache-Control"), "no-store");
+    }
+    // the release's files once, where one is once: the second is the edge's
+    assert.equal(seen.length, 2);
+    assert.equal(seen[1].get("Accept"), "application/octet-stream");
+    assert.equal((await ask("/dl/v0.1.3/magpie-nothing")).status, 404);
+  } finally {
+    downloadsDown = false;
+  }
+  // github.com answering again: its own address, and api beside it
+  store.clear();
+  const res = await ask("/api/latest");
+  assert.equal(res.headers.get("Cache-Control"), "public, max-age=300");
+  const a = (await res.json()).assets["magpie-linux-amd64"];
+  assert.equal(a.url, "https://dl/x");
+  assert.equal(a.api, "https://api.github.com/repos/yetone/magpie-releases/releases/assets/1");
+});
+
+test("dl: a redirect GitHub's API gives anywhere but its asset host is not passed on", async () => {
+  store.clear();
+  const was = globalThis.fetch;
+  globalThis.fetch = async (u, init = {}) =>
+    /\/releases\/assets\/\d+$/.test(String(u)) ? new Response(null, { status: 302, headers: { Location: "https://evil.example/x" } }) : was(u, init);
+  try {
+    const res = await ask("/dl/v0.1.3/magpie-linux-amd64");
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get("Cache-Control"), "no-store");
+  } finally {
+    globalThis.fetch = was;
+  }
+});
+
+// R2 holding a file under the hash the release gives, as the cron leaves it
+const holding = async (b, tag, name, body, hash = sha(body)) =>
+  b.put(`${tag}/${name}`, body, { httpMetadata: { contentType: "application/octet-stream" }, customMetadata: { sha256: hash } });
+
+test("r2: the feed and /download name the site's /files for a file R2 holds, with github.com's address beside it", async () => {
+  store.clear();
+  const env = { RELEASES: bucket() };
+  // the fixture's SHA256SUMS says "abc"
+  await holding(env.RELEASES, "v0.1.3", "magpie-linux-amd64", "bytes", "abc");
+  const res = await ask("/api/latest", env);
+  assert.equal(res.status, 200);
+  assert.deepEqual((await res.json()).assets["magpie-linux-amd64"], {
+    url: "https://usemagpie.ai/files/v0.1.3/magpie-linux-amd64",
+    api: "https://api.github.com/repos/yetone/magpie-releases/releases/assets/1",
+    size: 1,
+    sha256: "abc",
+    github: "https://github.com/yetone/magpie-releases/releases/download/v0.1.3/magpie-linux-amd64",
+  });
+  const dl = await ask("/download/linux", env);
+  assert.equal(dl.status, 302);
+  assert.equal(dl.headers.get("Location"), "https://usemagpie.ai/files/v0.1.3/magpie-linux-amd64");
+  const file = await ask("/files/v0.1.3/magpie-linux-amd64", env);
+  assert.equal(file.status, 200);
+  assert.equal(await file.text(), "bytes");
+  // a tag R2 no longer keeps goes to GitHub
+  const old = await ask("/files/v0.1.1/magpie-linux-amd64", env);
+  assert.equal(old.status, 302);
+  assert.equal(old.headers.get("Location"), "https://github.com/yetone/magpie-releases/releases/download/v0.1.1/magpie-linux-amd64");
+});
+
+test("r2: bytes R2 holds under another hash than the release's are not named; github.com's address is", async () => {
+  store.clear();
+  const env = { RELEASES: bucket() };
+  await holding(env.RELEASES, "v0.1.3", "magpie-linux-amd64", "older");
+  const a = (await (await ask("/api/latest", env)).json()).assets["magpie-linux-amd64"];
+  assert.equal(a.url, "https://dl/x");
+  assert.equal(a.github, "https://github.com/yetone/magpie-releases/releases/download/v0.1.3/magpie-linux-amd64");
+  // R2 failing: the feed as GitHub has it
+  store.clear();
+  env.RELEASES.fail = true;
+  const res = await ask("/api/latest", env);
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).assets["magpie-linux-amd64"].url, "https://dl/x");
+});
+
+test("r2: the five-minute cron copies the newest release's files from github.com, by GitHub's API when that fails", async () => {
+  const body = "the linux build";
+  const was = globalThis.fetch;
+  const asked = [];
+  globalThis.fetch = async (u, init = {}) => {
+    u = String(u);
+    if (u.endsWith("/SHA256SUMS") || u === "https://release-assets.githubusercontent.com/a/2?sig=1") return new Response(`${sha(body)}  magpie-linux-amd64\n`);
+    if (u === "https://github.com/yetone/magpie-releases/releases/download/v0.1.3/magpie-linux-amd64") {
+      asked.push("github.com");
+      return downloadsDown ? new Response("", { status: 504 }) : new Response(body);
+    }
+    if (u === "https://release-assets.githubusercontent.com/a/1?sig=1") {
+      asked.push("api");
+      return new Response(body);
+    }
+    return was(u, init);
+  };
+  try {
+    for (const down of [false, true]) {
+      store.clear();
+      downloadsDown = down;
+      asked.length = 0;
+      const env = { RELEASES: bucket() };
+      const pending = [];
+      await worker.scheduled({ cron: "*/5 * * * *" }, env, { waitUntil: (p) => void pending.push(p) });
+      await Promise.all(pending);
+      assert.deepEqual(asked, down ? ["github.com", "api"] : ["github.com"]);
+      const o = env.RELEASES.objs.get("v0.1.3/magpie-linux-amd64");
+      assert.ok(o, "copied");
+      assert.equal(new TextDecoder().decode(o.bytes), body);
+      assert.equal(o.customMetadata.sha256, sha(body));
+      // the quarter-hour cron is the ledger's, and copies nothing
+      const other = { RELEASES: bucket(), LEDGER: { get: async () => null, put: async () => {} } };
+      const p2 = [];
+      await worker.scheduled({ cron: "*/15 * * * *" }, other, { waitUntil: (p) => void p2.push(p.catch(() => {})) });
+      await Promise.all(p2);
+      assert.equal(other.RELEASES.objs.size, 0);
+    }
+  } finally {
+    globalThis.fetch = was;
+    downloadsDown = false;
+    store.clear();
+  }
+});
+
+test("plugins/tagged: the dist branch's list passed on, jsDelivr and the last copy when it fails", async () => {
+  const was = globalThis.fetch;
+  const list = { version: 1, plugins: [{ repo: "a/b", spec: "github:a/b", stars: 3 }] };
+  let rawDown = false, cdnDown = false;
+  globalThis.fetch = async (u) => {
+    u = String(u);
+    if (u.startsWith("https://raw.githubusercontent.com/magpie-community/plugins/dist/")) return rawDown ? new Response("x", { status: 503 }) : Response.json(list);
+    if (u.startsWith("https://cdn.jsdelivr.net/gh/magpie-community/plugins@dist/")) return cdnDown ? new Response("x", { status: 503 }) : Response.json(list);
+    throw new Error("a test reached " + u);
+  };
+  try {
+    store.delete("https://usemagpie.ai/__v2/tagged");
+    const ask = () => worker.fetch(new Request("https://usemagpie.ai/api/plugins/tagged"), {}, ctx);
+    let res = await ask();
+    assert.equal(res.status, 200);
+    assert.deepEqual((await res.json()).plugins, list.plugins);
+    store.delete("https://usemagpie.ai/__v2/tagged");
+    rawDown = true;
+    assert.equal((await (await ask()).json()).plugins[0].repo, "a/b", "jsDelivr stands in");
+    store.delete("https://usemagpie.ai/__v2/tagged");
+    cdnDown = true;
+    assert.equal((await (await ask()).json()).plugins[0].repo, "a/b", "the last whole copy stands in");
+    store.delete("https://usemagpie.ai/__v2/tagged-good");
+    assert.equal((await ask()).status, 503);
+  } finally {
+    globalThis.fetch = was;
+  }
+});
+
+test("plugins/readme: a plugin's kept README passed on, from jsDelivr when raw fails, 404 when none", async () => {
+  const was = globalThis.fetch;
+  const asked = [];
+  let rawDown = false;
+  globalThis.fetch = async (u) => {
+    u = String(u);
+    asked.push(u);
+    const raw = "https://raw.githubusercontent.com/magpie-community/plugins/dist/readmes/";
+    const cdn = "https://cdn.jsdelivr.net/gh/magpie-community/plugins@dist/readmes/";
+    for (const [base, down] of [[raw, rawDown], [cdn, false]]) {
+      if (!u.startsWith(base)) continue;
+      if (down) return new Response("x", { status: 503 });
+      if (u.endsWith("/rsshub-plugin.md")) return new Response("# kept");
+      if (u.endsWith("/%40sc/scoped.md")) return new Response("# scoped");
+      if (u.endsWith("/github/o/r.md")) return new Response("# repo");
+      return new Response("nope", { status: 404 });
+    }
+    throw new Error("a test reached " + u);
+  };
+  try {
+    const ask = (n) => worker.fetch(new Request("https://usemagpie.ai/api/plugins/readme?name=" + encodeURIComponent(n)), {}, ctx);
+    for (const [n, want] of [["rsshub-plugin", "# kept"], ["@sc/scoped", "# scoped"], ["github:o/r", "# repo"]]) {
+      store.delete("https://usemagpie.ai/__v2/readme/" + (n.startsWith("github:") ? "github/" + n.slice(7) : n));
+      const res = await ask(n);
+      assert.equal(res.status, 200, n);
+      assert.equal(await res.text(), want);
+    }
+    const before = asked.length;
+    assert.equal(await (await ask("rsshub-plugin")).text(), "# kept");
+    assert.equal(asked.length, before, "the edge keeps it");
+    store.delete("https://usemagpie.ai/__v2/readme/rsshub-plugin");
+    rawDown = true;
+    assert.equal(await (await ask("rsshub-plugin")).text(), "# kept", "jsDelivr stands in");
+    assert.equal((await ask("missing-one")).status, 404);
+    for (const bad of ["../x", "github:../../x", "", "A B"]) assert.equal((await ask(bad)).status, 400, bad);
+  } finally {
+    globalThis.fetch = was;
+  }
 });

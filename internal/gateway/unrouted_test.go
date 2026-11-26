@@ -359,6 +359,21 @@ func TestUnroutedRequestShownThenAnswered(t *testing.T) {
 	heldSight(t, s)
 	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
+	// #4200: giveUp is held once its 504 is out until the test has read
+	// the route, so a route ended only after the answer is seen undone
+	// every time, not when the client happens to be quick.
+	looked := make(chan struct{})
+	var lookedOnce sync.Once
+	look := func() { lookedOnce.Do(func() { close(looked) }) }
+	t.Cleanup(look)
+	hook := func(*unroutedHold) {
+		select {
+		case <-looked:
+		case <-time.After(10 * time.Second):
+		}
+	}
+	heldAnswered.Store(&hook)
+	t.Cleanup(func() { heldAnswered.Store(nil) })
 
 	type reply struct {
 		code int
@@ -404,6 +419,10 @@ func TestUnroutedRequestShownThenAnswered(t *testing.T) {
 	if len(rs) != 1 || !rs[0].Done || rs[0].Status != http.StatusGatewayTimeout || !strings.Contains(rs[0].Error, "without routing") {
 		t.Fatalf("the held request's route: %+v", rs)
 	}
+	if rs[0].Held == "" {
+		t.Fatalf("the held request's route names no report as it is answered: %+v", rs)
+	}
+	look()
 	heldSaved(t, s)
 }
 
@@ -639,4 +658,29 @@ func TestUnroutedTimersLetGoOfRequest(t *testing.T) {
 		t.Fatal("a stopped unrouted timer still reaches its request's body")
 	}
 	runtime.KeepAlive(timers)
+}
+
+// TestUnroutedContextLetsGoOfRequest: the same for a context timer. A
+// WithTimeout under the request's context, stopped as its call ended,
+// keeps that context, and its values, in the timer heap as long, and
+// through the watch's value or the inflight's one kept the request's
+// body (#5250 again: a socket's turn bodies on ubuntu CI). The test
+// holds the context as that heap does.
+func TestUnroutedContextLetsGoOfRequest(t *testing.T) {
+	body := make([]byte, 64<<10)
+	gone := weak.Make(&body[0])
+	f := &inflight{}
+	r := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	body = nil
+	r = r.WithContext(context.WithValue(r.Context(), inflightKey{}, f))
+	_, r, unwatch := (&Server{}).watchUnrouted(httptest.NewRecorder(), r, f)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Hour)
+	cancel()
+	unwatch()
+	r, f = nil, nil
+	runtime.GC()
+	if gone.Value() != nil {
+		t.Fatal("a context kept after its handler returned still reaches its request's body")
+	}
+	runtime.KeepAlive(ctx)
 }

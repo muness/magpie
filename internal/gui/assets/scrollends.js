@@ -38,8 +38,9 @@
     box.classList.toggle("on", on || held);
     let bottom = innerHeight - r.bottom + 16;
     // above a page's own sticky foot under it (Providers' Add buttons, a
-    // Routing group editor's Cancel and Add: Jiabubu on Discord)
-    for (const foot of v.querySelectorAll(":scope > .after-list:not(.away), .view-foot")) {
+    // Routing group editor's Cancel and Add: Jiabubu on Discord; Plugins'
+    // install box, the Library's save and pick bars: WaiooT on X)
+    for (const foot of v.querySelectorAll(":scope > .after-list:not(.away), .view-foot, .pm-manual, .lib-savebar, .lib-pickbar")) {
       const f = foot.getBoundingClientRect();
       if (getComputedStyle(foot).position === "sticky" && f.bottom > innerHeight - bottom - box.offsetHeight && f.top < innerHeight - bottom) bottom = Math.max(bottom, innerHeight - f.top + 8);
     }
@@ -66,7 +67,10 @@
   });
   function watch(v) {
     if (!seen.has(v)) seen.add(v), sizes.observe(v), kids.observe(v, { childList: true });
-    for (const c of v.children) if (!seen.has(c)) seen.add(c), sizes.observe(c);
+    // not app.js's .view-room: "where the reader is" sizes it while sizes
+    // are being told, and WebKit calls that a loop; it sets scrollTop with
+    // it, and the scroll is heard
+    for (const c of v.children) if (!seen.has(c) && !c.classList.contains("view-room")) seen.add(c), sizes.observe(c);
   }
   function go(e, top) {
     const v = open();

@@ -43,6 +43,7 @@ var matchOpening func(*rowChunk)
 // hintsOf are chunks' hints, read from a chunk only when none are kept for
 // its serial.
 func hintsOf(chunks []*rowChunk, rows *chunkRows) []*chunkHints {
+	derivedUsed()
 	matchHints.Lock()
 	matchHints.turn++
 	turn := matchHints.turn
@@ -73,7 +74,7 @@ func hintsOf(chunks []*rowChunk, rows *chunkRows) []*chunkHints {
 				continue
 			}
 			session := open.Strings[open.text(p, 13)]
-			if a := open.Strings[open.text(p, 0)]; a == "agy" || session == "" && agyGateway(a) {
+			if a := open.Strings[open.text(p, 0)]; agyLocal(a) || session == "" && agyGateway(a) {
 				session = agyMatchSession
 			}
 			if s := matchHash(session); len(h.sessions) == 0 || h.sessions[len(h.sessions)-1] != s {

@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -40,21 +41,18 @@ const copilotUnionsRequest = `{"model":"copilot/gemini-3.8-flash","stream":true,
                "required":["type"],"additionalProperties":false}]}},
       "required":["target"],"additionalProperties":false}}]}`
 
-// TestCopilotGeminiTakesCodexUnionsAsOneOf: Copilot's Gemini turned every
-// tool-bearing turn of Codex's away 400 "invalid request body" (#4374,
-// #3931's comparisons: the same request with the disjoint unions as oneOf
-// came back 200). What Copilot's Gemini rejects is the anyOf, so a
-// provably disjoint one goes as oneOf, which says the same to a model
-// choosing what to call.
-func TestCopilotGeminiTakesCodexUnionsAsOneOf(t *testing.T) {
+// TestCopilotGeminiFoldsCodexUnions: Copilot's Gemini turned every
+// tool-bearing turn of Codex's away 400 on an anyOf of object branches
+// (#4374), and takes a oneOf with 200 but drops its branches, so the model
+// answers with a string (DaVinci42, Novello42 on X). The disjoint branches
+// are folded into the one object they describe, which both take.
+func TestCopilotGeminiFoldsCodexUnions(t *testing.T) {
 	var mu sync.Mutex
 	var sent []string
 	copilotTurnFake(t, map[string]string{
 		"gemini-3.8-flash": `["/chat/completions"]`,
 	}, nil, func(m string, b []byte) bool {
-		// as #3931's live comparisons show: a tool whose schema carries an
-		// object anyOf turns the whole request away, whatever else it says
-		return bytes.Contains(b, []byte(`"anyOf"`))
+		return bytes.Contains(b, []byte(`"anyOf"`)) || bytes.Contains(b, []byte(`"oneOf"`))
 	}, "invalid request body", http.StatusBadRequest, &sent)
 
 	rec := httptest.NewRecorder()
@@ -67,11 +65,93 @@ func TestCopilotGeminiTakesCodexUnionsAsOneOf(t *testing.T) {
 	if len(sent) != 1 {
 		t.Fatalf("Copilot was asked %d times", len(sent))
 	}
-	if strings.Contains(sent[0], `"anyOf"`) {
-		t.Errorf("Codex's disjoint union went to Copilot's Gemini as anyOf, which it turns away: %s", sent[0])
+	if !strings.Contains(sent[0], `"enum":["project","projectless"]`) || !strings.Contains(sent[0], `"project_id"`) {
+		t.Errorf("the union was not folded into one object: %s", sent[0])
 	}
-	if !strings.Contains(sent[0], `"oneOf"`) {
-		t.Errorf("the union went as neither anyOf nor oneOf: %s", sent[0])
+}
+
+// The reporter's four cases (DaVinci42 on #4374, v0.1.3925), each as the
+// chat body they posted.
+func TestCopilotGeminiReporterSchemas(t *testing.T) {
+	cases := []struct{ name, schema, want, not string }{
+		{"disjoint object anyOf", `{"type":"object","properties":{"target":{"anyOf":[
+          {"type":"object","properties":{"type":{"type":"string","enum":["project"]},"projectId":{"type":"string"}},"required":["type","projectId"],"additionalProperties":false},
+          {"type":"object","properties":{"type":{"type":"string","enum":["none"]}},"required":["type"],"additionalProperties":false}]}},"required":["target"]}`,
+			`"target":{"additionalProperties":false,"properties":{"projectId":{"type":"string"},"type":{"enum":["project","none"],"type":"string"}},"required":["type"],"type":"object"}`, `Of"`},
+		{"$ref object anyOf", `{"type":"object","$defs":{"ById":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]},"ByPath":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
+          "properties":{"target":{"anyOf":[{"$ref":"#/$defs/ById"},{"$ref":"#/$defs/ByPath"}]}},"required":["target"]}`,
+			`"target":{"properties":{"id":{"type":"string"},"path":{"type":"string"}},"type":"object"}`, `"target":{"type":"string"`},
+		{"type beside a nullable anyOf", `{"type":"object","properties":{"x":{"type":"string","anyOf":[{"type":"string"},{"type":"null"}]}}}`,
+			`"x":{"anyOf":[{"type":"string"},{"type":"null"}]}`, `"x":{"type":"string"`},
+		{"bare array", `{"type":"object","properties":{"items":{"type":"array"}}}`,
+			`"items":{"items":{"type":"string"},"type":"array"}`, ``},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var sent []string
+			copilotTurnFake(t, map[string]string{"gemini-3.8-flash": `["/chat/completions"]`}, nil,
+				func(m string, b []byte) bool {
+					var req struct {
+						Tools []struct {
+							Function struct {
+								Parameters any `json:"parameters"`
+							} `json:"function"`
+						} `json:"tools"`
+					}
+					json.Unmarshal(b, &req)
+					bad := false
+					var walk func(v any)
+					walk = func(v any) {
+						switch x := v.(type) {
+						case map[string]any:
+							if _, u := x["anyOf"]; u {
+								if _, ty := x["type"]; ty {
+									bad = true
+								}
+							}
+							if x["type"] == "array" && x["items"] == nil {
+								bad = true
+							}
+							for _, c := range x {
+								walk(c)
+							}
+						case []any:
+							for _, c := range x {
+								walk(c)
+							}
+						}
+					}
+					for _, tl := range req.Tools {
+						walk(tl.Function.Parameters)
+					}
+					return bad
+				}, "invalid request body", http.StatusBadRequest, &sent)
+			req := `{"model":"copilot/gemini-3.8-flash","stream":false,"messages":[{"role":"user","content":"hi"}],
+			"tools":[{"type":"function","function":{"name":"t","parameters":` + c.schema + `}}]}`
+			rec := httptest.NewRecorder()
+			New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(req)))
+			if rec.Code != 200 || len(sent) != 1 {
+				t.Fatalf("%d %s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(sent[0], c.want) {
+				t.Errorf("want %s in %s", c.want, sent[0])
+			}
+			if c.not != "" && strings.Contains(sent[0], c.not) {
+				t.Errorf("%s in %s", c.not, sent[0])
+			}
+		})
+	}
+}
+
+// Another vendor's Gemini keeps its schema as it came: none of the above is
+// done for it.
+func TestCopilotGeminiShapesLeaveOthersAlone(t *testing.T) {
+	body := `{"model":"gemini-3.8-flash","tools":[{"type":"function","function":{"name":"t","parameters":{"type":"object","properties":{"a":{"type":"array"},"x":{"type":"string","anyOf":[{"type":"string"},{"type":"null"}]}}}}}]}`
+	for _, agent := range []string{"claude", ""} {
+		p := provider.Provider{Account: &provider.Account{Agent: agent}}
+		if got := string(copilotGeminiToolShapes(p, provider.Chat, []byte(body))); got != body {
+			t.Errorf("%q changed: %s", agent, got)
+		}
 	}
 }
 
@@ -87,7 +167,8 @@ const copilotOverlappingRequest = `{"model":"copilot/gemini-3.8-flash","stream":
 
 // TestCopilotGeminiKeepsUnprovenUnions: only what is provably disjoint
 // goes as oneOf. A union whose branches can't be told apart stays an
-// anyOf, and Copilot's refusal of it still reaches the client, as it did
+// anyOf (one of mixed types: same-type branches are merged,
+// TestCopilotGeminiTakesToolShapes), and Copilot's refusal of it still reaches the client, as it did
 // before (#4374's Gemini turns were all refused; this union is one the
 // conversion leaves as it came).
 func TestCopilotGeminiKeepsUnprovenUnions(t *testing.T) {
@@ -100,7 +181,8 @@ func TestCopilotGeminiKeepsUnprovenUnions(t *testing.T) {
 	}, "invalid request body", http.StatusBadRequest, &sent)
 
 	rec := httptest.NewRecorder()
-	New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(copilotOverlappingRequest)))
+	New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(strings.Replace(copilotOverlappingRequest,
+		`{"type":"object","properties":{"square":{"type":"boolean"}}}`, `{"type":"array","items":{"type":"string"}}`, 1))))
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid request body") {
 		t.Fatalf("%d %s", rec.Code, rec.Body.String())
 	}
@@ -187,38 +269,13 @@ func copilotTurnFake(t *testing.T, models map[string]string, refuse func(model s
 	chatRefuse func(model string, body []byte) bool, chatMessage string, chatStatus int, sent *[]string,
 ) {
 	t.Helper()
-	fresh(t)
-	cfg := os.Getenv("XDG_CONFIG_HOME")
-	os.MkdirAll(filepath.Join(cfg, "github-copilot"), 0o755)
-	os.WriteFile(filepath.Join(cfg, "github-copilot", "apps.json"), mustJSON(map[string]any{
-		"github.com:Iv1.x": map[string]any{"user": "echo", "oauth_token": "gho_echo"},
-	}), 0o600)
-
 	var mu sync.Mutex
 	note := func(m string, b []byte) {
 		mu.Lock()
 		*sent = append(*sent, m+" "+string(b))
 		mu.Unlock()
 	}
-	// the account's model list, as Copilot's would have it: each model on
-	// the APIs its endpoints give
-	var live []catalog.Model
-	for id, endpoints := range models {
-		var apis []string
-		for _, e := range strings.Split(strings.Trim(strings.ReplaceAll(endpoints, "/v1/messages", "/chat/completions"), `[]"`), ",") {
-			switch strings.TrimSpace(e) {
-			case "/responses":
-				apis = append(apis, "responses")
-			default:
-				apis = append(apis, "chat")
-			}
-		}
-		live = append(live, catalog.Model{ID: id, Name: id, APIs: apis, Efforts: []string{"low", "medium", "high"}})
-	}
-	if err := catalog.SaveLive("copilot", "https://api.githubcopilot.com", live); err != nil {
-		t.Fatalf("save live: %v", err)
-	}
-	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	copilotAPIFake(t, models, func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		switch r.URL.Path {
 		case "/models":
@@ -256,7 +313,39 @@ func copilotTurnFake(t *testing.T, models map[string]string, refuse func(model s
 		default:
 			w.WriteHeader(404)
 		}
-	}))
+	})
+}
+
+// copilotAPIFake is a signed-in Copilot account whose API is api, serving
+// models (id → endpoints, as Copilot's model list gives them).
+func copilotAPIFake(t *testing.T, models map[string]string, api http.HandlerFunc) {
+	t.Helper()
+	fresh(t)
+	cfg := os.Getenv("XDG_CONFIG_HOME")
+	os.MkdirAll(filepath.Join(cfg, "github-copilot"), 0o755)
+	os.WriteFile(filepath.Join(cfg, "github-copilot", "apps.json"), mustJSON(map[string]any{
+		"github.com:Iv1.x": map[string]any{"user": "echo", "oauth_token": "gho_echo"},
+	}), 0o600)
+
+	// the account's model list, as Copilot's would have it: each model on
+	// the APIs its endpoints give
+	var live []catalog.Model
+	for id, endpoints := range models {
+		var apis []string
+		for _, e := range strings.Split(strings.Trim(strings.ReplaceAll(endpoints, "/v1/messages", "/chat/completions"), `[]"`), ",") {
+			switch strings.TrimSpace(e) {
+			case "/responses":
+				apis = append(apis, "responses")
+			default:
+				apis = append(apis, "chat")
+			}
+		}
+		live = append(live, catalog.Model{ID: id, Name: id, APIs: apis, Efforts: []string{"low", "medium", "high"}})
+	}
+	if err := catalog.SaveLive("copilot", "https://api.githubcopilot.com", live); err != nil {
+		t.Fatalf("save live: %v", err)
+	}
+	apiSrv := httptest.NewServer(api)
 	t.Cleanup(apiSrv.Close)
 	ghSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/token") {
@@ -269,4 +358,142 @@ func copilotTurnFake(t *testing.T, models map[string]string, refuse func(model s
 	oldTok, oldUser := provider.CopilotTokenURL, provider.CopilotUserURL
 	provider.CopilotTokenURL, provider.CopilotUserURL = ghSrv.URL+"/token", ghSrv.URL+"/user"
 	t.Cleanup(func() { provider.CopilotTokenURL, provider.CopilotUserURL = oldTok, oldUser })
+}
+
+// copilotNullableRequest carries Codex Desktop's real move_thread_to_project
+// (#4374, RoyShen12's isolation and yuushabu_buyinn's report): projectId a
+// nullable string as anyOf, and the other shapes a nullable takes — oneOf,
+// inside an array's items, behind a $def.
+const copilotNullableRequest = `{"model":"copilot/gemini-3.8-flash","stream":true,"store":false,
+  "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+  "tools":[{"type":"function","name":"move_thread_to_project","description":"Move a thread.",
+    "parameters":{"type":"object","properties":{
+      "projectId":{"anyOf":[{"type":"string"},{"type":"null"}],"description":"Destination, or null."},
+      "alt":{"oneOf":[{"type":"integer"},{"type":"null"}]},
+      "many":{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"null"}]}},
+      "ref":{"$ref":"#/$defs/maybe"}},
+      "$defs":{"maybe":{"anyOf":[{"type":"number"},{"type":"null"}]}},
+      "required":["projectId"],"additionalProperties":false}}]}`
+
+// TestCopilotGeminiKeepsNullableUnionsUntyped: the type written beside a
+// nullable union (Vertex wants one) is what Copilot's Gemini turns away
+// 400 "invalid request body": removing that one field made the live
+// request 200 (#4374). Every union goes as its client wrote it.
+func TestCopilotGeminiKeepsNullableUnionsUntyped(t *testing.T) {
+	var mu sync.Mutex
+	var sent []string
+	copilotTurnFake(t, map[string]string{
+		"gemini-3.8-flash": `["/chat/completions"]`,
+	}, nil, func(m string, b []byte) bool {
+		bad := false
+		var walk func(v any)
+		walk = func(v any) {
+			switch x := v.(type) {
+			case map[string]any:
+				_, a := x["anyOf"]
+				_, o := x["oneOf"]
+				if _, ty := x["type"]; (a || o) && ty {
+					bad = true
+				}
+				for _, c := range x {
+					walk(c)
+				}
+			case []any:
+				for _, c := range x {
+					walk(c)
+				}
+			}
+		}
+		var req map[string]any
+		json.Unmarshal(b, &req)
+		walk(req["tools"])
+		return bad
+	}, "invalid request body", http.StatusBadRequest, &sent)
+
+	rec := httptest.NewRecorder()
+	New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(copilotNullableRequest)))
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "hi") {
+		t.Fatalf("%d %s", rec.Code, rec.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) != 1 || !strings.Contains(sent[0], `"anyOf"`) {
+		t.Fatalf("Copilot was asked %q", sent)
+	}
+}
+
+// TestGeminiTypesOtherVendorsKeepTheirs: only Copilot's Gemini leaves a
+// union untyped; a Vertex-bound Gemini behind any other provider is still
+// given the type Vertex requires.
+func TestGeminiTypesOtherVendorsKeepTheirs(t *testing.T) {
+	body := []byte(`{"model":"gemini-3.8-flash","tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"p":{"anyOf":[{"type":"string"},{"type":"null"}]}}}}}]}`)
+	other := provider.Provider{Account: &provider.Account{Agent: "claude"}}
+	if copilotGemini(other, body) {
+		t.Fatal("another provider counted as Copilot")
+	}
+	if got := geminiTypes(body, copilotGemini(other, body)); !strings.Contains(string(got), `"p":{"type":"string","anyOf"`) {
+		t.Errorf("another vendor's union lost its type: %s", got)
+	}
+	cp := provider.Provider{Account: &provider.Account{Agent: "copilot"}}
+	if got := geminiTypes(body, copilotGemini(cp, body)); strings.Contains(string(got), `"type":"string","anyOf"`) {
+		t.Errorf("Copilot's union was typed: %s", got)
+	}
+}
+
+// copilotNamespaceRequest is Codex Desktop's turn with an ordinary
+// namespace (an MCP server's tools) and a function whose parameters are a
+// root union.
+const copilotNamespaceRequest = `{"model":"copilot/%s","stream":true,"store":false,
+  "input":[{"role":"user","content":"hi"}],
+  "tools":[{"type":"namespace","name":"mcp__codex_app","description":"Codex app.",
+     "tools":[{"type":"function","name":"move_thread_to_project","description":"Move.","parameters":{"type":"object","properties":{"projectId":{"type":"string"}}}}]},
+    {"type":"function","name":"automation_update","description":"Update.","parameters":{"oneOf":[
+      {"type":"object","properties":{"mode":{"type":"string","enum":["a"]}},"required":["mode"]},
+      {"type":"object","properties":{"mode":{"type":"string","enum":["b"]}},"required":["mode"]}]}}]}`
+
+// TestCopilotGrokTakesNamespacesFlat: Grok behind Copilot turns a request
+// with a namespace tool, or a function whose parameters are a root union,
+// away; flat names and object roots gave 200 (#4374). GPT on the same
+// /responses is handed the tools as they came.
+func TestCopilotGrokTakesNamespacesFlat(t *testing.T) {
+	var mu sync.Mutex
+	var sent []string
+	copilotTurnFake(t, map[string]string{
+		"grok-4.7": `["/responses"]`,
+		"gpt-6.1":  `["/responses"]`,
+	}, func(m string, b []byte) (int, string) {
+		if m == "grok-4.7" && (bytes.Contains(b, []byte(`"type":"namespace"`)) || bytes.Contains(b, []byte(`"oneOf"`))) {
+			return http.StatusBadRequest, `{"error":{"message":"Bad Request","type":"invalid_request_error"}}`
+		}
+		return 0, ""
+	}, nil, "", 0, &sent)
+	turn := func(model string) {
+		rec := httptest.NewRecorder()
+		New().Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(fmt.Sprintf(copilotNamespaceRequest, model))))
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), "DONE") {
+			t.Fatalf("%s: %d %s", model, rec.Code, rec.Body.String())
+		}
+	}
+	turn("grok-4.7")
+	turn("gpt-6.1")
+	mu.Lock()
+	defer mu.Unlock()
+	for _, s := range sent {
+		switch {
+		case strings.HasPrefix(s, "grok-4.7 "):
+			if !strings.Contains(s, `"name":"mcp__codex_app__move_thread_to_project"`) || strings.Contains(s, `"namespace"`) {
+				t.Errorf("Grok's namespace not flat: %s", s)
+			}
+			if !strings.Contains(s, `"name":"automation_update"`) {
+				t.Errorf("a plain function was lost: %s", s)
+			}
+		case strings.HasPrefix(s, "gpt-6.1 "):
+			if !strings.Contains(s, `"type":"namespace"`) || !strings.Contains(s, `"oneOf"`) {
+				t.Errorf("GPT's tools were changed: %s", s)
+			}
+		}
+	}
+	if len(sent) != 2 {
+		t.Fatalf("Copilot took %d turns", len(sent))
+	}
 }

@@ -19,13 +19,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -33,7 +33,7 @@ import (
 // connection was made: a name that didn't resolve, no route, refused, a
 // dial or TLS handshake that timed out. A proxy that is down (proxyDown)
 // is told apart before it.
-var connFailed = regexp.MustCompile(`dial tcp |dial udp |lookup [^ ]+|TLS handshake timeout|network is unreachable|no route to host|Unable to connect|ConnectionRefused|FailedToOpenSocket|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH`)
+var connFailed = lazyre.New(`dial tcp |dial udp |lookup [^ ]+|TLS handshake timeout|network is unreachable|no route to host|Unable to connect|ConnectionRefused|FailedToOpenSocket|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH`)
 
 // lastHeard is when any upstream last answered, as unix nanoseconds.
 var lastHeard atomic.Int64
@@ -126,7 +126,9 @@ func hostsOf(p provider.Provider) []string {
 
 // otherHosts is up to three hosts of providers other than p, reached
 // directly as p was, that tell whether the network is up: not p's own,
-// nor one reached through a proxy, nor a near one.
+// nor one reached through a proxy or at addresses of the user's choosing
+// (Resolve: dialled by name here, it may not resolve on a managed
+// network that works), nor a near one.
 func otherHosts(p provider.Provider) []string {
 	own := map[string]bool{}
 	for _, h := range hostsOf(p) {
@@ -134,7 +136,7 @@ func otherHosts(p provider.Provider) []string {
 	}
 	var out []string
 	for _, o := range provider.All() {
-		if o.ID == p.ID || o.Proxy != "" {
+		if o.ID == p.ID || o.Proxy != "" || len(o.Resolve) > 0 {
 			continue
 		}
 		for _, h := range hostsOf(o) {

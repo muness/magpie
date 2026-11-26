@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"bytes"
 	"encoding/json"
 	"strings"
 
@@ -25,9 +24,12 @@ import (
 // advisor when the request's model is not Claude's (a vendor's Messages
 // API knows no such tool): the turn is answered without one, as a model
 // that isn't on magpie would be. What Claude Code put in the conversation
-// for an advisor left out goes with it (withoutAdvisor).
-func advisorTools(body []byte, p provider.Provider, upstream string, wires map[string]string) []byte {
-	if !bytes.Contains(body, []byte(`"advisor_`)) {
+// for an advisor left out goes with it (withoutAdvisor). allowed says
+// whether the calling key may use one of p's models (keyAllows): the
+// advisor's model is the client's to name, and the vendor runs it on the
+// user's account, so a key held to some models is held here too.
+func advisorTools(body []byte, p provider.Provider, upstream string, wires map[string]string, allowed func(model string) bool) []byte {
+	if !bodyHas(body, `"advisor_`) {
 		return body
 	}
 	tools := gjson.GetBytes(body, "tools")
@@ -52,6 +54,9 @@ func advisorTools(body []byte, p provider.Provider, upstream string, wires map[s
 		}
 		json.Unmarshal(t["model"], &model)
 		name, ok := advisorModel(p, model, wires)
+		if ok && allowed != nil && !allowed(advisorKeyModel(model)) {
+			ok = false
+		}
 		if !claude || !ok {
 			var n string
 			json.Unmarshal(t["name"], &n)
@@ -84,11 +89,42 @@ func advisorTools(body []byte, p provider.Provider, upstream string, wires map[s
 	return out
 }
 
+// advisorID is the advisor model Claude Code names, taken to the id magpie
+// serves as a request's own model is (validateModel): Claude Code is given
+// a dotted Claude id with dashes (provider.ClaudeSpelled) and writes
+// settings.json's advisorModel so, and it sends that id as written, its
+// [1m] or [2m] mark dropped. Taken as it was, relay/claude-fable-5-2 was no
+// model of a provider that lists claude-fable-5.2, so it went upstream as
+// claude-fable-5-2 beside the request's claude-opus-5.5, a name the relay
+// doesn't know (Refeccd on Discord).
+func advisorID(model string) string {
+	model = strings.TrimSpace(model)
+	model = strings.TrimSuffix(strings.TrimSuffix(model, "[1m]"), "[2m]")
+	if model == "" {
+		return ""
+	}
+	if real, ok := provider.ClaudeUndashed(model); ok {
+		return real
+	}
+	return provider.CanonicalRef(unflat(model))
+}
+
+// advisorKeyModel is the model id a key's models are checked against for
+// an advisor named model: magpie's model id when it names one, else the
+// bare id as it was sent.
+func advisorKeyModel(model string) string {
+	model = advisorID(model)
+	if _, m, ok := provider.Resolve(model); ok && !provider.IsGroupRef(model) {
+		return m
+	}
+	return model
+}
+
 // advisorModel is the name p's upstream knows the advisor model by, and
 // whether p can run it: one of p's models, by magpie's id, or a Claude
 // model's own id that names no provider.
 func advisorModel(p provider.Provider, model string, wires map[string]string) (string, bool) {
-	model = strings.TrimSuffix(strings.TrimSpace(model), "[1m]")
+	model = advisorID(model)
 	if model == "" {
 		return "", false
 	}
@@ -132,6 +168,23 @@ func advisorGoneIn(text string) (string, bool) {
 	return text[:i] + advisorGone + trail + text[end:], true
 }
 
+// advisorCut is text without the advisor's instructions, up to the end of
+// the reminder they are in or of the text, and whether it held them: the
+// advisor model is asked with the executor's conversation (adviceFor), and
+// the executor's instructions to call it, or advisorGone in their place,
+// had it answer as the executor that it has no advisor (#6804).
+func advisorCut(text string) (string, bool) {
+	i := strings.Index(text, advisorNote)
+	if i < 0 {
+		return text, false
+	}
+	end := len(text)
+	if j := strings.Index(text[i:], "</system-reminder>"); j >= 0 {
+		end = i + j
+	}
+	return strings.TrimRight(text[:i], " \t\r\n") + text[end:], true
+}
+
 // withoutAdvisor is a Messages request's messages without what Claude Code
 // put there for an advisor tool that is left out, named in gone: the
 // tool_addition (or tool_removal, tool_reference) naming it, and a message
@@ -141,7 +194,7 @@ func advisorGoneIn(text string) (string, bool) {
 // tools, which Claude Code answers "No such tool available: advisor"
 // (JackChou on Discord).
 func withoutAdvisor(raw json.RawMessage, gone map[string]bool) (json.RawMessage, bool) {
-	if len(gone) == 0 || !bytes.Contains(raw, []byte("dvisor")) {
+	if len(gone) == 0 || !bodyHas(raw, "dvisor") {
 		return raw, false
 	}
 	var msgs []map[string]json.RawMessage

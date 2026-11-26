@@ -75,7 +75,7 @@ func SaveGatewayTurnGeneration(turn GatewayTurn, generation uint64) error {
 
 func saveGatewayTurn(turn GatewayTurn, generation uint64) error {
 	gatewayMu.Lock()
-	allowed := settings.Load().GatewayConversations && generation == gatewayGeneration
+	allowed := settings.Shared().GatewayConversations && generation == gatewayGeneration
 	gatewayMu.Unlock()
 	if !allowed || turn.Agent == "" || turn.Session == "" {
 		return nil
@@ -121,7 +121,7 @@ func saveGatewayTurn(turn GatewayTurn, generation uint64) error {
 	}
 	gatewayMu.Lock()
 	defer gatewayMu.Unlock()
-	if generation != gatewayGeneration || !settings.Load().GatewayConversations {
+	if generation != gatewayGeneration || !settings.Shared().GatewayConversations {
 		return nil
 	}
 	dir := filepath.Join(gatewayDir(), turn.Time.UTC().Format(time.DateOnly), gatewayIdentity(turn.Agent, turn.Session))
@@ -431,8 +431,18 @@ func GatewayTranscript(agent, id string) (Transcript, error) {
 			fresh = input[len(previous):]
 		}
 		for _, p := range fresh {
-			if !out.add(true, p) {
-				return out, nil
+			// a turn WorkBuddy (or Cursor) sends as its context and the
+			// user's words in one block, as in its own files (wbTyped)
+			parts := []Part{p}
+			if p.Role == "user" && p.Kind == "text" && strings.HasPrefix(strings.TrimSpace(p.Text), "<") {
+				if split, ok := wbSplit(p.Text); ok {
+					parts = split
+				}
+			}
+			for _, p := range parts {
+				if !out.add(true, p) {
+					return out, nil
+				}
 			}
 		}
 		for _, p := range turn.Output {

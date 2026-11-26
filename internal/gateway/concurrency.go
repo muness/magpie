@@ -35,6 +35,73 @@ type lanes struct {
 	// given back or a rest is lifted (signal): a request waiting in one
 	// lane looks then for another with room (waitMate)
 	freed chan struct{}
+	// ended is when a turn on each key or account last gave its slot
+	// back, its reply read to the end: what it spent is counted by then
+	// (cap_near.go reads usage again after it)
+	ended map[string]time.Time
+	turns map[string]int // how many turns each has had come back
+	idles int            // turns waiting in idle, for tests
+	// planned is each's turns found not near a usage cap, or let in near
+	// it, that haven't taken their lane yet: out on it already, for out
+	// and idle (#6958)
+	planned map[string]int
+	// read is how many turns had come back on each when one of its turns
+	// last took its lane: a reply tells the usage as its turn begins, so
+	// the reading it brings has those turns and none come back since
+	// (cap_near.go, #6958)
+	read map[string]int
+}
+
+// began notes that one of who's turns took its lane now.
+func (l *lanes) began(who string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.read == nil {
+		l.read = map[string]int{}
+	}
+	l.read[who] = l.turns[who]
+}
+
+// readThrough notes a reading of who's usage that has its first n turns
+// come back: read again with none out (nearCapAgain).
+func (l *lanes) readThrough(who string, n int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.read == nil {
+		l.read = map[string]int{}
+	}
+	l.read[who] = max(l.read[who], n)
+}
+
+// inReading is how many of who's turns come back the reading last told
+// has at most: those come back as one of its turns last took its lane.
+func (l *lanes) inReading(who string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.read[who]
+}
+
+// plan counts a turn out on who before it takes its lane, and gives back
+// the func that stops counting it: called once its lane counts it, or as
+// it leaves.
+func (l *lanes) plan(who string) func() {
+	l.mu.Lock()
+	if l.planned == nil {
+		l.planned = map[string]int{}
+	}
+	l.planned[who]++
+	l.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			l.mu.Lock()
+			if l.planned[who]--; l.planned[who] <= 0 {
+				delete(l.planned, who)
+			}
+			l.signalLocked()
+			l.mu.Unlock()
+		})
+	}
 }
 
 // signalLocked wakes every request waiting in a lane to look for another
@@ -437,6 +504,14 @@ func (l *lanes) releaser(who string, ln *lane) func() {
 	return func() {
 		once.Do(func() {
 			l.mu.Lock()
+			if l.ended == nil {
+				l.ended = map[string]time.Time{}
+			}
+			l.ended[who] = time.Now()
+			if l.turns == nil {
+				l.turns = map[string]int{}
+			}
+			l.turns[who]++
 			ln.busy--
 			ln.grant()
 			l.drop(who, ln)
@@ -444,6 +519,60 @@ func (l *lanes) releaser(who string, ln *lane) func() {
 			l.mu.Unlock()
 		})
 	}
+}
+
+// out is how many of who's turns are out at the vendor now, those found
+// not near its cap on their way to their lane among them (plan), when one
+// last came back, and how many have come back.
+func (l *lanes) out(who string) (busy int, ended time.Time, turns int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	busy = l.planned[who]
+	if ln := l.m[who]; ln != nil {
+		busy += ln.busy
+	}
+	return busy, l.ended[who], l.turns[who]
+}
+
+// idle waits till no more than own of who's slots are taken (the
+// caller's own), or ctx ends.
+func (l *lanes) idle(ctx context.Context, who string, own int) error {
+	for {
+		l.mu.Lock()
+		busy := l.planned[who]
+		if ln := l.m[who]; ln != nil {
+			busy += ln.busy
+		}
+		if busy <= own {
+			l.mu.Unlock()
+			return nil
+		}
+		if l.freed == nil {
+			l.freed = make(chan struct{})
+		}
+		freed := l.freed
+		l.idles++
+		l.mu.Unlock()
+		var err error
+		select {
+		case <-freed:
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+		l.mu.Lock()
+		l.idles--
+		l.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// idling is how many turns wait in idle.
+func (l *lanes) idling() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.idles
 }
 
 // grant lets those first in the queue go while there is room.
@@ -493,8 +622,13 @@ func (s *Server) concurrency(w http.ResponseWriter, r *http.Request) {
 	for _, ln := range lanes {
 		waiting += ln.Waiting
 	}
+	// and those waiting for a slot of their gateway key's (key_slots.go)
+	keys := s.KeyLanes()
+	for _, ln := range keys {
+		waiting += ln.Waiting
+	}
 	b := s.Busy()
-	writeJSON(w, 200, map[string]any{"object": "concurrency", "data": lanes, "requests": b.Requests, "waiting": waiting, "tools": b.Tools, "active": s.Active()})
+	writeJSON(w, 200, map[string]any{"object": "concurrency", "data": lanes, "requests": b.Requests, "keys": keys, "waiting": waiting, "tools": b.Tools, "active": s.Active()})
 }
 
 // Lanes is how each key or account with requests out or waiting stands,

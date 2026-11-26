@@ -3,6 +3,9 @@ package gateway
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -12,8 +15,10 @@ import (
 // Every route Handler registers is either a client route `magpie web`'s
 // port hands to the gateway (ClientPath), or one named here that stays on
 // the gateway's port alone: its info page at /, the /api/* routes (the
-// page's own namespace there) and the Claude helper's callbacks under
-// /_magpie/. A route added to Handler and to neither fails this, so the
+// page's own namespace there), the Claude helper's callbacks under
+// /_magpie/, and the artifacts' pages under /a/ and their assets under
+// /_blob/, which are this computer's alone (artifactPage, artifactBlob)
+// while the page's port is the one put behind a proxy. A route added to Handler and to neither fails this, so the
 // one-port page doesn't miss it, or take it, by accident.
 func TestClientPathCoversHandler(t *testing.T) {
 	// the patterns as routes() registers them, not as its source reads
@@ -24,7 +29,7 @@ func TestClientPathCoversHandler(t *testing.T) {
 		}
 		p := strings.NewReplacer("{$}", "", "{id...}", "x", "{call...}", "x", "{id}", "x", "{token}", "x", "{name}", "x", "{agent}", "x").Replace(pat)
 		n++
-		stays := p == "/" || strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/_magpie/")
+		stays := p == "/" || strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/_magpie/") || strings.HasPrefix(p, ArtifactPagePath) || strings.HasPrefix(p, artifactBlobPath)
 		if ClientPath(p) == stays {
 			t.Errorf("%s (%s): ClientPath %v", pat, p, ClientPath(p))
 		}
@@ -46,6 +51,40 @@ func TestClientPathOnlyClean(t *testing.T) {
 		if !ClientPath(p) {
 			t.Errorf("%q is not a client path", p)
 		}
+	}
+}
+
+// docs/reference.md's LazyCat manifest makes public (public_path) every
+// client route and nothing else. A route it leaves out sends an agent that
+// isn't signed in to the box to the box's login page; one of the page's
+// own made public there lets a browser that isn't signed in reach magpie
+// without being sent to the box's sign-in.
+func TestLazyCatManifestListsTheClientRoutes(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "docs", "reference.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, doc, ok := strings.Cut(string(b), "\n#### LazyCat\n")
+	if !ok {
+		t.Fatal("docs/reference.md has no LazyCat section")
+	}
+	_, list, ok := strings.Cut(doc, "\n  public_path:\n")
+	if !ok {
+		t.Fatal("its manifest has no public_path")
+	}
+	var public []string
+	for _, l := range strings.Split(list, "\n") {
+		p, ok := strings.CutPrefix(strings.TrimSpace(l), "- ")
+		if !ok {
+			break
+		}
+		public = append(public, strings.TrimSuffix(p, "/"))
+	}
+	want := slices.Clone(clientPrefixes)
+	slices.Sort(public)
+	slices.Sort(want)
+	if !slices.Equal(public, want) {
+		t.Fatalf("public_path %v, the client routes %v", public, want)
 	}
 }
 

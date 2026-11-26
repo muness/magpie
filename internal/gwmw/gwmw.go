@@ -33,6 +33,22 @@ type Info struct {
 	Stream   bool   `json:"stream"`
 	Path     string `json:"path"`
 	Agent    string `json:"agent,omitempty"`
+	// Caller is the agent the request came from, here or on the first of
+	// the magpies that passed it on: what a plugin's chat.headers is told
+	// as input.caller. nil when no agent is known.
+	Caller *Caller `json:"caller,omitempty"`
+}
+
+// Caller is the agent a request came from, as the gateway records it:
+// its id, the name people know it by, and the computers it came through
+// when other magpies passed it on (the agent's first; empty for an agent
+// on this computer). The same shape and value as a plugin's
+// chat.headers input.caller, so a plugin reads one caller wherever it is
+// told one.
+type Caller struct {
+	Agent string   `json:"agent"`
+	Name  string   `json:"name"`
+	Via   []string `json:"via"`
 }
 
 // Reject is a request a middleware turned away: the agent gets Status with
@@ -268,7 +284,7 @@ func ForgetRefreshForTest() {
 
 // ErrUnmasked is the error a request gets when masking is wanted and
 // nothing can mask it.
-var ErrUnmasked = fmt.Errorf("masking is on in magpie's Settings → Privacy, but the redact plugin isn't serving it, so nothing was sent; turn the plugin on in Settings → Plugins")
+var ErrUnmasked = fmt.Errorf("masking is on in magpie's Settings › Privacy, but the Masking built-in isn't serving it, so nothing was sent; turn it on in Plugins › Built-in")
 
 // Served is the masker that serves now. With none, one refresh is asked
 // (at most once a second, never from inside one) and it is looked for

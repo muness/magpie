@@ -2,7 +2,6 @@ package sessions
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,14 +26,16 @@ func TestQoderUsageAfterWindowLoss(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					var c map[string]any
-					dec := json.NewDecoder(bytes.NewReader(b))
-					dec.UseNumber()
-					if err := dec.Decode(&c); err != nil {
+					files, ok := decodeCache(b, zone())
+					if !ok || files[path] == nil {
+						t.Fatalf("cache file: %q", b)
+					}
+					files[path].Claude = nil
+					var w bytes.Buffer
+					if err := encodeCache(&w, cacheFile{Version: cacheVersion, Zone: zone(), Parsers: parseVersions, Files: files}); err != nil {
 						t.Fatal(err)
 					}
-					delete(c["files"].(map[string]any)[path].(map[string]any), "claude")
-					b, _ = json.Marshal(c)
+					b = w.Bytes()
 					if err := os.WriteFile(CachePath(), b, 0o644); err != nil {
 						t.Fatal(err)
 					}
@@ -87,7 +88,7 @@ func TestClaudeLargeWindowSurvivesIdleAndSmallFiles(t *testing.T) {
 				t.Fatal(err)
 			}
 			snapshot := cache[path]
-			snapshot.Named = "must resume this summary"
+			snapshot.own().Named = "must resume this summary"
 			// Cross the old hard cutoff without sleeping. The cutoff used source
 			// mtime, so advancing only the eviction clock reproduces idle expiry.
 			later := time.Now().Add(2 * revisionIdle)
@@ -118,7 +119,7 @@ func TestClaudeLargeWindowSurvivesIdleAndSmallFiles(t *testing.T) {
 			}
 			appendText(t, path, string(claudeUsageLine(at.Add(time.Hour), "new", "", "m", Tokens{Input: 1, Output: 2}, "", true))+"\n")
 			read()
-			if cache[path].Named != "must resume this summary" {
+			if cache[path].more().Named != "must resume this summary" {
 				t.Fatal("summary reparsed the large prefix")
 			}
 			if got := cache[path].Models.of("m"); got != (Tokens{Input: 4001, Output: 8002}) {
@@ -180,7 +181,7 @@ func TestClaudeWindowReservationsAndRemoval(t *testing.T) {
 	cache[path] = cache[path].withoutRevisions()
 	// An additional Claude-compatible source uses the same default dispatch;
 	// retention must not carry a second hard-coded list of agent names.
-	windows := summaryRevisionWindows([]file{{path: path, agent: "claude-compatible", size: 1024, mod: now}}, now)
+	windows := summaryRevisionWindows([]file{{path: path, agent: "claude-compatible", size: 1024, mod: modOf(now)}}, now)
 	if !windows[path] || len(windows) != 1 {
 		t.Fatal("disk-only summaries reserved phantom slots", windows)
 	}

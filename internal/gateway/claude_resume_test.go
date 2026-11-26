@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
 	"net/http/httptest"
 	"os"
@@ -26,8 +27,9 @@ type resumeHarness struct {
 	p      provider.Provider
 	logs   string
 	config string
-	extra  string // fields each request has besides its own, each with a comma after it
-	from   string // the requests' address, "" for httptest's (another computer's)
+	extra  string  // fields each request has besides its own, each with a comma after it
+	from   string  // the requests' address, "" for httptest's (another computer's)
+	who    *caller // who the requests are recorded as, as withCaller notes it; nil for none
 }
 
 func newResumeHarness(t *testing.T) *resumeHarness {
@@ -117,7 +119,11 @@ func (h *resumeHarness) ask(system string, said ...string) {
 	body := `{"model":"claude-sonnet-5","max_tokens":100,` + h.extra + `"system":"` + system + `","tools":[{"name":"read","input_schema":{"type":"object"}}],"messages":[` + strings.Join(msgs, ",") + `]}`
 	rec := httptest.NewRecorder()
 	var u Usage
-	if code, msg := h.s.serveClaudeSubscription(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)), provider.Anthropic, h.p, "claude-sonnet-5", []byte(body), &u); code != 200 {
+	r := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+	if h.who != nil {
+		r = r.WithContext(context.WithValue(r.Context(), callerCtx{}, *h.who))
+	}
+	if code, msg := h.s.serveClaudeSubscription(rec, r, provider.Anthropic, h.p, "claude-sonnet-5", []byte(body), &u); code != 200 {
 		h.t.Fatalf("%d %s", code, msg)
 	}
 }
@@ -322,8 +328,13 @@ func TestClaudeSessionFilesAreRemoved(t *testing.T) {
 		t.Fatal("a discarded session's file stayed")
 	}
 
-	// the runs waiting end: their sessions go with them
+	// the runs waiting end as the gateway does: their sessions stay for
+	// the next start (#6292), which discards what it doesn't take
 	h.s.subscription.abortAll()
+	eventually(t, "the waiting runs ended", func() bool { return len(h.s.subscription.idle) == 0 && len(h.s.subscription.runs) == 0 })
+	for _, s := range h.s.subscription.shelf {
+		s.discard()
+	}
 	eventually(t, "sessions left", func() bool { return len(h.sessions()) == 0 })
 }
 
@@ -339,7 +350,7 @@ func TestClaudeOldSessionsAreSwept(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o600)
 	long := time.Now().Add(-2 * idleLongest)
 	os.Chtimes(old, long, long)
-	newSubscriptionBridge().sweepSessions([]string{dir})
+	newSubscriptionBridge().sweepSessions([]string{dir}, false)
 	// The sweep removes the session's file, then its folder: wait for both.
 	gone := func(p string) bool { _, err := os.Stat(p); return os.IsNotExist(err) }
 	eventually(t, "the old session stayed", func() bool { return gone(old) && gone(filepath.Join(dir, "old")) })

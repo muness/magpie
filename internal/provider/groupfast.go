@@ -14,9 +14,10 @@ package provider
 
 import (
 	"fmt"
-	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // FastWord is the last part of a member typed to be sent fast.
@@ -30,6 +31,11 @@ func MemberFast(id string) (member string, fast bool) {
 }
 
 func memberFastIn(entries []Entry, id string) (string, bool) {
+	if base, acct := MemberAccount(id); acct != "" {
+		// "a/m:high:fast#x": fast is said before the account, which is last
+		m, fast := memberFastIn(entries, base)
+		return WithMemberAccount(m, acct), fast
+	}
 	i := strings.LastIndex(id, ":")
 	if i <= 0 || !strings.EqualFold(id[i+1:], FastWord) {
 		return id, false
@@ -167,14 +173,34 @@ func modelSlug(model string) string {
 }
 
 var (
-	openAIFast = regexp.MustCompile(`^(gpt-|o\d)`)
+	openAIFast = lazyre.New(`^(gpt-|o\d)`)
 	// a dated id is its model's: claude-opus-4-8-20260501
-	claudeDated = regexp.MustCompile(`-\d{8}$`)
+	claudeDated = lazyre.New(`-\d{8}$`)
 )
 
 // claudeFastModels are the Claude models with fast mode (speed "fast",
-// beta fast-mode-2026-02-01).
-var claudeFastModels = []string{"claude-opus-4-8", "claude-opus-5", "claude-opus-5-5"}
+// beta fast-mode-2026-02-01). Fable 5.2 has it from its launch
+// (2026-11-09, $16/$80 per Mtok; Claude Code 2.1.321 offers it on Fable
+// 5.2 and Mythos 5.2); Fable 5.1 and before never had it.
+var claudeFastModels = []string{"claude-opus-4-8", "claude-opus-5", "claude-opus-5-5", "claude-fable-5-2"}
+
+// openAIUltraModels are the models OpenAI's API serves at service_tier
+// "ultrafast" (OoopsHh on X): GPT-6.2 Astra, GPT-6.2 Sol, GPT-6 Astra and
+// GPT-6.1 Sol, as its Ultrafast mode guide names them
+// (developers.openai.com/api/docs/guides/ultrafast-mode), on its Responses
+// API alone: on 11-18 api.openai.com's /v1/responses took the tier for these
+// four and turned it away ("Invalid service_tier argument") for GPT-6 Sol
+// and GPT-6.1 Terra, and /v1/chat/completions turned it away for all.
+var openAIUltraModels = []string{"gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol"}
+
+// openAIDated is a dated snapshot's suffix: gpt-6-astra-2026-09-14.
+var openAIDated = lazyre.New(`-(\d{4}-\d{2}-\d{2}|\d{8})$`)
+
+// OpenAIUltra reports whether OpenAI's API serves model, or a dated
+// snapshot of it, at service_tier "ultrafast".
+func OpenAIUltra(model string) bool {
+	return slices.Contains(openAIUltraModels, openAIDated.ReplaceAllString(modelSlug(model), ""))
+}
 
 // ClaudeFast reports whether a Claude model has fast mode.
 func ClaudeFast(model string) bool {
@@ -213,15 +239,37 @@ func cleanFast(entries []Entry, g *Group) error {
 		out = append(out, f)
 	}
 	g.Fast = out
+	// Ultra is a part of Fast: a member kept out of it is kept out here
+	g.Ultra = slices.DeleteFunc(slices.Clone(g.Ultra), func(u string) bool { return !slices.Contains(out, key(u)) })
 	return nil
+}
+
+// IsUltra reports whether the group sends member id in the faster mode.
+func (g Group) IsUltra(id string) bool {
+	return slices.Contains(g.Ultra, id) && slices.Contains(g.Fast, id)
 }
 
 // SetMemberFast sends the group's member id fast, or not, where it is in
 // the group.
 func (g *Group) SetMemberFast(id string, fast bool) {
+	tier := ""
+	if fast {
+		tier = "priority"
+	}
+	g.SetMemberTier(id, tier)
+}
+
+// SetMemberTier sends the group's member id at tier: "" the usual speed,
+// "priority" fast, "ultrafast" the faster mode of an account that offers
+// it. Only a member that is in the group is switched on.
+func (g *Group) SetMemberTier(id, tier string) {
 	g.Fast = slices.DeleteFunc(slices.Clone(g.Fast), func(x string) bool { return x == id })
-	if fast && slices.Contains(g.Members, id) {
+	g.Ultra = slices.DeleteFunc(slices.Clone(g.Ultra), func(x string) bool { return x == id })
+	if tier != "" && slices.Contains(g.Members, id) {
 		g.Fast = append(g.Fast, id)
+		if tier == "ultrafast" {
+			g.Ultra = append(g.Ultra, id)
+		}
 	}
 }
 
@@ -250,6 +298,11 @@ func (g *Group) RenameMember(from, to string) {
 			g.Fast[i] = to
 		}
 	}
+	for i, f := range g.Ultra {
+		if f == from {
+			g.Ultra[i] = to
+		}
+	}
 	for i, p := range g.Placed {
 		if p == from {
 			g.Placed[i] = to
@@ -261,6 +314,12 @@ func (g *Group) RenameMember(from, to string) {
 		}
 	}
 	g.Weights = renamedWeights(g.Weights, func(m string) string {
+		if m == from {
+			return to
+		}
+		return m
+	})
+	g.EffortMaps = renamedEffortMaps(g.EffortMaps, func(m string) string {
 		if m == from {
 			return to
 		}

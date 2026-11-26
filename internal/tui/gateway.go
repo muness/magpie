@@ -22,6 +22,20 @@ var gw struct {
 	err  atomic.Pointer[string] // why it couldn't, "" or nil when it could
 }
 
+// serving ends the gateway this terminal serves and waits for it to
+// drain, while Run runs.
+var serving atomic.Pointer[func()]
+
+// StopGateway ends the gateway the terminal serves, its idle Claude
+// sessions saved for the next magpie, and returns once it has drained: what
+// the terminal closing (SIGHUP, which bubbletea doesn't handle) runs before
+// magpie dies of it. Nothing when the terminal serves none.
+func StopGateway() {
+	if f := serving.Load(); f != nil {
+		(*f)()
+	}
+}
+
 // gatewayWatch is how often the terminal looks for a gateway gone.
 var gatewayWatch = 15 * time.Second
 
@@ -82,15 +96,15 @@ func serveGateway(ctx context.Context) (wait func()) {
 // nothing else to say: served here, or why agents can't reach it.
 func gatewayStatus() string {
 	if gw.here.Load() {
-		return sMuted.Render("● gateway " + gateway.URL() + " · served while magpie tui is open")
+		return sMuted.Render("● " + trf("gateway %s · served while magpie tui is open", gateway.URL()))
 	}
 	if e := gw.err.Load(); e != nil && *e != "" {
-		return sBad.Render("✗ ") + sText.Render("gateway not running: "+*e)
+		return sBad.Render("✗ ") + sText.Render(trf("gateway not running: %s", *e))
 	}
 	return ""
 }
 
 // gatewayGoneNote is said as the terminal quits having served the gateway.
 func gatewayGoneNote() string {
-	return "magpie: the gateway stopped with magpie tui; agents connected to magpie reach it while magpie tui, magpie web or magpie serve runs"
+	return tr("magpie: the gateway stopped with magpie tui; agents connected to magpie reach it while magpie tui, magpie web or magpie serve runs")
 }

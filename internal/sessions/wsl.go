@@ -22,6 +22,9 @@ import (
 // sets; this one can't import it). Claude Code's, Codex's, Pi's and omp's
 // session files there are read as this computer's are, each session marked
 // with its distro (Session.WSL) and resumed through wsl.exe (wslResume).
+// So are agy's, and the Antigravity app's when it is connected to the
+// distro: its language server runs there and keeps the conversations in
+// the distro's ~/.gemini/antigravity (@guyng35955 on X).
 //
 // Reading over \\wsl.localhost is slow, and looking at a stopped distro's
 // files starts it. So the distros' files are listed behind, at most every
@@ -59,6 +62,12 @@ var WSLRunning func(distro string) bool
 // listed before.
 var WSLOff func() bool
 
+// WSLListed is whether wsl.exe answered the last list of distros, so that
+// WSLHomes naming none means "no distro has an agent" (the user took the
+// last one away), not "wsl.exe didn't answer"; internal/agent sets it. Nil
+// is not known.
+var WSLListed func() bool
+
 // wslLooking is whether the distros' sessions are listed.
 func wslLooking() bool { return WSLHomes != nil && (WSLOff == nil || !WSLOff()) }
 
@@ -76,6 +85,9 @@ var wslAgents = []struct{ agent, dir string }{
 	{"raft", ".slock"},
 	{"omp", filepath.Join(".omp", "agent")},
 	{"kimi", ".kimi-code"},
+	{"antigravity", filepath.Join(".gemini", "antigravity")},
+	{"antigravity", filepath.Join(".gemini", "antigravity-insiders")},
+	{"agy", filepath.Join(".gemini", "antigravity-cli")},
 }
 
 // wslScan lists the session files under a distro's home.
@@ -99,6 +111,20 @@ func wslScan(h WSLHome) []file {
 			out = append(out, ompFilesIn(dir)...)
 		case "kimi":
 			out = append(out, kimiFilesIn(filepath.Join(dir, "sessions"))...)
+		case "antigravity":
+			// the rows name the distro's own folders (file:///home/…)
+			conv := filepath.Join(dir, "conversations")
+			if filepath.Base(a.dir) == "antigravity-insiders" {
+				if !sameDir(dir, AntigravityInsidersDir()) {
+					out = append(out, antigravityInsiders(conv, "linux")...)
+				}
+			} else if !sameDir(dir, AntigravityAppDir()) {
+				out = append(out, antigravityFilesIn(conv, "linux")...)
+			}
+		case "agy":
+			if !sameDir(dir, AgyDir()) {
+				out = append(out, agyFilesIn(dir, "linux")...)
+			}
 		}
 	}
 	return out
@@ -112,6 +138,34 @@ type wslEntry struct {
 	Main  bool      `json:"main,omitempty"`
 	Size  int64     `json:"size"`
 	Mod   time.Time `json:"mod"`
+	// ReadOnly: the Antigravity app's conversations, which magpie lists
+	// and never moves or deletes
+	ReadOnly bool `json:"readOnly,omitempty"`
+	// Agy and Rev: an agy or Antigravity conversation's summary row and
+	// what tells it changed (file.more's agy and rev)
+	Agy *agySummary `json:"agy,omitempty"`
+	Rev string      `json:"rev,omitempty"`
+	// Calls is an agy transcript's size and time as a call source, its
+	// conversation's database taken in (agyCallStat); nil for a file that
+	// isn't one (a conversation listed from its row alone)
+	Calls *wslStat `json:"calls,omitempty"`
+}
+
+// wslStat is a file's size and time.
+type wslStat struct {
+	Size int64     `json:"size"`
+	Mod  time.Time `json:"mod"`
+}
+
+// wslEntryOf is f as a listing keeps it.
+func wslEntryOf(f file) wslEntry {
+	e := wslEntry{Agent: f.agent, Key: f.key, Path: f.path, Main: f.main, Size: f.size, Mod: f.mod.Time(), ReadOnly: f.readOnly, Agy: f.m().agy, Rev: f.m().rev}
+	if f.agent == "agy" && !agyRowOnly(f.path) {
+		c := file{path: f.path, size: f.size, mod: f.mod}
+		agyCallStat(&c)
+		e.Calls = &wslStat{Size: c.size, Mod: c.mod.Time()}
+	}
+	return e
 }
 
 // wslListing is a distro's files as last listed.
@@ -127,6 +181,7 @@ var wslSess struct {
 	loaded bool
 	lists  map[string]*wslListing // by distro
 	at     time.Time              // when the last listing started
+	first  time.Time              // when the first listing started: reads wait wslFirstWait from it, in all
 	done   chan struct{}          // the listing under way, nil when none
 	kept   []byte                 // what sessions-wsl.json holds
 }
@@ -134,8 +189,11 @@ var wslSess struct {
 var (
 	// wslRelist is how often the distros' files are listed again
 	wslRelist = 30 * time.Second
-	// wslFirstWait is how long a read waits for the very first listing,
-	// when nothing was kept of one; after it the read goes on without
+	// wslFirstWait is how long reads wait for the very first listing,
+	// when nothing was kept of one, all told from when it started; after
+	// it they go on without. Each read waiting it afresh held the Sessions
+	// page's first open, whose list, stats and overview each read, ~10s
+	// on a hung wsl.exe (shangyuan0818 on X).
 	wslFirstWait = 3 * time.Second
 )
 
@@ -144,7 +202,14 @@ func wslListPath() string { return filepath.Join(filepath.Dir(CachePath()), "ses
 // wslFiles are the session files of the given agents in the WSL distros,
 // as last listed; a listing is started behind when the last is older than
 // wslRelist.
-func wslFiles(agents ...string) []file {
+func wslFiles(agents ...string) []file { return wslFilesAs(false, agents...) }
+
+// wslCallFiles are wslFiles as call sources: an agy transcript with its
+// conversation's database taken into its size and time, as agyCallFiles
+// has it, and none of agy's conversations listed from their row alone.
+func wslCallFiles(agents ...string) []file { return wslFilesAs(true, agents...) }
+
+func wslFilesAs(calls bool, agents ...string) []file {
 	agents = slices.DeleteFunc(slices.Clone(agents), func(a string) bool { return !Reads(a) })
 	if len(agents) == 0 || !wslLooking() {
 		return nil
@@ -165,18 +230,24 @@ func wslFiles(agents ...string) []file {
 	if wslSess.done == nil && time.Since(wslSess.at) > wslRelist {
 		done := make(chan struct{})
 		wslSess.done, wslSess.at = done, time.Now()
+		if wslSess.first.IsZero() {
+			wslSess.first = wslSess.at
+		}
 		go wslList(wslSess.gen, done)
 	}
 	wait := wslSess.done
 	if len(wslSess.lists) > 0 {
 		wait = nil // what was found before is read now; the new listing comes next time
 	}
+	left := wslFirstWait - time.Since(wslSess.first)
 	wslSess.Unlock()
-	if wait != nil {
+	if wait != nil && left > 0 {
+		t := time.NewTimer(left)
 		select {
 		case <-wait:
-		case <-time.After(wslFirstWait):
+		case <-t.C:
 		}
+		t.Stop()
 	}
 	want := map[string]bool{}
 	for _, a := range agents {
@@ -205,9 +276,21 @@ func wslFiles(agents ...string) []file {
 		cold := !l.Running || !up[n]
 		in := &fileMore{wsl: n} // the distro's files share it
 		for _, e := range l.Files {
-			if want[e.Agent] {
-				out = append(out, file{agent: e.Agent, key: e.Key, path: e.Path, main: e.Main, size: e.Size, mod: e.Mod, more: in, cold: cold})
+			if !want[e.Agent] {
+				continue
 			}
+			f := file{agent: e.Agent, key: e.Key, path: e.Path, main: e.Main, size: e.Size, mod: modOf(e.Mod), more: in, cold: cold, readOnly: e.ReadOnly}
+			if calls && e.Agent == "agy" {
+				if e.Calls == nil {
+					continue
+				}
+				f.size, f.mod = e.Calls.Size, modOf(e.Calls.Mod)
+			}
+			if e.Agy != nil || e.Rev != "" {
+				m := f.w()
+				m.agy, m.rev = e.Agy, e.Rev
+			}
+			out = append(out, f)
 		}
 	}
 	return out
@@ -215,7 +298,8 @@ func wslFiles(agents ...string) []file {
 
 // wslList lists the distros' files: a running one's afresh, a stopped
 // one's as they were. With no distros said at all (wsl.exe didn't answer)
-// every listing is kept, cold.
+// every listing is kept, cold. A wsl.exe that answered with no distro an
+// agent is in (WSLListed) lets them all go.
 func wslList(gen uint64, done chan struct{}) {
 	defer close(done)
 	homes := WSLHomes()
@@ -237,11 +321,14 @@ func wslList(gen uint64, done chan struct{}) {
 		}
 		l := &wslListing{Home: h.Home, Running: true, Files: []wslEntry{}}
 		for _, f := range wslScan(h) {
-			l.Files = append(l.Files, wslEntry{Agent: f.agent, Key: f.key, Path: f.path, Main: f.main, Size: f.size, Mod: f.mod})
+			l.Files = append(l.Files, wslEntryOf(f))
 		}
 		lists[h.Distro] = l
 	}
-	if len(homes) == 0 {
+	// with no distros said and no answer from wsl.exe every listing is
+	// kept; one that answered and found no agent anywhere has none left to
+	// list, and the rows of files that are gone with them
+	if len(homes) == 0 && (WSLListed == nil || !WSLListed()) {
 		for n, o := range old {
 			c := *o
 			c.Running = false
@@ -403,7 +490,7 @@ func wslReset() {
 	wslSess.Lock()
 	defer wslSess.Unlock()
 	wslSess.gen++
-	wslSess.loaded, wslSess.lists, wslSess.at, wslSess.done, wslSess.kept = false, nil, time.Time{}, nil, nil
+	wslSess.loaded, wslSess.lists, wslSess.at, wslSess.first, wslSess.done, wslSess.kept = false, nil, time.Time{}, time.Time{}, nil, nil
 }
 
 // wslResume is the PowerShell line that resumes a session in a WSL distro

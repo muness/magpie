@@ -16,13 +16,14 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/access"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/usage"
@@ -260,14 +261,58 @@ func markedKey(p provider.Provider, by string) (provider.Provider, bool) {
 }
 
 // videomaker is the model a request that names none makes its video with:
-// AutoVideomaker's, unless the Settings turned image generation off, which
-// turns video off with it. None when it is off or no provider makes videos.
+// the Settings' VideoGen while it resolves, else AutoVideomaker's, unless
+// the Settings turned image generation off, which turns video off with
+// it. None when it is off or no provider makes videos.
 func videomaker() (string, bool) {
-	if settings.Load().ImageGen == "off" {
+	st := settings.Load()
+	if st.ImageGen == "off" {
 		return "", false
+	}
+	if v := st.VideoGen; v != "" && VideomakerMissingOf(v) == "" {
+		return v, true
 	}
 	m := AutoVideomaker()
 	return m, m != ""
+}
+
+// Videomaker is the model a request that names none makes its video with
+// (videomaker), as provider/model: "" when it is off or none can.
+func Videomaker() string {
+	m, _ := videomaker()
+	return m
+}
+
+// VideomakerMissing is the model Settings › Models › Images › Video generation
+// names when magpie can't make videos with it any more, so that
+// AutoVideomaker's makes them in its place, as DrawerMissing is Image
+// generation's. "" when none is named or it resolves.
+func VideomakerMissing() string { return VideomakerMissingOf(settings.Shared().VideoGen) }
+
+// VideomakerMissingOf is v, a Video generation pick, when magpie can't
+// make videos with it: its provider is gone, off or decide-only, or no
+// longer has it among its Videomakers (a custom provider's model the user
+// no longer marks a video model, #1399). A routing group resolves while
+// one of its members makes videos.
+func VideomakerMissingOf(v string) string {
+	if v == "" {
+		return ""
+	}
+	if provider.IsGroupRef(v) {
+		if _, _, ok := mediaGroupFirst(v, provider.KindVideo); ok {
+			return ""
+		}
+		return v
+	}
+	id, model, _ := strings.Cut(v, "/")
+	p, err := provider.Find(id)
+	if err != nil || !p.On() || p.DecideOnly() {
+		return v
+	}
+	if slices.ContainsFunc(Videomakers(*p), func(m catalog.Model) bool { return m.ID == model }) {
+		return ""
+	}
+	return v
 }
 
 // AutoVideomaker is the model a request that names none makes its video
@@ -276,6 +321,22 @@ func videomaker() (string, bool) {
 // second from the key's balance, and a key set up for chat would
 // otherwise take videos a subscription made before.
 func AutoVideomaker() string {
+	// the provider the pick is held to makes them while it can (heldPick,
+	// auto_picks.go): one added later doesn't take it over
+	held := heldPick(slotVideo)
+	m := autoVideomaker(held)
+	settlePick(slotVideo, held, held != "" && providerOfRef(m) == held, providerOfRef(m))
+	return m
+}
+
+func autoVideomaker(held string) string {
+	if held != "" {
+		if p, err := provider.Find(held); err == nil && p.On() && !p.DecideOnly() {
+			if ms := OfferedVideomakers(*p); len(ms) > 0 {
+				return p.ID + "/" + ms[0].ID
+			}
+		}
+	}
 	paid := ""
 	for _, p := range provider.All() {
 		if !p.On() || p.DecideOnly() {
@@ -511,7 +572,7 @@ func ptrs(pics []picture) []*picture {
 
 // decimalNumber is a number as JSON writes it, not as Go's ParseFloat also
 // takes it (hex, inf, nan, underscores).
-var decimalNumber = regexp.MustCompile(`^[0-9]+(\.[0-9]*)?([eE][+-]?[0-9]+)?$`)
+var decimalNumber = lazyre.New(`^[0-9]+(\.[0-9]*)?([eE][+-]?[0-9]+)?$`)
 
 // parseSeconds is a duration in whole seconds, however it was written: 6,
 // "6", 6.0, 6e0. What the vendor's limit makes of a length it says itself.
@@ -749,7 +810,7 @@ func signer(p provider.Provider) string {
 
 // idPart is what a provider id or a vendor's request id is made of; an id
 // is put in a URL, so nothing that would change its path gets through.
-var idPart = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+var idPart = lazyre.New(`^[A-Za-z0-9_-]+$`)
 
 // parseVideoID is the provider, vendor id, start and signer of a video's id.
 func parseVideoID(id string) (providerID, vendorID string, started time.Time, by string, ok bool) {
@@ -860,8 +921,8 @@ func videoMaker(id string) (p provider.Provider, vendorID string, started time.T
 		return p, "", started, fmt.Errorf("%q isn't the id of a video magpie is making", id)
 	}
 	found, ferr := provider.Find(pid)
-	if ferr == nil && filmsMiniMax(*found) {
-		// a MiniMax task is its key's account's: asked on that key
+	if ferr == nil && (filmsMiniMax(*found) || filmsDashScope(*found)) {
+		// a MiniMax or DashScope task is its key's account's: asked on that key
 		q, ok := markedKey(*found, by)
 		if !ok {
 			return p, "", started, fmt.Errorf("this video was started with a key of %s that is no longer on: turn it back on to get the video", found.Name)
@@ -951,9 +1012,32 @@ func asOurs(b []byte, p provider.Provider, id string) (map[string]any, error) {
 }
 
 // filmsOpenAI is whether p makes videos at an OpenAI-shaped videos API:
-// another magpie, or a provider whose model list marks video models.
+// another magpie, or a provider whose model list marks video models, but
+// for xAI's own API (filmsXAI), which has none.
 func filmsOpenAI(p provider.Provider) bool {
-	return p.IsRemoteMagpie() || len(customVideomakers(p)) > 0 && !isArk(p)
+	return p.IsRemoteMagpie() || len(customVideomakers(p)) > 0 && !isArk(p) && !xaiHost(p)
+}
+
+// xaiHost is whether p is a provider set up with a key for xAI's own API.
+func xaiHost(p provider.Provider) bool {
+	return p.Account == nil && !p.IsRemoteMagpie() && p.VendorHost() == "api.x.ai"
+}
+
+// filmsXAI is whether p makes model's videos at xAI's own API, as a Grok
+// subscription's backend does: xAI starts a grok-imagine-video* at
+// /v1/videos/generations, answers with its request_id and says how it goes
+// at /v1/videos/<request_id> (docs.x.ai, Video Generation). It has no
+// OpenAI-shaped POST /v1/videos: that answers 404 "No handler found on
+// route". Its video models were listed as image models until their ids
+// were read as video ones (iceloon on X).
+func filmsXAI(p provider.Provider, model string) bool {
+	return xaiHost(p) && strings.HasPrefix(model, grokVideoFamily)
+}
+
+// grokVideosRoot is the root Grok's videos API is under: a Grok
+// subscription's Responses base, or an xAI key's API.
+func grokVideosRoot(p provider.Provider) string {
+	return strings.TrimRight(cmp.Or(p.Base(provider.Responses), videoBase(p)), "/")
 }
 
 // remoteVideoURL is where another magpie, or a provider's OpenAI-shaped
@@ -967,8 +1051,11 @@ func (s *Server) videoStatus(ctx context.Context, p provider.Provider, vendorID 
 	if filmsMiniMax(p) {
 		return s.minimaxVideoStatus(ctx, p, vendorID)
 	}
+	if filmsDashScope(p) {
+		return s.dashScopeVideoStatus(ctx, p, vendorID)
+	}
 	var st videoState
-	at := strings.TrimRight(p.Base(provider.Responses), "/") + "/videos/" + url.PathEscape(vendorID)
+	at := grokVideosRoot(p) + "/videos/" + url.PathEscape(vendorID)
 	ark := p.Preset == "volcengine" || isArk(p)
 	if ark {
 		at = arkTasks(p) + "/" + url.PathEscape(vendorID)
@@ -1019,7 +1106,7 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 	if f.Model == "" {
 		m, ok := videomaker()
 		if !ok {
-			fail(400, "no model to make videos with: sign in to a Grok subscription or set up a provider that makes videos (a MiniMax API key makes them with MiniMax-H3), and leave Settings → Images → Image generation on, or name one")
+			fail(400, "no model to make videos with: sign in to a Grok subscription or set up a provider that makes videos (a MiniMax API key makes them with MiniMax-H3), and leave Settings → Models → Images → Image generation on, or name one")
 			return
 		}
 		f.Model, call.Model = m, m
@@ -1049,8 +1136,8 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 		r = heldByGroup(r, g) // held to the group's accounts, if it is
 	}
 	keyWho, keyHeld := keyHolds(r)
-	if keyHeld && named && (isGroup && !groupAllowed(keyWho, g, ms) || !isGroup && !modelAllowed(keyWho, p, model)) {
-		fail(403, keyModelError(keyWho, f.Model))
+	if named && (isGroup && !groupGiven(r, keyWho, keyHeld, g, ms) || keyHeld && !isGroup && !modelAllowed(keyWho, p, model)) {
+		fail(keyModelRefusal(w, keyWho, f.Model))
 		return
 	}
 	if msg, off := modelOff(p, model, f.Model); off { // disabled by the user (#1867)
@@ -1071,9 +1158,9 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 		if keyHeld {
 			keeps = groupKeeps(keyWho, g, ms)
 		}
-		t := s.drawingTries(g, ms, keeps, servesKind(provider.KindVideo))
+		t := s.drawingTries(keyRouted(access.Caller(r.Context()), g), ms, keeps, servesKind(provider.KindVideo))
 		if len(t) == 0 && keeps != nil {
-			fail(403, keyModelError(keyWho, f.Model))
+			fail(keyGroupRefusal(w, keyWho, f.Model, ms))
 			return
 		}
 		if len(t) > 0 {
@@ -1081,20 +1168,23 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	call.To = provider.Chat
-	var unmask func()
 	prompt := f.Prompt
-	var hits maskHits
-	w, f.Prompt, unmask, hits, err = redactedPromptHits(r.Context(), w, f.Prompt)
-	defer unmask()
-	// the fields passed on as they came are masked as the prompt is: a
-	// negative_prompt is the user's text all the same
-	var extra maskHits
-	if err == nil {
-		err = maskStrings(r.Context(), f.Extra, &extra)
-	}
-	if err != nil { // fails closed
-		fail(maskStatus(err), err.Error())
-		return
+	var hits, extra maskHits
+	// masked unless every model it may start on is a provider the user
+	// set to go unmasked (unmaskedMembers), as a chat's is
+	if !unmaskedMembers(tries) {
+		var unmask func()
+		w, f.Prompt, unmask, hits, err = redactedPromptHits(r.Context(), w, f.Prompt)
+		defer unmask()
+		// the fields passed on as they came are masked as the prompt is: a
+		// negative_prompt is the user's text all the same
+		if err == nil {
+			err = maskStrings(r.Context(), f.Extra, &extra)
+		}
+		if err != nil { // fails closed
+			fail(maskStatus(err), err.Error())
+			return
+		}
 	}
 	n := extra.n
 	hits.add(extra)
@@ -1129,7 +1219,7 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 	for i, m := range tries {
 		model = m.Model
 		at := time.Now()
-		v, code, err = s.startVideo(ctx, r, m.Provider, m.Model, f)
+		v, code, err = s.startVideo(ctx, memberOn(r, g, m), m.Provider, m.Model, f)
 		p, call.Provider = v.p, v.p.ID
 		side.tryAt(candidateOf(v.p, m.Model), at)(code, err)
 		// a group's next member is asked as a chat's would be: while this
@@ -1215,6 +1305,8 @@ type videoStart struct {
 // failure before any vendor is asked (the model makes no videos, a key may
 // use none of the provider's keys) has asked unset.
 func (s *Server) startVideo(ctx context.Context, r *http.Request, p provider.Provider, model string, f filming) (videoStart, int, error) {
+	// the headers the user gave the video model
+	ctx = provider.WithModel(ctx, p.ID, model)
 	// the provider's other keys to start the video on, when the first
 	// says it doesn't serve the model
 	var keys []candidate
@@ -1230,12 +1322,14 @@ func (s *Server) startVideo(ctx context.Context, r *http.Request, p provider.Pro
 		}
 		p, keys = cs[0].p, cs[1:]
 		// an Ark key's video is a task of that key's account: its id names
-		// the key, as a plan's does, and it is asked after there
-		onKey = isArk(p)
-	} else if makesMiniMaxVideo(p, model) {
+		// the key, as a plan's does, and it is asked after there; an xAI
+		// key's request likewise
+		onKey = isArk(p) || filmsXAI(p, model)
+	} else if makesMiniMaxVideo(p, model) || makesDashScopeVideo(p, model) {
 		// on the first key a chat for the model would go to that the
 		// calling key may use, the next while one's plan doesn't make H3
-		// (a Token Plan's); the video's id names the key it is asked on
+		// (a Token Plan's); the video's id names the key it is asked on,
+		// as a DashScope task is its key's
 		cs, code, msg := s.onKeys(r, p, model, f.Model)
 		if code != 0 {
 			return videoStart{p: p}, code, errors.New(msg)
@@ -1266,16 +1360,18 @@ func (s *Server) startVideo(ctx context.Context, r *http.Request, p provider.Pro
 	if msg := f.arkOnly(); msg != "" && !volcengine && !v.remote {
 		return v, 400, errors.New(msg)
 	}
-	v.custom = !v.remote && !volcengine && filmsCustom(p, model)
+	xai := !v.remote && filmsXAI(p, model)
+	v.custom = !v.remote && !volcengine && !xai && filmsCustom(p, model)
 	minimax := !v.remote && !v.custom && makesMiniMaxVideo(p, model)
+	dashscope := !v.remote && !v.custom && !minimax && makesDashScopeVideo(p, model)
 	// any grok-imagine-video*, not only those listed: the vendor's newer ones work before magpie names them
-	if !v.remote && !v.custom && !volcengine && !minimax && (!drawsGrok(p) || !strings.HasPrefix(model, grokVideoFamily)) {
+	if !v.remote && !v.custom && !volcengine && !minimax && !dashscope && !xai && (!drawsGrok(p) || !strings.HasPrefix(model, grokVideoFamily)) {
 		v.unfit = true
-		return v, 400, fmt.Errorf(`%s/%s can't make videos: magpie makes videos with a Grok subscription's grok-imagine-video, Volcengine Agent Plan's or an Ark key's Seedance models, a MiniMax API key's MiniMax-H3 models, another magpie's, and a provider's models its own model list marks "kind": "video" or that you mark a Video model (right-click the model in the provider's editor: Makes…)`, p.ID, model)
+		return v, 400, fmt.Errorf(`%s/%s can't make videos: magpie makes videos with a Grok subscription's or an xAI API key's grok-imagine-video, Volcengine Agent Plan's or an Ark key's Seedance models, a MiniMax API key's MiniMax-H3 models, an Alibaba Token Plan's Wan 3.0 and HappyHorse models, another magpie's, and a provider's models its own model list marks "kind": "video" or that you mark a Video model (right-click the model in the provider's editor: Makes…)`, p.ID, model)
 	}
 	// another magpie is asked at its videos API, which says itself what
 	// it can't make
-	at, field := strings.TrimRight(p.Base(provider.Responses), "/")+"/videos/generations", "request_id"
+	at, field := grokVideosRoot(p)+"/videos/generations", "request_id"
 	var body []byte
 	switch {
 	case v.remote, v.custom:
@@ -1290,6 +1386,12 @@ func (s *Server) startVideo(ctx context.Context, r *http.Request, p provider.Pro
 			return v, 400, err
 		}
 		at, field = minimaxHost(p)+"/v2/video_generation", "task_id"
+	case dashscope:
+		var err error
+		if body, err = dashScopeVideoBody(model, f); err != nil {
+			return v, 400, err
+		}
+		at, field = dashScopeVideoURL(p), "task_id"
 	default:
 		var err error
 		if body, err = grokVideoBody(model, f); err != nil {
@@ -1297,12 +1399,25 @@ func (s *Server) startVideo(ctx context.Context, r *http.Request, p provider.Pro
 		}
 	}
 	v.field, v.asked = field, true
-	b, code, err := s.send(ctx, p, at, "application/json", body, true)
+	var extra http.Header
+	if dashscope {
+		extra = dashScopeAsync
+	}
+	b, code, err := s.sendWith(ctx, p, http.MethodPost, at, "application/json", body, true, extra)
 	// a key answering 404 that it doesn't serve the model hands it to the
 	// next (#1657), as a drawing does; the id names the key that started it
 	for ; err != nil && len(keys) > 0 && ctx.Err() == nil && (keyLacksModel(code, err) || minimax && minimaxLacksH3(b)); keys = keys[1:] {
 		p = keys[0].p
-		b, code, err = s.send(ctx, p, at, "application/json", body, true)
+		b, code, err = s.sendWith(ctx, p, http.MethodPost, at, "application/json", body, true, extra)
+	}
+	if dashscope {
+		if err != nil {
+			if said := dashScopeSaid(b); said != "" {
+				err = fmt.Errorf("%s: %d %s: %s", provider.HostOf(at), code, http.StatusText(code), said)
+			}
+		} else if b, err = dashScopeStarted(p, model, b); err != nil {
+			code = 502
+		}
 	}
 	if minimax {
 		if err != nil {
@@ -1328,7 +1443,7 @@ func videoAsker(r *http.Request, p provider.Provider) (provider.Provider, string
 	if !held {
 		return p, ""
 	}
-	if !p.IsRemoteMagpie() && (filmsOpenAI(p) || filmsMiniMax(p) || isArk(p) && len(customVideomakers(p)) > 0) {
+	if !p.IsRemoteMagpie() && (filmsOpenAI(p) || filmsMiniMax(p) || filmsDashScope(p) || isArk(p) && len(customVideomakers(p)) > 0) {
 		if p.Key == "" && p.Account == nil || accountAllowed(who, candidate{p: p}) {
 			return p, ""
 		}
@@ -1535,6 +1650,7 @@ func (s *Server) remoteVideoContent(ctx context.Context, w http.ResponseWriter, 
 		// vendors are told no caller
 		req.Header.Set("User-Agent", "magpie/"+Version)
 		passOnCaller(ctx, req)
+		passOnUA(req, callerUA(ctx))
 	}
 	if err := p.Sign(ctx, req, provider.Chat, nil); err != nil {
 		writeError(w, provider.Chat, 502, err.Error())

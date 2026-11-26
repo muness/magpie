@@ -48,6 +48,7 @@ func (t *translator) row(b []byte) {
 		APIStatus     int             `json:"apiErrorStatus"`
 		ToolUseResult json.RawMessage `json:"toolUseResult"`
 		Operation     string          `json:"operation"`
+		Content       string          `json:"content"`
 		APIParams     struct {
 			RateLimitInfo json.RawMessage `json:"rate_limit_info"`
 		} `json:"apiErrorParams"`
@@ -60,12 +61,17 @@ func (t *translator) row(b []byte) {
 	case "queue-operation":
 		// a message sent mid-turn waits in Claude Code's queue
 		if r.Operation == "enqueue" {
+			t.heard(func() heardRow { return heardRow{r.Content, -1} })
 			t.out.sawRow()
 		}
 	case "user":
 		if !r.IsMeta && isPrompt(r.Message) {
 			t.failed = false
+			t.heard(func() heardRow { return promptRow(r.Message) })
 			t.out.sawRow()
+		}
+		if r.IsMeta {
+			t.heardTaken(r.Message)
 		}
 		if len(r.ToolUseResult) > 0 && r.ToolUseResult[0] == '{' {
 			t.out.emit(map[string]any{"type": "user", "tool_use_result": r.ToolUseResult})
@@ -105,11 +111,13 @@ func (t *translator) row(b []byte) {
 				text += c.Text
 			}
 		}
+		t.failed = true
+		// the error's own allowance after any an earlier reply of the
+		// turn told (tap.settle), as it is the latest
+		t.tap.settle()
 		if len(r.APIParams.RateLimitInfo) > 0 && string(r.APIParams.RateLimitInfo) != "null" {
 			t.out.emit(map[string]any{"type": "rate_limit_event", "rate_limit_info": r.APIParams.RateLimitInfo})
 		}
-		t.failed = true
-		t.tap.settle()
 		t.out.turnOver()
 		t.out.emit(map[string]any{"type": "result", "subtype": "error_during_execution", "is_error": true,
 			"result": text, "api_error_status": r.APIStatus})

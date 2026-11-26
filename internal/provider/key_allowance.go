@@ -15,6 +15,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -72,9 +73,12 @@ func readsKeyWindows(p Provider) bool {
 
 // accountPlanOf is which plan p's key is on whose windows the key's
 // account tells, not the key: Volcengine Ark's Coding and Agent Plans and
-// Tencent Cloud's Token Plan Enterprise, read with the account's access
-// key (volcengine_usage.go, tencent_usage.go), and StepFun's Step Plan,
-// read with magpie's sign-in to its platform (stepfun_plan.go). The
+// Tencent Cloud's Token Plan Enterprise and Alibaba Cloud's Token Plan, read
+// with the account's access key (volcengine_usage.go, tencent_usage.go,
+// alibaba_usage.go), and StepFun's Step Plan and the Qwen AI platform's
+// Token Plan and Baidu Qianfan's Token Plan Personal, read with magpie's
+// sign-in to the platform (stepfun_plan.go, qianwen_plan.go,
+// qianfan_plan.go). The
 // Usage page had their windows while routing had none, and the Routing
 // page said "one key" of a plan with them (chen on Discord). "" for any
 // other key, or one whose access key magpie isn't given; said without
@@ -90,8 +94,17 @@ func accountPlanOf(p Provider) string {
 	if _, ok := tencentPlanRegion(p); ok && keyed {
 		return "tencent"
 	}
+	if _, ok := aliPlanSite(p); ok && keyed {
+		return "alibaba"
+	}
 	if StepFunSite(p) != "" {
 		return "stepfun"
+	}
+	if QianwenPlan(p) {
+		return "qianwen"
+	}
+	if QianfanPlan(p) {
+		return "qianfan"
 	}
 	return ""
 }
@@ -112,11 +125,24 @@ func accountPlanWindows(ctx context.Context, q Provider) (keyReading, error) {
 			return keyReading{}, nil
 		}
 		c = cs[0]
+	case "alibaba":
+		site, _ := aliPlanSite(q)
+		c = aliPlanQuota(q.Via(ctx), q, site)
 	case "stepfun":
 		if !StepFunSignedIn(q.ID) {
 			return keyReading{}, nil
 		}
 		c = stepPlanQuota(q.Via(ctx), q)
+	case "qianwen":
+		if !QianwenSignedIn(q.ID) {
+			return keyReading{}, nil
+		}
+		c = qianwenPlanQuota(q.Via(ctx), q)
+	case "qianfan":
+		if !QianfanSignedIn(q.ID) {
+			return keyReading{}, nil
+		}
+		c = qianfanPlanQuota(q.Via(ctx), q)
 	}
 	if c.Error != "" {
 		return keyReading{}, errors.New(c.Error)
@@ -171,7 +197,8 @@ func KeyAllowance(p Provider) (Allowance, bool) {
 	// last till the user asks, or the key says it is out (#1518)
 	if !e.loading && time.Since(e.at) > age && (e.refused || !readsAsked()) {
 		e.loading = true
-		go readKeyAllowance(p, id, c.gen)
+		gen := c.gen
+		goRead(func() { readKeyAllowance(p, id, gen) })
 	}
 	return e.a, len(e.a) > 0
 }
@@ -191,8 +218,11 @@ func readKeyAllowance(p Provider, id string, gen int) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	r, err := keyWindows(ctx, p)
-	ws := r.ws
 	now := time.Now()
+	var a Allowance
+	if err == nil {
+		a = keyAllowanceOf(p, r.ws, now) // before the lock: it reads p's list
+	}
 	c.Lock()
 	e := c.m[id]
 	if e == nil || c.gen != gen {
@@ -202,7 +232,7 @@ func readKeyAllowance(p Provider, id string, gen int) {
 	e.loading, e.at = false, now
 	var renewed, started bool
 	if err == nil {
-		renewed, started = e.keep(allowanceOf(ws, now), SpentShareOf(p.Routing), now)
+		renewed, started = e.keep(a, SpentShareOf(p.Routing), now)
 	}
 	if err == nil {
 		r.at, r.seq = now, seq
@@ -210,7 +240,7 @@ func readKeyAllowance(p Provider, id string, gen int) {
 	}
 	if e.stale {
 		e.stale, e.loading, e.at = false, true, time.Time{}
-		go readKeyAllowance(p, id, gen)
+		goRead(func() { readKeyAllowance(p, id, gen) })
 	}
 	c.Unlock()
 	if renewed {
@@ -278,8 +308,15 @@ func keyCardTag(p Provider) string {
 			return keyTag("volc "+action, p.AccessKeyID)
 		case "tencent":
 			return keyTag("tencent", p.AccessKeyID)
+		case "alibaba":
+			site, _ := aliPlanSite(p)
+			return keyTag("alibaba "+site.region, p.AccessKeyID)
 		case "stepfun":
 			return keyTag("stepfun", p.ID)
+		case "qianwen":
+			return keyTag("qianwen", p.ID)
+		case "qianfan":
+			return keyTag("qianfan", p.ID)
 		}
 	}
 	if _, ok := planQuotaSourceOf(p); ok && !sub2APIKeyLimits(p) {
@@ -288,18 +325,57 @@ func keyCardTag(p Provider) string {
 	return keyTag("balance", p.Key)
 }
 
+// keyAllowanceOf is the allowance routing goes by from ws, p's key's
+// windows read at now: each counts the models that draw on it (paidOnly).
+func keyAllowanceOf(p Provider, ws []QuotaWindow, now time.Time) Allowance {
+	return allowanceOf(p.paidOnly(ws), now)
+}
+
+// paidOnly is ws, p's key's plan windows, each made to count only the
+// models that draw on it where the vendor serves models free of them:
+// OpenCode Go's 5 hours, week and month count none of its free models
+// (its list's "monthly_usage": null; beam-free, hy4-flash-free), which it
+// serves with every window used up ("If you reach the usage limit, you
+// can continue using the free models"). Read as the whole key's, a full
+// window held them too: ordered last, held at the key's cap, shown used
+// up on the Routing page (Winnie7572 on X, #7496). The free models are
+// p's list's as it is now (costsNothing); ws as it is at any other
+// vendor, or with none free. A window still counts model "", the key.
+func (p Provider) paidOnly(ws []QuotaWindow) []QuotaWindow {
+	if len(ws) == 0 || !p.atOpenCodeGo() {
+		return ws
+	}
+	free := map[string]bool{}
+	for _, m := range p.Available() {
+		if p.costsNothing(m) {
+			free[strings.ToLower(m.ID)] = true
+		}
+	}
+	if len(free) == 0 {
+		return ws
+	}
+	paid := func(model string) bool { return !free[model] }
+	out := slices.Clone(ws)
+	for i, w := range out {
+		if w.Model == "" && w.Family == "" && w.matches == nil {
+			out[i].matches = paid
+		}
+	}
+	return out
+}
+
 // lastKeyAllowance is p's key's windows as its card last read them, kept
 // on disk (keepLast), each started again whose reset has passed.
 func lastKeyAllowance(p Provider) Allowance {
 	c := &lastQuotas
 	c.Lock()
-	defer c.Unlock()
 	c.load()
 	q, ok := c.reading(p.ID + "/" + strings.ToLower(keyCardTag(p)))
+	c.Unlock()
 	if !ok || len(q.Windows) == 0 {
 		return nil
 	}
-	return allowanceOf(q.Windows, time.Now())
+	return keyAllowanceOf(p, q.Windows, time.Now())
 }
 
 // noteKeyAllowance keeps the windows the key's card just read, for
@@ -308,6 +384,7 @@ func noteKeyAllowance(p Provider, ws []QuotaWindow, now time.Time) {
 	if !readsKeyWindows(p) {
 		return
 	}
+	a := keyAllowanceOf(p, ws, now)
 	c := &keyAllowances
 	c.Lock()
 	if c.m == nil {
@@ -319,7 +396,7 @@ func noteKeyAllowance(p Provider, ws []QuotaWindow, now time.Time) {
 		e = &keyAllowance{}
 		c.m[id] = e
 	}
-	renewed, started := e.keep(allowanceOf(ws, now), SpentShareOf(p.Routing), now)
+	renewed, started := e.keep(a, SpentShareOf(p.Routing), now)
 	e.at = now
 	c.Unlock()
 	if renewed {

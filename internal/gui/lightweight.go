@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -35,12 +36,14 @@ func (h *host) makeMain(url string) *application.WebviewWindow {
 	minW, minH := windowMin(z, 0, 0)
 	width, height := openSize(settings.Load().Window, minW, minH)
 	state := application.WindowStateNormal
-	if runtime.GOOS == "linux" && settings.Load().WindowMaximised {
+	if runtime.GOOS == "linux" && settings.Shared().WindowMaximised {
 		state = application.WindowStateMaximised
 	}
 	// Windows' title bar in the page's colour from the first frame; the
 	// page keeps it so as its theme changes (TintTitleBar)
-	winOpts, winBg := windowChrome(cmp.Or(os.Getenv("MAGPIE_THEME"), settings.Load().Theme))
+	winOpts, winBg := windowChrome(cmp.Or(os.Getenv("MAGPIE_THEME"), settings.Shared().Theme))
+	// pinned above other windows, as the title bar's pin left it (ontop.go)
+	onTop := settings.Load().OnTop && canOnTop(runtime.GOOS, os.Getenv)
 	w := h.app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:             "main",
 		Title:            "magpie",
@@ -52,14 +55,31 @@ func (h *host) makeMain(url string) *application.WebviewWindow {
 		Zoom:             z,
 		Hidden:           true,
 		StartState:       state,
+		AlwaysOnTop:      onTop,
+		Frameless:        mainFrameless(runtime.GOOS),
 		Mac:              mainMacWindow(),
 		Windows:          winOpts,
 		BackgroundColour: winBg,
 	})
 	h.zoomWhenLoaded(w)
 	lowWhileHidden(w)
-	if runtime.GOOS == "windows" {
-		w.OnWindowEvent(events.Common.WindowRuntimeReady, func(*application.WindowEvent) { w.ExecJS(frameOnlyResizeJS) })
+	h.mendWebView(w)
+	if mainFrameless(runtime.GOOS) {
+		// resized from Windows' own border too, not the page's edge alone
+		keepResizeFrame(w)
+		// the page's caption buttons follow the window's maximised state
+		// (captionJS); a resize that changes it says so, once
+		var maxed atomic.Bool
+		w.OnWindowEvent(events.Common.WindowRuntimeReady, func(*application.WindowEvent) {
+			m := w.IsMaximised()
+			maxed.Store(m)
+			w.ExecJS(captionJS(m))
+		})
+		w.OnWindowEvent(events.Common.WindowDidResize, func(*application.WindowEvent) {
+			if m := w.IsMaximised(); maxed.Swap(m) != m {
+				w.ExecJS(captionJS(m))
+			}
+		})
 	}
 	// A resize is kept once it settles (settle): the size, or that the
 	// window is maximised. Nothing is kept of a window not placed and shown
@@ -130,11 +150,11 @@ func (h *host) makePanel() *application.WebviewWindow {
 	w := h.app.Window.NewWithOptions(po)
 	h.zoomWhenLoaded(w)
 	lowWhileHidden(w)
+	h.mendWebView(w)
 	if h.tray != nil {
 		h.tray.AttachWindow(w).WindowOffset(6)
 	}
 	// the icon stays lit while the panel is open (the Mac's)
-	trayOwnClicks()
 	w.OnWindowEvent(events.Mac.WindowShow, func(*application.WindowEvent) { trayHighlight(true) })
 	w.OnWindowEvent(events.Mac.WindowHide, func(*application.WindowEvent) { trayHighlight(false) })
 	sayWailsHides(w)
@@ -282,6 +302,8 @@ func (h *host) openMain(url string) {
 	hideWebview(h.panel)
 	// the window a restart by itself brings back: up, not in front
 	quiet := quietShow.Swap(false)
+	// and minimised, on the taskbar, if it was (#3495)
+	minimised := quietMinimised.Swap(false) && quiet
 	h.dockFront(settings.Load(), true, !quiet)
 	if h.main == nil {
 		w := h.makeMain(cmp.Or(url, "/?"+h.query))
@@ -289,8 +311,7 @@ func (h *host) openMain(url string) {
 		h.madeAgain(w)
 		h.whenLoaded(w, func() {
 			if h.main == w {
-				h.placeMain(w)
-				showHere(w, !quiet)
+				h.reveal(w, quiet, minimised)
 			}
 		})
 		return
@@ -301,8 +322,24 @@ func (h *host) openMain(url string) {
 	if h.loading[h.main] {
 		return // made again, it is shown once its page has come
 	}
-	h.placeMain(h.main)
-	showHere(h.main, !quiet)
+	h.reveal(h.main, quiet, minimised)
+}
+
+// reveal places the main window and shows it; on the main thread. One a
+// restart by itself brings back minimised goes onto the taskbar as it was,
+// to restore at its place and size, maximised if it was, where the system
+// can do that without showing it first (showsMinimised); elsewhere it is
+// shown quietly, as any window a restart by itself brings back.
+func (h *host) reveal(w *application.WebviewWindow, quiet, minimised bool) {
+	if runtime.GOOS == "darwin" {
+		plainTitlebar(w) // the Mac's, not shown yet; not at start (app.go)
+	}
+	if minimised && showsMinimised {
+		showMinimised(w, h.placeAt(w))
+		return
+	}
+	h.placeMain(w)
+	showHere(w, !quiet)
 }
 
 // reopenMain answers a click on magpie's Dock icon (#1252). A window that is
@@ -328,12 +365,15 @@ const spaceSettle = 500 * time.Millisecond
 // was last; on the main thread. It moves only while being shown: left on,
 // activating magpie in any way (the Dock, Command-Tab) would pull the open
 // window off its own Space onto the user's (#1252). Without focus, it is
-// shown and left behind the app the user is in (a restart by itself).
+// shown and left behind the app the user is in (a restart by itself),
+// asking nothing of the user (showQuietly).
 func showHere(w *application.WebviewWindow, focus bool) {
 	setMovesToActiveSpace(w, true)
-	showWebview(w)
 	if focus {
+		showWebview(w)
 		w.Focus()
+	} else {
+		showQuietly(w)
 	}
 	time.AfterFunc(spaceSettle, func() {
 		application.InvokeAsync(func() { setMovesToActiveSpace(w, false) })
@@ -363,13 +403,23 @@ func showHere(w *application.WebviewWindow, focus bool) {
 // to its own size, which the Mac fits to the screen again, so it couldn't
 // be restored at all.
 func (h *host) placeMain(w *application.WebviewWindow) {
+	if h.placeAt(w) {
+		w.EnableSizeConstraints()
+		w.Maximise()
+		w.EnableSizeConstraints()
+	}
+}
+
+// placeAt is placeMain short of maximising: it puts the window where and at
+// the size it was left, and says whether it is to be maximised.
+func (h *host) placeAt(w *application.WebviewWindow) (maximise bool) {
 	if h.placed.Swap(w) == w {
-		return
+		return false
 	}
 	// where it was left, on a screen there now (putBack)
 	put := h.putBack(w)
 	if runtime.GOOS == "linux" || w.IsMaximised() {
-		return
+		return false
 	}
 	wd, ht := w.Size()
 	sw, sh := h.mainRoom(w)
@@ -381,11 +431,7 @@ func (h *host) placeMain(w *application.WebviewWindow) {
 		}
 		fitted = false
 	}
-	if settings.Load().WindowMaximised && !fitted {
-		w.EnableSizeConstraints()
-		w.Maximise()
-		w.EnableSizeConstraints()
-	}
+	return settings.Shared().WindowMaximised && !fitted
 }
 
 // putBack moves the main window, not shown yet, to where it was last left

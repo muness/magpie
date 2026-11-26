@@ -252,6 +252,9 @@ func TestKeyLimitWindowResets(t *testing.T) {
 // reservation. A late check or release of it cannot spend the new window.
 func TestKeyLimitReservationsStayInTheirWindow(t *testing.T) {
 	for _, period := range access.Periods {
+		if period == "total" {
+			continue // one window that never ends: no boundary to cross (internal/budget's total_test.go holds it)
+		}
 		for _, cap := range []struct {
 			name   string
 			tokens int64
@@ -272,6 +275,21 @@ func TestKeyLimitReservationsStayInTheirWindow(t *testing.T) {
 				at := time.Date(2026, 10, 4, 12, 0, 0, 0, time.FixedZone("UTC+8", 8*3600))
 				if period == "days" {
 					lim.Days, lim.Since = 3, at.Add(-50*time.Hour)
+				}
+				if period == "account" {
+					// the account's 5 hours, read: each begins where the last ended
+					// (a window not read holds its reservations, internal/budget's
+					// account_test.go)
+					lim.Account, lim.AccountWindow = "codex/me@example.com", "5h"
+					origin := at.Add(-2 * time.Hour)
+					t.Cleanup(provider.AccountWindowVia(func(_, _ string, now time.Time) (time.Time, time.Time, bool) {
+						n := now.Sub(origin) / (5 * time.Hour)
+						if now.Before(origin) {
+							n--
+						}
+						start := origin.Add(n * 5 * time.Hour)
+						return start, start.Add(5 * time.Hour), true
+					}))
 				}
 				_, after := lim.Window(at)
 				before := after.Add(-time.Second)

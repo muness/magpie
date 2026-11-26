@@ -52,6 +52,8 @@ package agent
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -78,13 +80,48 @@ const (
 // T3, and a sync doesn't bring it back.
 const t3CodexOffered = "t3code.codex"
 
-func t3code(home string) *Agent {
-	base := appdir.Getenv("T3CODE_HOME")
-	if base == "" {
-		base = filepath.Join(home, ".t3")
-	} else if rest, ok := strings.CutPrefix(base, "~"); ok {
-		base = filepath.Join(home, rest)
+// t3Base is T3 Code's folder for home: $T3CODE_HOME, else ~/.t3. Its
+// settings are userdata/settings.json in it.
+func t3Base(home string) string { return appdir.T3Code(home) }
+
+// t3CodexRunsIn reports whether T3 Code's settings for home have magpie's
+// Codex instance (t3CodexInstance) running Codex in the Codex home dir:
+// its homePath, ~ being home, or Codex's own home when it gives none.
+// Codex keeps the provider each thread was started on and resumes it
+// there, whatever the instance's -c model_provider says, so the threads
+// that instance starts are on magpie while config.toml names another
+// provider, and are T3's to resume through magpie. Settings there that
+// can't be read say yes: what they hold is unknown.
+func t3CodexRunsIn(home, dir string) bool {
+	path := filepath.Join(t3Base(home), "userdata", "settings.json")
+	if _, err := os.Stat(path); err != nil {
+		return !errors.Is(err, fs.ErrNotExist)
 	}
+	if _, ok := edit.GetJSON(path, t3CodexInstance); !ok {
+		raw, err := os.ReadFile(path)
+		return err != nil || !json.Valid(raw)
+	}
+	h, _ := edit.GetJSON(path, t3CodexInstance+".config.homePath")
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return true
+	}
+	if h == "~" || strings.HasPrefix(h, "~/") || strings.HasPrefix(h, `~\`) {
+		h = filepath.Join(home, h[1:])
+	}
+	if filepath.Clean(h) == filepath.Clean(dir) {
+		return true
+	}
+	a, err := os.Stat(h)
+	if err != nil {
+		return false
+	}
+	b, err := os.Stat(dir)
+	return err == nil && os.SameFile(a, b)
+}
+
+func t3code(home string) *Agent {
+	base := t3Base(home)
 	path := filepath.Join(base, "userdata", "settings.json")
 	claudeOn := func() bool { _, ok := edit.GetJSON(path, t3Instance); return ok }
 	// either of magpie's instances: one the user removed in T3 leaves
@@ -128,7 +165,17 @@ func t3code(home string) *Agent {
 				return why
 			}
 			at := here(home)
-			return claudeCloud(at, filepath.Join(at.claudeDir(), "settings.json"))
+			settings := filepath.Join(at.claudeDir(), "settings.json")
+			// Claude Code applies its own settings' env over the instance
+			// env T3 adds, so an ANTHROPIC_BASE_URL set there (Billion
+			// Context and other Claude Code routers write one) wins over
+			// magpie's and takes T3's requests to it, as the doc above says.
+			// wiringOff reads magpie's instance, which still names the
+			// gateway, so only this catches it.
+			if f, u := claudeBaseURLElsewhere(at, settings); u != "" {
+				return "T3 Code's Claude Code takes ANTHROPIC_BASE_URL " + u + " from " + f + ", which Claude Code applies over magpie's instance, so its requests go there, not to magpie's gateway at " + gateway.URL() + "; take it out there to go through magpie"
+			}
+			return claudeCloud(at, settings)
 		},
 		Fields: []Field{{
 			Key: "provider", Label: "provider",
@@ -206,8 +253,8 @@ func t3InstanceJSON(path, gw string) map[string]any {
 		{"name": "ANTHROPIC_BASE_URL", "value": gw, "sensitive": false},
 		{"name": "ANTHROPIC_AUTH_TOKEN", "value": keyAt(gw), "sensitive": false},
 	}
-	// auto mode's review off while no model it lists is one Anthropic
-	// reviews, as for Claude Code itself (claudeReviewEnv); a value in the
+	// auto mode's review off unless every model it lists is one whose
+	// review comes back, as for Claude Code itself (claudeReviewEnv); a value in the
 	// user's ~/.claude settings comes after it
 	if !claudeReviewed([]string{"t3code"}) {
 		environment = append(environment, map[string]any{"name": claudeReviewEnv, "value": "0", "sensitive": false})

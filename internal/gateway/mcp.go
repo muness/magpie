@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log"
@@ -18,13 +19,17 @@ import (
 // mcpClient relays the agents' requests to a remote MCP server magpie is
 // signed in to. It has no timeout: a GET's event stream stays open for as
 // long as the agent keeps it.
-var mcpClient = &http.Client{Transport: mcpTransport()}
+var mcpClient = &http.Client{Transport: mcpTransport(nil)}
 
-func mcpTransport() http.RoundTripper {
+// mcpTransport sends the relay's requests, a body that stops moving over
+// HTTP/2 given up like every upstream's (stallGuard). tc is the TLS config
+// to trust, nil for the system's.
+func mcpTransport(tc *tls.Config) http.RoundTripper {
 	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.TLSClientConfig = tc
 	t.Proxy = netproxy.Func
 	t.ResponseHeaderTimeout = 2 * time.Minute
-	return netproxy.Dispatch(t)
+	return stallGuard{netproxy.Dispatch(t)}
 }
 
 // mcpHop are the headers a relay doesn't pass on.
@@ -51,6 +56,12 @@ func runMCP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "magpie runs no MCP server here", http.StatusNotFound)
 		return
 	}
+	// a gateway key held to some MCP servers or tools (access.Key.MCP)
+	w, r, done, ok := mcpKeyGuard(w, r, r.PathValue("name"))
+	if !ok {
+		return
+	}
+	defer done()
 	RunMCP(w, r, r.PathValue("name"))
 }
 
@@ -74,6 +85,12 @@ func (s *Server) mcpProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "magpie lends its MCP sign-ins to agents, not to web pages", http.StatusForbidden)
 		return
 	}
+	// a gateway key held to some MCP servers or tools (access.Key.MCP)
+	w, r, done, held := mcpKeyGuard(w, r, name)
+	if !held {
+		return
+	}
+	defer done()
 	rec, ok := mcpauth.Get(name)
 	if !ok {
 		http.Error(w, "magpie isn't signed in to an MCP server called "+name+": sign in to it in magpie's Library", http.StatusNotFound)
@@ -107,7 +124,8 @@ func (s *Server) mcpProxy(w http.ResponseWriter, r *http.Request) {
 			return nil, err
 		}
 		for k, v := range r.Header {
-			if mcpHop[http.CanonicalHeaderKey(k)] {
+			// nor what a proxy in front of magpie says of the caller
+			if mcpHop[http.CanonicalHeaderKey(k)] || proxyIdentity(k) {
 				continue
 			}
 			// the gateway's own key, which the caller check put there

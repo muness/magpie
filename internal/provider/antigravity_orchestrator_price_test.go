@@ -1,0 +1,203 @@
+package provider
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/yetone/magpie/internal/catalog"
+)
+
+// writeAntigravityRolesCatalog is models.dev's four Gemini 4 models and
+// another vendor's, in a sandbox HOME.
+func writeAntigravityRolesCatalog(t *testing.T) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
+	// models.dev's prices on 2026-11-15 (Neon's on 2026-11-19, Google's own:
+	// https://aistudio.google.com/docs/pricing)
+	os.WriteFile(catalog.CachePath(), []byte(`{
+	  "google":{"id":"google","models":{
+	    "gemini-4-argon":{"id":"gemini-4-argon","cost":{"input":2,"output":10,"cache_read":0.1}},
+	    "gemini-4-carbon":{"id":"gemini-4-carbon","cost":{"input":2.5,"output":12,"cache_read":0.25}},
+	    "gemini-4-hydrogen":{"id":"gemini-4-hydrogen","cost":{"input":1.5,"output":7.5,"cache_read":0.075}},
+	    "gemini-4-neon":{"id":"gemini-4-neon","cost":{"input":3,"output":15,"cache_read":0.15}}}},
+	  "openai":{"id":"openai","models":{
+	    "gpt-5.1-codex":{"id":"gpt-5.1-codex","cost":{"input":1.25,"output":10}}}}}`), 0o644)
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+}
+
+// Antigravity's Orchestrator mode records its calls under role ids, not
+// a model's: gemini-pro-orchestrator-argon, gemini-pro-orchestrator-carbon
+// and the worker gemini-flash-worker-agy showed tokens with no cost
+// (guyng35955 on X). Each is priced as the Gemini model Antigravity's
+// docs say it is, whichever provider's call names it; a name only like
+// one of them, and every other model, keeps its own price or none.
+func TestAntigravityOrchestratorIDsPricedAsTheirModel(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest())
+	writeAntigravityRolesCatalog(t)
+	// carbon is given its own price here, apart from argon's, so a role
+	// priced as the other model shows
+	want := map[string]catalog.Price{
+		"gemini-4-argon":    {Input: 2, Output: 10, CacheRead: 0.1},
+		"gemini-4-carbon":   {Input: 2.5, Output: 12, CacheRead: 0.25},
+		"gemini-4-hydrogen": {Input: 1.5, Output: 7.5, CacheRead: 0.075},
+		"gemini-4-neon":     {Input: 3, Output: 15, CacheRead: 0.15},
+	}
+	ag := Provider{ID: "antigravity", Name: "Antigravity"}
+	other := Provider{ID: "some-relay", Name: "Relay"}
+	for id, model := range map[string]string{
+		// the reporter's three
+		"gemini-pro-orchestrator-argon":  "gemini-4-argon",
+		"gemini-pro-orchestrator-carbon": "gemini-4-carbon",
+		"gemini-flash-worker-agy":        "gemini-4-hydrogen",
+		// Orchestrator (Carbon) before Argon came, and in agy
+		"gemini-pro-orchestrator": "gemini-4-carbon",
+		// agy's Orchestrator (Argon) (mu33410 on X)
+		"gemini-pro-orchestrator-g1-pro":         "gemini-4-argon",
+		"agy-cli/gemini-pro-orchestrator-g1-pro": "gemini-4-argon",
+		"gemini-pro-orchestrator-g1-pro-high":    "gemini-4-argon",
+		// Orchestrator (Neon), in agy and the app (mu33410 on X)
+		"gemini-pro-orchestrator-neon":         "gemini-4-neon",
+		"agy-cli/gemini-pro-orchestrator-neon": "gemini-4-neon",
+		"gemini-pro-orchestrator-neon-high":    "gemini-4-neon",
+		// Gemini 4 Neon itself, at the efforts agy names it by
+		"gemini-4-neon-xhigh": "gemini-4-neon",
+		// spelled as a route or an effort names them
+		"Gemini-Pro-Orchestrator-Argon":        "gemini-4-argon",
+		"google/gemini-pro-orchestrator-argon": "gemini-4-argon",
+		"gemini-pro-orchestrator-carbon-high":  "gemini-4-carbon",
+		"gemini-flash-worker-agy-extra-high":   "gemini-4-hydrogen",
+	} {
+		w := want[model]
+		// Argon and Carbon under Antigravity's own ids at its original price
+		// (antigravityOriginal); cache read the catalog's where higher
+		if o, ok := antigravityOriginal[model]; ok {
+			w = catalog.Price{Input: o.Input, Output: o.Output, CacheRead: max(o.CacheRead, w.CacheRead)}
+		}
+		for name, price := range map[string]func(string) (catalog.Price, bool){
+			"MakerPrice": MakerPrice, "antigravity ListPrice": ag.ListPrice, "relay ListPrice": other.ListPrice} {
+			if pr, ok := price(id); !ok || !samePrice(pr, w) {
+				t.Errorf("%s(%q) = %+v, %v; want %s's %+v", name, id, pr, ok, model, w)
+			}
+		}
+		if got := PricedName(id); got != model {
+			t.Errorf("PricedName(%q) = %q, want %q", id, got, model)
+		}
+	}
+	// the models themselves, under agy's and the app's routes too, and
+	// another vendor's, keep their own price
+	for id, w := range map[string]catalog.Price{
+		"gemini-4-argon": want["gemini-4-argon"], "gemini-4-carbon": want["gemini-4-carbon"],
+		"gemini-4-neon": want["gemini-4-neon"], "agy-cli/gemini-4-neon-high": want["gemini-4-neon"],
+		"antigravity/gemini-4-neon-low": want["gemini-4-neon"],
+		"gpt-5.1-codex":                 {Input: 1.25, Output: 10},
+	} {
+		if pr, ok := MakerPrice(id); !ok || !samePrice(pr, w) {
+			t.Errorf("MakerPrice(%q) = %+v, %v; want %+v", id, pr, ok, w)
+		}
+	}
+	// a name only like a role is no role
+	for _, id := range []string{"gemini-pro-orchestrator-neon-fast", "my-gemini-pro-orchestrator-neon", "gemini-flash-worker", "gemini-pro-orchestrator-argon-fast",
+		"my-gemini-pro-orchestrator-argon", "gemini-pro-orchestrator-g1", "gemini-pro-orchestrator-g1-ultra", "gemini-flash-worker-agy-ultra", "orchestrator", "gpt-5.1-codex-orchestrator"} {
+		if pr, ok := MakerPrice(id); ok {
+			t.Errorf("MakerPrice(%q) = %+v; want unpriced", id, pr)
+		}
+		if pr, ok := other.ListPrice(id); ok {
+			t.Errorf("relay ListPrice(%q) = %+v; want unpriced", id, pr)
+		}
+	}
+}
+
+// Antigravity counts Gemini 4 Carbon and Argon at their original price, not
+// the introductory one models.dev lists until 2026-11-30
+// (ZhouYimingsjtu on X: Carbon : Neon : Hydrogen measured at 1.64 : 1 :
+// 0.39 on an Ultra 20x plan). The Gemini API key, Vertex and any other
+// route keep the catalog's price; Neon and Hydrogen have no introductory
+// one and are the same everywhere. Once the catalog lists the original, it
+// is not raised again.
+func TestAntigravityCountsCarbonAtOriginalPrice(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
+	// models.dev's google on 2026-11-19, with a later catalog's Argon
+	os.WriteFile(catalog.CachePath(), []byte(`{"google":{"id":"google","models":{
+	    "gemini-4-argon":{"id":"gemini-4-argon","cost":{"input":4,"output":20,"cache_read":0.2}},
+	    "gemini-4-carbon":{"id":"gemini-4-carbon","cost":{"input":2,"output":10,"cache_read":0.1}},
+	    "gemini-4-hydrogen":{"id":"gemini-4-hydrogen","cost":{"input":1.5,"output":7.5,"cache_read":0.075}},
+	    "gemini-4-neon":{"id":"gemini-4-neon","cost":{"input":3,"output":15,"cache_read":0.15}}}}}`), 0o644)
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+
+	orig := catalog.Price{Input: 4, Output: 20, CacheRead: 0.2}
+	promo := catalog.Price{Input: 2, Output: 10, CacheRead: 0.1}
+	same := func(a, b catalog.Price) bool {
+		return a.Input == b.Input && a.Output == b.Output && a.CacheRead == b.CacheRead
+	}
+	ag := Provider{ID: "antigravity", Name: "Antigravity"}
+	agy := Provider{ID: "agy-cli", Name: "Antigravity (local agy CLI)"}
+	other := Provider{ID: "some-relay", Name: "Relay"}
+	for _, id := range []string{"gemini-4-carbon", "gemini-4-carbon-high", "agy-cli/gemini-4-carbon-high"} {
+		for name, p := range map[string]Provider{"antigravity": ag, "agy-cli": agy} {
+			if pr, ok := p.ListPrice(id); !ok || !same(pr, orig) {
+				t.Errorf("%s ListPrice(%q) = %+v, %v; want the original %+v", name, id, pr, ok, orig)
+			}
+			if pr, ok, _ := p.listPrice(id); !ok || !same(pr, orig) {
+				t.Errorf("%s listPrice(%q) = %+v, %v; want the original", name, id, pr, ok)
+			}
+		}
+	}
+	// the Gemini API key, a relay and the maker's list are the catalog's
+	for _, id := range []string{"gemini-4-carbon", "gemini-4-carbon-high", "google/gemini-4-carbon"} {
+		if pr, ok := other.ListPrice(id); !ok || !same(pr, promo) {
+			t.Errorf("relay ListPrice(%q) = %+v, %v; want the catalog's %+v", id, pr, ok, promo)
+		}
+		if pr, ok := MakerPrice(id); !ok || !same(pr, promo) {
+			t.Errorf("MakerPrice(%q) = %+v, %v; want the catalog's %+v", id, pr, ok, promo)
+		}
+	}
+	// Antigravity's own route and role ids are its alone
+	for _, id := range []string{"agy-cli/gemini-4-carbon-high", "antigravity/gemini-4-carbon", "gemini-pro-orchestrator-carbon", "gemini-pro-orchestrator"} {
+		if pr, ok := MakerPrice(id); !ok || !same(pr, orig) {
+			t.Errorf("MakerPrice(%q) = %+v, %v; want the original %+v", id, pr, ok, orig)
+		}
+	}
+	// the record of an Antigravity call, whichever the model's route
+	if pr := AgyPriced("gemini-4-carbon-high", promo); !same(pr, orig) {
+		t.Errorf("AgyPriced(carbon) = %+v, want %+v", pr, orig)
+	}
+	// Neon and Hydrogen have no introductory price, and the catalog's own
+	// original is not raised
+	for id, w := range map[string]catalog.Price{
+		"gemini-4-neon": {Input: 3, Output: 15, CacheRead: 0.15}, "gemini-4-hydrogen": {Input: 1.5, Output: 7.5, CacheRead: 0.075},
+		"gemini-4-argon": orig,
+	} {
+		for name, p := range map[string]Provider{"antigravity": ag, "agy-cli": agy, "relay": other} {
+			if pr, ok := p.ListPrice(id); !ok || !same(pr, w) {
+				t.Errorf("%s ListPrice(%q) = %+v, %v; want %+v", name, id, pr, ok, w)
+			}
+		}
+	}
+	// what a call costs there: Carbon dearer than Neon, as measured
+	if c, n := mustPrice(t, ag, "gemini-4-carbon"), mustPrice(t, ag, "gemini-4-neon"); c.Cost(1e6, 1e6, 0, 0) <= n.Cost(1e6, 1e6, 0, 0) {
+		t.Errorf("Antigravity's Carbon %+v is not dearer than Neon %+v", c, n)
+	}
+}
+
+func mustPrice(t *testing.T, p Provider, id string) catalog.Price {
+	t.Helper()
+	pr, ok := p.ListPrice(id)
+	if !ok {
+		t.Fatalf("%s ListPrice(%q) unpriced", p.ID, id)
+	}
+	return pr
+}

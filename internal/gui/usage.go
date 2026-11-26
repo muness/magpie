@@ -15,6 +15,7 @@ import (
 
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/sessions"
 	"github.com/yetone/magpie/internal/settings"
@@ -41,7 +42,7 @@ var (
 func init() {
 	usageapi.Clients = func() []usageapi.Client {
 		var out []usageapi.Client
-		for _, a := range agent.Clients() {
+		for _, a := range agent.Looks() {
 			out = append(out, usageapi.Client{ID: a.ID, Name: a.Name, Icon: a.Icon})
 		}
 		return out
@@ -55,7 +56,9 @@ func csvStamp(p usage.Period, day string, now time.Time) string {
 		return "magpie-requests-day-" + day
 	}
 	if p.IsRange() { // the days picked, which already say when
-		return "magpie-requests-" + strings.Replace(string(p), "..", "-to-", 1)
+		// a minute an end names ("T09:30") without the colon Windows
+		// doesn't take in a file name
+		return "magpie-requests-" + strings.ReplaceAll(strings.Replace(string(p), "..", "-to-", 1), ":", "")
 	}
 	// a rolling window ("last:24h0m0s") without the colon, which Windows
 	// doesn't take in a file name (#2075)
@@ -182,6 +185,12 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		limit, _ := strconv.Atoi(q.Get("limit"))
 		writeJSON(rw, ledgerPage(periodOf(q.Get("period")), ledgerFilter(r), offset, limit))
 	}))
+	// the gateway's bytes up and down so far and its requests in flight,
+	// which the Requests read a moment apart for how fast its traffic flows
+	// now; {} when another magpie serves the gateway
+	mux.HandleFunc("GET /api/usage/traffic", func(rw http.ResponseWriter, r *http.Request) {
+		writeJSON(rw, trafficNow())
+	})
 	// the heatmap (#1369): the last 53 weeks a day each, of the requests the
 	// page's filters keep, read from the same index as the page
 	mux.HandleFunc("GET /api/usage/heatmap", coldTurn(func(rw http.ResponseWriter, r *http.Request) {
@@ -278,6 +287,8 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		qs = usage.WithWindowHolds(qs, usage.Clock())
 		// and when each began, for its Pace number (fflake33)
 		qs = provider.WithWindowStarts(qs, usage.Clock())
+		// and how long each runs, for the table's columns (LotusDecoder on X)
+		qs = provider.WithWindowPeriods(qs)
 		// and which an account can't spend for another window used up,
 		// for the accounts' sum (#4791)
 		qs = provider.WithHeldWindows(qs, usage.Clock())
@@ -303,7 +314,7 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 		provider.RefreshUsage(ctx, id, r.URL.Query().Get("user"))
-		writeJSON(rw, withTrayKinds(provider.WithHeldWindows(provider.WithWindowStarts(usage.WithWindowHolds(provider.InProviderOrder(provider.WithCheckins(provider.Quotas(ctx))), usage.Clock()), usage.Clock()), usage.Clock())))
+		writeJSON(rw, withTrayKinds(provider.WithHeldWindows(provider.WithWindowPeriods(provider.WithWindowStarts(usage.WithWindowHolds(provider.InProviderOrder(provider.WithCheckins(provider.Quotas(ctx))), usage.Clock()), usage.Clock())), usage.Clock())))
 	})
 	// WorkBuddy's daily check-in pressed now, from the Usage card, for
 	// each account not in yet today, as `magpie accounts checkin` does; the
@@ -380,6 +391,16 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		}
 		writeJSON(rw, rs[0])
 	})
+	// the accounts a check-in reaches whose provider is switched off, for
+	// the Usage page's folded Switched off group (wxkwxk666 on X): asks
+	// nothing, switches nothing on
+	mux.HandleFunc("GET /api/usage/checkins/off", func(rw http.ResponseWriter, r *http.Request) {
+		qs := provider.OffCheckins()
+		if qs == nil {
+			qs = []provider.SubscriptionQuota{}
+		}
+		writeJSON(rw, qs)
+	})
 	// what was left of each window over time, for the quota cards' curves
 	// (#651); ?days= back
 	mux.HandleFunc("GET /api/usage/quotas/history", func(rw http.ResponseWriter, r *http.Request) {
@@ -435,4 +456,21 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		}
 		writeJSON(rw, out)
 	})
+}
+
+// trafficJSON is the gateway's bytes so far (gateway.Traffic) with its
+// requests in flight; all left out when this process serves no gateway.
+type trafficJSON struct {
+	*gateway.Traffic
+	Requests *int `json:"requests,omitempty"`
+}
+
+// trafficNow is what /api/usage/traffic answers.
+func trafficNow() trafficJSON {
+	gw := served.Load()
+	if gw == nil {
+		return trafficJSON{}
+	}
+	t, n := gw.Traffic(), gw.Busy().Requests
+	return trafficJSON{Traffic: &t, Requests: &n}
 }

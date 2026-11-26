@@ -61,7 +61,7 @@ func TestSearchOnAndOff(t *testing.T) {
 		return sent
 	}
 	mcp := func() (string, error) {
-		return s.searchMCPRun(httptest.NewRequest("POST", "/mcp/search", nil), "latest go", nil)
+		return s.searchMCPRun(httptest.NewRequest("POST", "/mcp/search", nil), "latest go", nil, nil)
 	}
 
 	// on
@@ -101,7 +101,7 @@ func TestSearchOnAndOff(t *testing.T) {
 	if !strings.Contains(ask(true), "web_search_20250305") {
 		t.Error("off: a vendor that searches by itself lost its own web_search")
 	}
-	if _, err := mcp(); err == nil || !strings.Contains(err.Error(), "Web search plugin") {
+	if _, err := mcp(); err == nil || !strings.Contains(err.Error(), "Plugins › Built-in") {
 		t.Errorf("off: MCP search said %v, not that the plugin is off", err)
 	}
 	for _, ctx := range []context.Context{context.Background(), searchingOn(context.Background(), plan)} {
@@ -147,8 +147,16 @@ func TestServingGatesTools(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if gwtool.Served(gwtool.WebSearch) {
-		t.Error("serving, with the plugin off: web search still served")
+	// the listener is set before ListenAndServe gates the tools, and the
+	// HTTP server only starts after: wait for the gate, not for the
+	// listener (#6016, red in a full -race run on a loaded mote)
+	deadline = time.Now().Add(10 * time.Second)
+	for gwtool.Served(gwtool.WebSearch) {
+		if time.Now().After(deadline) {
+			t.Error("serving, with the plugin off: web search still served")
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
 	cancel()
 	if err := <-done; err != nil {

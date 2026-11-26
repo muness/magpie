@@ -6,7 +6,7 @@
 //
 // Smart, the default, is the core's. The others a provider or group can be
 // routed by (order, rotate, usage, pace, weight, free, fast, cheap,
-// drain, expiring) are here for a plugin to
+// drain, pace-drain, expiring, fit) are here for a plugin to
 // register: plugins/rotation does, and off, a pool routed by one of them is
 // tried in its listed order, as an unknown routing always was.
 package routes
@@ -35,17 +35,29 @@ type Seat struct {
 	Used float64
 	// WeekLow: Used is at LowShare or more for its budget windows alone
 	// (a day or longer: the week), no rate cap of it near full
-	// (provider.Allowance.CapUsed). Smart and Use before expiry keep it
+	// (provider.Allowance.CapUsed). Smart and Use before expiry (and
+	// Before expiry, one by one, which picks as it does) keep it
 	// with those that have room: what the week has left is lost at its
 	// reset, and kept for last a week at 90% renewing today went unused
 	// (ysicing_01858 on Discord).
 	WeekLow bool
 	// Soon is when its windows renew, the biggest first (Allowance.Renewal)
 	Soon []time.Time
+	// Unreached is how many of Soon's windows, the biggest first, can no
+	// longer be used up before they renew unless the next one's left is
+	// used before that renews (provider.Allowance.Unreached): Smart ranks
+	// it by the next one, as what that leaves at its reset is lost
+	// (#5639). 0 for every account whose windows don't tell their counts.
+	Unreached int
 	// Lapse is when the soonest of what it has left is lost, apart from
 	// its windows' renewals (Allowance.Lapse): zero when not told. Smart
 	// goes by it when Soon ties.
 	Lapse time.Time
+	// Lapsing is the share of its allowance, in points of Used, that is
+	// lost soon unspent (Allowance.Lapsing): zero when not told. Least
+	// used first sends a seat with room and some ahead, as credits lost
+	// anyway cost nothing to spend.
+	Lapsing float64
 	// Pace is its week left per hour until that renews; an account not
 	// known has a whole week (provider.FreshPace), a key none
 	Pace float64
@@ -66,15 +78,25 @@ type Seat struct {
 	// "Free", "Free plan", a trial), as its vendor or plugin names it.
 	// FreeExpiring spends it, as it does Free, before a paid one.
 	FreePlan bool
-	// Credits: a Codex account that goes on past its allowance on its
-	// credits, and is let spend them. All but used up, it goes before
-	// those used up with nothing to go on with.
+	// Credits: an account that goes on past its allowance on its credits:
+	// a Codex account let spend them, or a plugin's whose plugin says so
+	// (a Kiro trial's). All but used up, it goes before those used up with
+	// nothing to go on with.
 	Credits bool
+	// Trial: its credits cost nothing to spend, a plugin's own trial
+	// credits (a Kiro month used up with a trial left), not bought ones a
+	// Codex account spends. What is left of the window isn't all it has,
+	// so it is weighed as having room (seatTier).
+	Trial bool
 	// First: such an account the user set to spend its credits before
 	// another account (provider.CodexCreditsFirst): its windows running
 	// out never put it behind the others (seatTier), so it keeps the
 	// place an account with room has.
 	First bool
+	// Lead: its provider is set to be used first (provider.Provider.
+	// UseFirst). Smart puts such seats ahead of the others while they have
+	// quota (seatTier below 2), in Smart's own order among themselves.
+	Lead bool
 	// TTFT is how long it took lately to the first of its reply, in ms,
 	// for the model this seat would be asked for: a decayed average of its
 	// recent streamed answers, 0 when it hasn't answered one lately.
@@ -98,6 +120,9 @@ type Seat struct {
 	// costs 0. Cheapest goes by them.
 	Priced          bool
 	Cost, CacheCost float64
+	// Window is its model's context window there, in tokens, 0 when not
+	// known. SmallFirst goes by it.
+	Window int
 }
 
 // Strategy orders a pool.
@@ -128,6 +153,9 @@ type Strategy struct {
 	// trace then shows it. Only when set: pricing reads each provider's
 	// model list and the user's prices.
 	ByPrice bool
+	// ByWindow: it weighs by Window, so the gateway reads each seat's
+	// model's context window, and the routing trace then shows it.
+	ByWindow bool
 }
 
 var reg = struct {

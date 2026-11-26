@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -14,14 +15,15 @@ import (
 	"golang.org/x/net/publicsuffix"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/settings"
 )
 
 // Rename gives a provider another id, the one its models are picked by
 // (<id>/<model>). What magpie keeps that names it by id follows: the
 // routing groups it is in and their rules and classifiers, the other
-// providers' fallbacks, which agents are shown it, and its StepFun sign-in. The old id stays
-// with it (Was), so an agent still running on a config that names it the
+// providers' fallbacks, which agents are shown it, and its StepFun and
+// Qwen AI platform sign-ins. The old id stays with it (Was), so an agent still running on a config that names it the
 // old way reaches it, and its usage so far is counted with it; the agents'
 // own files are the agent package's to rewrite (agent.RenameProvider).
 // A signed-in account keeps the id of its agent.
@@ -99,8 +101,15 @@ func Rename(from, to string) error {
 	if err := store(f); err != nil {
 		return err
 	}
-	// so is its StepFun sign-in, kept by provider id
+	// so are its StepFun, Qwen AI platform and Baidu Cloud console
+	// sign-ins, kept by provider id
 	if err := renameStepFun(from, to); err != nil {
+		return err
+	}
+	if err := renameQianwen(from, to); err != nil {
+		return err
+	}
+	if err := renameQianfan(from, to); err != nil {
 		return err
 	}
 	s := settings.Load()
@@ -140,6 +149,9 @@ func mapModelRefs(f *file, to func(string) string) {
 		for k, m := range g.Fast {
 			g.Fast[k] = to(m)
 		}
+		for k, m := range g.Ultra {
+			g.Ultra[k] = to(m)
+		}
 		for k, m := range g.Placed {
 			g.Placed[k] = to(m)
 		}
@@ -150,7 +162,8 @@ func mapModelRefs(f *file, to func(string) string) {
 			g.Off[k] = to(m)
 		}
 		g.Weights = renamedWeights(g.Weights, to)
-		g.Classifier = to(g.Classifier)
+		g.EffortMaps = renamedEffortMaps(g.EffortMaps, to)
+		g.MapClassifiers(to)
 		g.Pick = to(g.Pick)
 	}
 }
@@ -262,6 +275,16 @@ type Renames struct {
 	// the other way, each provider's merged ones
 	into   map[string]string
 	merged map[string][]string
+}
+
+// Same is whether o is r itself, the one read UsageRenames hands back
+// while providers.json is unchanged: the same maps, not equal ones. A
+// reader that keeps what it made from r asks it to know r is unchanged.
+func (r Renames) Same(o Renames) bool {
+	at := func(m any) uintptr { return reflect.ValueOf(m).Pointer() }
+	return at(r.now) == at(o.now) && at(r.gave) == at(o.gave) && at(r.hosts) == at(o.hosts) &&
+		at(r.sites) == at(o.sites) && at(r.gone) == at(o.gone) && at(r.into) == at(o.into) &&
+		at(r.merged) == at(o.merged)
 }
 
 type gaveTo struct {
@@ -406,8 +429,23 @@ func (r Renames) Key() string {
 // every renamed provider would be shown split until it read again.
 var lastRenames atomic.Pointer[Renames]
 
-// UsageRenames are the renames of providers.json as it is now.
+// UsageRenames are the renames of providers.json as it is now, worked
+// out once each time the file changes and shared, so read only: each
+// profile's in-use check on every state poll parsed the whole file again
+// for them, 5 MB of forty polls with real accounts.
 func UsageRenames() Renames {
+	if r, err := filememo.Read("provider renames", Path(), func(b []byte) (Renames, error) {
+		f, err := parseProviders(b)
+		if err != nil {
+			return Renames{}, err
+		}
+		return renamesOf(f.Providers, f.Deleted), nil
+	}); err == nil {
+		lastRenames.Store(&r)
+		return r
+	}
+	// missing, or a file that doesn't decode: read's own way, its last
+	// good generation
 	f, err := read()
 	if err != nil {
 		if r := lastRenames.Load(); r != nil {

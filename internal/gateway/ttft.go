@@ -27,11 +27,40 @@ type firstToken struct {
 	first                    time.Duration // to the first content; 0 until it comes
 	text                     time.Duration // to the first text
 	reasoning, lastReasoning time.Duration
-	hidden                   bool // redacted thinking cannot be timed by its visible portion
-	off                      bool // not a stream, or read as far as it is
-	began                    bool
-	read                     int
-	pend                     []byte
+	// think: the first sign of reasoning of any kind, seen or sealed — a
+	// reasoning delta, a Responses reasoning item's start, an Anthropic
+	// thinking block's start, a Gemini thought — before or after the first
+	// text. A reply's speed is all its output over the time from its first
+	// output of any kind, this or its first content, to its end
+	// (usage.DecodeOf, Archivemylife on X: reasoning and tool calls are
+	// tokens too); 0 when the reply showed no sign of when it reasoned
+	think time.Duration
+	// marked: think is a reasoning item's or thinking block's start, or
+	// sealed thinking, which come as the model begins to think; else it is
+	// a reasoning delta, which tells when only once the deltas span 100 ms
+	// (reasoningMs)
+	marked bool
+	// lastThink: the last sign of reasoning, which with think says whether
+	// the deltas were paced or one burst
+	lastThink time.Duration
+	hidden    bool // redacted thinking cannot be timed by its visible portion
+	// summarized: the reasoning shown was a summary translated from another
+	// protocol (continuation's summaryUpstream), whose thinking block opens
+	// at the summary's first words, after the reasoning it sums up began, so
+	// it tells no start (#1463)
+	summarized bool
+	// again: the reply reasoned again after its first text (a Codex
+	// preamble, "I'll look at the tests", then its thinking, then a tool
+	// call: Archivemylife on X), and nothing has come after that
+	// reasoning yet. The answer the speed is counted over starts at what
+	// comes next, so text then moves to it: counted from the preamble, the
+	// window held the thinking, and the reply read as one burst at its
+	// end and told no speed
+	again bool
+	off   bool // not a stream, or read as far as it is
+	began bool
+	read  int
+	pend  []byte
 	// flow: how many bytes of content events had come by each time, one
 	// mark a millisecond, from the first content on
 	flow []flowMark
@@ -74,14 +103,37 @@ func (f *firstToken) see(b []byte) {
 		f.pend = f.pend[end:]
 		if f.text > 0 {
 			// the first text is known: what is left to tell is when the
-			// rest came, which a quicker look tells
+			// rest came, which a quicker look tells, and whether the reply
+			// reasoned again after it (again)
+			if mayReason(ev) {
+				_, _, reasoning, hidden := timingKind(ev)
+				f.hidden = f.hidden || hidden
+				if reasoning || hidden || reasoningItem(ev) || thinkingBlock(ev) {
+					f.again, f.lastReasoning = true, d
+					if !reasoning || hidden || !summaryPart(ev) {
+						f.thought(d, hidden || !reasoning)
+					}
+					if flowContent(ev) {
+						f.mark(d, len(ev))
+					}
+					continue
+				}
+			}
 			if flowContent(ev) {
 				f.mark(d, len(ev))
+				if f.again {
+					f.text, f.again = d, false
+				}
 			}
 			continue
 		}
 		content, text, reasoning, hidden := timingKind(ev)
 		f.hidden = f.hidden || hidden
+		if hidden || mayReason(ev) && (reasoningItem(ev) || thinkingBlock(ev)) {
+			f.thought(d, true)
+		} else if reasoning && !summaryPart(ev) {
+			f.thought(d, false)
+		}
 		if reasoning {
 			if f.reasoning == 0 {
 				f.reasoning = d
@@ -107,6 +159,60 @@ func (f *firstToken) see(b []byte) {
 	}
 }
 
+// mayReason: an event that can carry reasoning, or a reasoning item's
+// start or end, told by a look rather than a parse, so the events of an
+// answer after its first text are still only looked at (see).
+func mayReason(ev []byte) bool {
+	return bodyHas(ev, "reasoning") || bodyHas(ev, "thinking") || bodyHas(ev, "encrypted_content") || bodyHas(ev, `"thought"`)
+}
+
+// summaryPart: a Responses reasoning summary's words or a Gemini thought,
+// a summary written after some of the reasoning it sums up, so its first
+// words tell no start of it (hidesReasoning, #1463). A Responses reasoning
+// item's start, before its summary, does.
+func summaryPart(ev []byte) bool {
+	return bodyHas(ev, "reasoning_summary") || bodyHas(ev, `"candidates"`) && bodyHas(ev, `"thought"`)
+}
+
+// reasoningItem: a Responses reasoning item's start or end, which streams
+// nothing of the thinking it holds when its summary is off.
+func reasoningItem(ev []byte) bool {
+	if !bodyHas(ev, "output_item.") {
+		return false
+	}
+	_, data := eventParts(ev)
+	var v struct {
+		Item *struct {
+			Type string `json:"type"`
+		} `json:"item"`
+	}
+	return json.Unmarshal(data, &v) == nil && v.Item != nil && v.Item.Type == "reasoning"
+}
+
+// thinkingBlock: an Anthropic thinking block's start, which comes as the
+// model begins to think, whether its thinking then streams or is omitted.
+func thinkingBlock(ev []byte) bool {
+	if !bodyHas(ev, "content_block_start") {
+		return false
+	}
+	_, data := eventParts(ev)
+	var v struct {
+		ContentBlock *struct {
+			Type string `json:"type"`
+		} `json:"content_block"`
+	}
+	return json.Unmarshal(data, &v) == nil && v.ContentBlock != nil && (v.ContentBlock.Type == "thinking" || v.ContentBlock.Type == "redacted_thinking")
+}
+
+// thought notes a sign of reasoning at d, the first one kept; marked
+// says it is a start or sealed thinking rather than a delta.
+func (f *firstToken) thought(d time.Duration, marked bool) {
+	if f.think == 0 {
+		f.think, f.marked = d, marked
+	}
+	f.lastThink = d
+}
+
 // flowMost is the most marks kept: a reply that took longer than this many
 // distinct milliseconds to come has its flow untold (flowMs).
 const flowMost = 1 << 16
@@ -130,7 +236,7 @@ func (f *firstToken) mark(d time.Duration, n int) {
 // The end of a reply (Responses' response.completed, which says the whole
 // reply again) carries none.
 func flowContent(ev []byte) bool {
-	return bytes.Contains(ev, []byte("delta")) || bytes.Contains(ev, []byte(`"parts"`))
+	return bodyHas(ev, "delta") || bodyHas(ev, `"parts"`)
 }
 
 // flowMs is how long the content of a reply took to come from its decode's
@@ -182,21 +288,11 @@ func firstKind(ev []byte) (content, text bool) {
 }
 
 func timingKind(ev []byte) (content, text, reasoning, hidden bool) {
-	var name string
-	var data []byte
-	for _, ln := range bytes.Split(ev, []byte("\n")) {
-		ln = bytes.TrimRight(ln, "\r")
-		switch {
-		case bytes.HasPrefix(ln, []byte("event:")):
-			name = string(bytes.TrimSpace(ln[6:]))
-		case bytes.HasPrefix(ln, []byte("data:")):
-			data = append(data, bytes.TrimSpace(ln[5:])...)
-		}
-	}
+	name, data := eventParts(ev)
 	// only deltas, a tool call's start and Gemini's parts carry any: the
 	// rest go by unread
-	if len(data) == 0 || !(bytes.Contains(data, []byte("delta")) || bytes.Contains(data, []byte(`"parts"`)) ||
-		bytes.Contains(data, []byte("content_block_start")) || bytes.Contains(data, []byte("output_item.added")) || bytes.Contains(data, []byte("encrypted_content"))) {
+	if len(data) == 0 || !(bodyHas(data, "delta") || bodyHas(data, `"parts"`) ||
+		bodyHas(data, "content_block_start") || bodyHas(data, "output_item.added") || bodyHas(data, "encrypted_content")) {
 		return false, false, false, hidden
 	}
 	var v struct {
@@ -300,6 +396,20 @@ func timingKind(ev []byte) (content, text, reasoning, hidden bool) {
 	return content, false, reasoning, hidden
 }
 
+// eventParts are a server-sent event's name and its data lines joined.
+func eventParts(ev []byte) (name string, data []byte) {
+	for _, ln := range bytes.Split(ev, []byte("\n")) {
+		ln = bytes.TrimRight(ln, "\r")
+		switch {
+		case bytes.HasPrefix(ln, []byte("event:")):
+			name = string(bytes.TrimSpace(ln[6:]))
+		case bytes.HasPrefix(ln, []byte("data:")):
+			data = append(data, bytes.TrimSpace(ln[5:])...)
+		}
+	}
+	return name, data
+}
+
 // filled is a JSON value with something in it.
 func filled(raw json.RawMessage) bool {
 	switch string(bytes.TrimSpace(raw)) {
@@ -331,12 +441,14 @@ func (f *firstToken) hidesReasoning(proto provider.Protocol, counted int) bool {
 	return f.hidden || f.reasoning > 0 && (counted <= 0 || proto == provider.Responses || proto == provider.Gemini || proto == provider.CodeAssist)
 }
 
-// reasoningMs requires a paced visible channel. Responses and Gemini summaries
-// do not measure their full reasoning count; translation keeps that restriction.
-func (f *firstToken) reasoningMs(proto provider.Protocol) int64 {
-	if proto != provider.Chat && proto != provider.Anthropic || f.hidden || f.off ||
-		f.reasoning == 0 || f.reasoning != f.first || f.lastReasoning-f.reasoning < 100*time.Millisecond {
+// reasoningMs is when the reply first showed it was reasoning, as ms from
+// start (think), in any protocol: 0 when it showed no sign of it, or its
+// only signs were reasoning deltas that came at once, a buffered burst
+// whose writing the stream didn't show, or a summary (summaryPart, or one
+// translated from another protocol: summarized).
+func (f *firstToken) reasoningMs() int64 {
+	if f.think == 0 || f.summarized || !f.marked && f.lastThink-f.think < 100*time.Millisecond {
 		return 0
 	}
-	return f.reasoning.Milliseconds()
+	return f.think.Milliseconds()
 }

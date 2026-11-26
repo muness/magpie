@@ -3,7 +3,6 @@ package library
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"slices"
 	"strings"
 	"unicode/utf8"
@@ -11,6 +10,7 @@ import (
 	"github.com/tidwall/jsonc"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // A server's tools can be turned off one by one (nf1qaz2w on Discord): the
@@ -50,6 +50,8 @@ func toolsOffOf(t *Target) toolsOffHow {
 		return toolsNone
 	}
 	id, _, _ := strings.Cut(t.Agent.ID, "@")
+	// another Hermes profile (hermes#coder) reads tools.exclude as the first
+	id, _, _ = strings.Cut(id, "#")
 	switch {
 	case id == "claude" && t.MCP.Format == fmtClaude && t.Settings != "":
 		return toolsClaudeDeny
@@ -216,7 +218,7 @@ func entryToolsEdit(f *mcpFile, old map[string]any, prev, want []string) (*tools
 // mcpToolName is a name as Claude Code and OpenCode spell it in a tool's
 // id: each character but a letter, a digit, _ and - is an _ (Claude Code
 // 2.1.296's normalizeNameForMCP; OpenCode's tool/mcp.ts namespace()).
-var mcpNameBad = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+var mcpNameBad = lazyre.New(`[^a-zA-Z0-9_-]`)
 
 func mcpToolName(s string) string { return mcpNameBad.ReplaceAllString(s, "_") }
 
@@ -248,6 +250,11 @@ func (l *Library) syncToolRules(t *Target, how toolsOffHow, given []string, b *b
 				want = append(want, r)
 			}
 		}
+	}
+	// Claude Code's own artifacts, beside magpie's (artifacts.go)
+	artifacts := how == toolsClaudeDeny && l.artifactsGiven(id, given)
+	if artifacts {
+		want = append(want, claudeArtifactTool)
 	}
 	if len(want) == 0 && len(a.ToolRules) == 0 {
 		return
@@ -285,6 +292,10 @@ func (l *Library) syncToolRules(t *Target, how toolsOffHow, given []string, b *b
 	}
 	if how == toolsClaudeDeny {
 		perms, _ := doc["permissions"].(map[string]any)
+		// the user's own rule for it (allowed, asked) is theirs
+		if artifacts && claudeRuled(doc, claudeArtifactTool) {
+			want = slices.DeleteFunc(want, func(r string) bool { return r == claudeArtifactTool })
+		}
 		cur, ok := entryTools(doc, []string{"permissions", "deny"})
 		if !ok {
 			fail(fmt.Errorf("%s: permissions.deny isn't a list of rules, so magpie leaves it as it is", path))
@@ -393,4 +404,18 @@ func ServerTools(name string, off []string) (*Result, error) {
 		s.DisabledTools = off
 		return nil
 	})
+}
+
+// claudeRuled is whether Claude Code's settings allow the tool, or ask
+// before it, by a rule of the user's.
+func claudeRuled(doc map[string]any, tool string) bool {
+	for _, k := range []string{"allow", "ask"} {
+		list, _ := entryTools(doc, []string{"permissions", k})
+		for _, r := range list {
+			if r == tool || r == tool+"(*)" {
+				return true
+			}
+		}
+	}
+	return false
 }

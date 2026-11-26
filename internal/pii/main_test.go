@@ -44,13 +44,18 @@ const (
 //	badmodel     says it couldn't read the model's file, by the name
 //	             it was given
 //	novulkan     as pf-serve-vulkan, says Vulkan is missing; else ok
+//	noavx2       as pf-serve, ends at once as on a CPU (or an emulation)
+//	             without AVX2, SIGILL; else ok
 //	gpuloadhang  on the GPU, never says the model is loaded; else ok
 //	asserts      fails a ggml assert at its first request
 //	gpuhang      on the GPU, never answers a request; else ok
 //	gpuhangonce  on the GPU, never answers the first request of the
 //	             test; else ok
-//	gpudiesonce  on the GPU, ends at the first request of the test;
-//	             else ok
+//	gpudiestwice on the GPU, ends at the first two requests of the
+//	             test; else ok
+//	gpulostidle  on the GPU, answers the first request of the test and
+//	             ends at the second, its device lost as Vulkan's is
+//	             after an idle spell (plugins#853); else ok
 //
 // Like pf-serve, it first writes ggml's startup lines to stderr.
 func fakeServe(mode string) {
@@ -91,6 +96,9 @@ func fakeServe(mode string) {
 		json.NewEncoder(os.Stdout).Encode(map[string]string{"error": "failed to read GGUF: " + model})
 		os.Exit(1)
 	}
+	if mode == "noavx2" && name == "pf-serve" {
+		os.Exit(132)
+	}
 	if mode == "noload" || mode == "novulkan" && name == "pf-serve-vulkan" {
 		json.NewEncoder(os.Stdout).Encode(map[string]string{"error": "can't load " + mode})
 		os.Exit(1)
@@ -120,17 +128,27 @@ func fakeServe(mode string) {
 			texts[i] = string(b)
 		}
 		logf("request %d %q", n, texts)
-		// once: the first request of the test, on the GPU
-		once := false
-		if p := os.Getenv(fakeLog); p != "" && gpu && strings.HasSuffix(mode, "once") {
-			if f, err := os.OpenFile(p+".once", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644); err == nil {
-				f.Close()
-				once = true
+		// nth: which request of the test this is on the GPU, counted
+		// across the pf-serves the test starts
+		nth := 0
+		if p := os.Getenv(fakeLog); p != "" && gpu {
+			for nth = 1; ; nth++ {
+				f, err := os.OpenFile(fmt.Sprintf("%s.gpu%d", p, nth), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+				if err == nil {
+					f.Close()
+					break
+				}
 			}
 		}
+		once := strings.HasSuffix(mode, "once") && nth == 1
 		switch {
-		case mode == "gpudies" && gpu, mode == "gpudiesonce" && once:
+		case mode == "gpudies" && gpu, mode == "gpudiestwice" && gpu && nth <= 2:
 			fmt.Fprintln(os.Stderr, "ggml_metal: device lost")
+			os.Exit(3)
+		case mode == "gpulostidle" && nth == 2:
+			// as pf-serve-vulkan on Windows (MinGW) ends with it
+			fmt.Fprintln(os.Stderr, "terminate called after throwing an instance of 'vk::DeviceLostError'")
+			fmt.Fprintln(os.Stderr, "  what():  vk::Device::waitForFences: ErrorDeviceLost")
 			os.Exit(3)
 		case mode == "hang", mode == "gpuhang" && gpu, mode == "gpuhangonce" && once:
 			time.Sleep(time.Hour)

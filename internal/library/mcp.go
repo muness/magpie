@@ -8,8 +8,9 @@ import (
 	"io/fs"
 	"maps"
 	"math"
+	"os"
 	"path/filepath"
-	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -26,12 +27,14 @@ import (
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/imagemcp"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // Server is one MCP server: a command magpie's agents start, or a URL they
 // reach.
 type Server struct {
-	Name string `json:"name"`
+	Name   string `json:"name"`
+	Bundle string `json:"bundle,omitempty"` // the Claude Code plugin it came with (plugin.go)
 	// Transport is stdio for a command, http (streamable) or sse for a URL.
 	Transport string            `json:"transport"`
 	Command   string            `json:"command,omitempty"`
@@ -49,10 +52,26 @@ type Server struct {
 	// (GitHub's, 新v学员 on Discord). It is magpie's alone: the agents are
 	// given the server as before.
 	OAuth *OAuthApp `json:"oauth,omitempty"`
+	// Accounts are further sets of headers for the server (Elorynth on X:
+	// several keys, one in use), each laid over Headers, and Account is the
+	// one the agents are given ("" for Headers as they are). magpie's own
+	// OAuth sign-ins to the server have their accounts in mcpauth.
+	Accounts []Account `json:"accounts,omitempty"`
+	Account  string    `json:"account,omitempty"`
 	// StartupTimeout is the seconds an agent waits for the server to start
 	// and list its tools: Codex's startup_timeout_sec (#3168), the only
 	// agent given it. 0 leaves it to the agent (Codex's own is 30s).
 	StartupTimeout int `json:"startupTimeout,omitempty"`
+	// IdleTimeout is the seconds a server magpie runs itself (through the
+	// MCP hub, or for Codex at /mcp/run/) is kept with no call before it is
+	// ended, 0 for magpie's own (hubIdle, runIdle); KeepAlive keeps it
+	// until magpie stops or the server is edited (MasterYi on Discord:
+	// chrome-devtools-mcp --autoConnect, whose Chrome asks again to allow
+	// each new connection, and a heavy one ended sooner to free its
+	// browser). An agent's own entry is never given either: the agent
+	// runs that server.
+	IdleTimeout int  `json:"idleTimeout,omitempty"`
+	KeepAlive   bool `json:"keepAlive,omitempty"`
 	// Local keeps the server to this computer (huhuy72219405 on X: a
 	// server of a program or folder only this computer has). A backup or
 	// a sync never carries it, and one coming in neither takes it away nor
@@ -62,6 +81,16 @@ type Server struct {
 	// gateway serves them at its URL, and the hub calls the plugin itself
 	// (plugin_tools.go)
 	Plugin string `json:"plugin,omitempty"`
+	// Hidden is a server turned off in the Library (ServerOn), or a
+	// plugin's whose tools were hidden from every agent on the Plugins
+	// page (PluginServerOn, chengming0v0 on Discord): no agent is given
+	// it, nor a project, nor an app at the MCP router's address. Paused are the agents it had, given back when it is shown
+	// again. Both go once the server has an agent again (save).
+	Hidden bool     `json:"hidden,omitempty"`
+	Paused []string `json:"paused,omitempty"`
+	// Bridge is the Remote magpie (its provider id) whose MCP router the
+	// server is, given a server of its own (bridge_mcp.go)
+	Bridge string `json:"bridge,omitempty"`
 	// Hub is how the MCP hub (Library.MCPHub) gives the server: "" shares
 	// it through the hub's one entry, as every server was before;
 	// HubDirect keeps it the agents' own entry, written as with the hub
@@ -72,10 +101,20 @@ type Server struct {
 	// Discord: with many of them, which is which). Only the library keeps
 	// it, and a sync carries it; no agent is given it (TestNoteNeverGiven).
 	Note string `json:"note,omitempty"`
+	// Shared is set when this computer starts the server its own way
+	// (#3836, #6426; jinpwng on X: one server on a Mac and in WSL, each
+	// with its own path): Command, Args and Env are then this computer's,
+	// and Shared is what a sync carries and brings for them. Never carried
+	// itself (mcp_here.go).
+	Shared *Start `json:"shared,omitempty"`
 
 	// about is the hub entry's description, for an agent that shows a
 	// server by one before it has connected (Pi, hubServerFor)
 	about string
+
+	// direct are the hub entry's tools Pi declares to its model whole
+	// (piDirect)
+	direct []string
 
 	// startupWrote is the startup_timeout_sec magpie last wrote in the
 	// entry being written, 0 for none: one the entry has otherwise is the
@@ -125,6 +164,7 @@ func (s *Server) check() error {
 		if s.Command == "" {
 			return fmt.Errorf("%s: a command is needed", s.Name)
 		}
+		s.Command, s.Args = spacedProgram(s.Command, s.Args)
 		s.URL, s.Headers = "", nil
 	case "http", "sse":
 		if !strings.HasPrefix(s.URL, "http://") && !strings.HasPrefix(s.URL, "https://") {
@@ -133,6 +173,16 @@ func (s *Server) check() error {
 		s.Command, s.Args, s.Env = "", nil, nil
 	default:
 		return fmt.Errorf("%s: unknown transport %q", s.Name, s.Transport)
+	}
+	// only a synced command server has a start of its own here
+	if s.Transport != "stdio" || s.Local {
+		s.Shared = nil
+	} else if s.Shared != nil {
+		s.Shared.Command = strings.TrimSpace(s.Shared.Command)
+		if s.Shared.Command == "" {
+			return fmt.Errorf("%s: the synced command is empty", s.Name)
+		}
+		s.Shared.Command, s.Shared.Args = spacedProgram(s.Shared.Command, s.Shared.Args)
 	}
 	switch s.Hub {
 	case "", "shared":
@@ -164,6 +214,9 @@ func (s *Server) check() error {
 	if s.StartupTimeout < 0 || s.StartupTimeout > maxStartupTimeout {
 		return fmt.Errorf("%s: the startup timeout is between 0 (the agent's own) and %d seconds", s.Name, maxStartupTimeout)
 	}
+	if s.IdleTimeout < 0 || s.IdleTimeout > maxStartupTimeout {
+		return fmt.Errorf("%s: the idle timeout is between 0 (magpie's own) and %d seconds", s.Name, maxStartupTimeout)
+	}
 	for k := range s.Env {
 		if strings.TrimSpace(k) == "" {
 			delete(s.Env, k)
@@ -174,7 +227,40 @@ func (s *Server) check() error {
 			delete(s.Headers, k)
 		}
 	}
-	return nil
+	return s.checkAccounts()
+}
+
+// spacedProgram is a program by full path that has spaces in it, typed
+// as it is: "/Applications/Agent HUD.app/Contents/MacOS/Agent HUD --mcp"
+// (zachzhao1984 on Discord), or C:\Program Files\… on Windows, which a
+// command line split at each space makes /Applications/Agent and three
+// arguments, a program that isn't there. When cmd is a full path to no
+// file and cmd with the words after it, joined back by a space, is a
+// program on this computer, that is the program and the rest are its
+// arguments: the fewest words that make one, as Windows reads an unquoted
+// path. A command that is there, a bare name, or a path no join makes a
+// program are left as typed.
+func spacedProgram(cmd string, args []string) (string, []string) {
+	if len(args) == 0 || !filepath.IsAbs(cmd) || program(cmd) {
+		return cmd, args
+	}
+	p := cmd
+	for i, a := range args {
+		p += " " + a
+		if program(p) {
+			return p, slices.Clone(args[i+1:])
+		}
+	}
+	return cmd, args
+}
+
+// program is whether path is a file this computer can run.
+func program(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	return runtime.GOOS == "windows" || fi.Mode().Perm()&0o111 != 0
 }
 
 // same reports whether two definitions start the same server; which agents
@@ -182,6 +268,23 @@ func (s *Server) check() error {
 func (s *Server) same(o *Server) bool {
 	return s.Transport == o.Transport && s.Command == o.Command && slices.Equal(s.Args, o.Args) &&
 		maps.Equal(s.Env, o.Env) && s.URL == o.URL && maps.Equal(s.Headers, o.Headers) && s.about == o.about
+}
+
+// piDirect are the tools of s Pi is told to declare to its model as it
+// does a built-in tool (toolExposure "direct", docs/mcp.md "Control tool
+// exposure"), not behind codemode, whose prompt has a line for the
+// server alone: told only that line, a Pi asked to draw an architecture
+// used a skill of its own and never Magpie Artifacts (owner, 11-24).
+// They are written while the entry has neither exposure nor toolExposure:
+// either is the user's, and stays as they wrote it (merged, behind).
+func piDirect(s *Server) []string {
+	if s.Name == HubEntry {
+		return s.direct
+	}
+	if serverKey(s) == artifactsKey {
+		return []string{artifactPublish}
+	}
+	return nil
 }
 
 // ---- each agent's own format ----------------------------------------------
@@ -240,6 +343,15 @@ const (
 	// config.json.live-mcp.json: a list of servers, each by its id, stdio
 	// or streamable HTTP (liveagent.go)
 	fmtLiveAgent
+	// fmtOpenClaw is OpenClaw's openclaw.json mcp.servers: command/args/
+	// env, or url/headers with a transport, where a url with none is SSE
+	// (OpenClaw 2026.11.6 docs/cli/mcp.md, McpServerSchema)
+	fmtOpenClaw
+	// fmtTrae is TRAE CN's User/mcp.json in its userData: mcpServers of
+	// command/args/env or url/headers, no type on an entry, a url
+	// streamable HTTP and no way to name SSE (TRAE CN 2.3.105403's
+	// workbench)
+	fmtTrae
 )
 
 // mcpFile is the file an agent keeps its user-wide MCP servers in.
@@ -263,6 +375,9 @@ type mcpFile struct {
 	// Literal: what reads the file reads no reference to a variable
 	// (pi-mcp-extension), whatever its format's syntax (refsOf)
 	Literal bool
+	// NoCmdRefs: the agent reads no reference in a command or its args,
+	// whatever its format's other agents do (Droid's, cmdRefs)
+	NoCmdRefs bool
 }
 
 // files are every file the servers are written into.
@@ -277,7 +392,7 @@ func (f *mcpFile) key() string {
 		return "mcp"
 	case fmtGoose:
 		return "extensions"
-	case fmtZCode:
+	case fmtZCode, fmtOpenClaw:
 		return "mcp.servers"
 	case fmtZed:
 		return "context_servers"
@@ -290,7 +405,7 @@ func (f *mcpFile) supports(s *Server) error {
 	if f.Format == fmtDesktop && s.Remote() {
 		return errNoRemote
 	}
-	if s.Transport == "sse" && (f.Format == fmtCodex || f.Format == fmtGoose || f.Format == fmtDsh || f.Format == fmtPiNative || f.Format == fmtGrok || f.Format == fmtCommandCode || f.Format == fmtZed || f.Format == fmtKiro || f.Format == fmtLiveAgent) {
+	if s.Transport == "sse" && (f.Format == fmtCodex || f.Format == fmtGoose || f.Format == fmtDsh || f.Format == fmtPiNative || f.Format == fmtGrok || f.Format == fmtCommandCode || f.Format == fmtZed || f.Format == fmtKiro || f.Format == fmtTrae || f.Format == fmtLiveAgent) {
 		return errNoSSE
 	}
 	if f.Format == fmtDsh && s.Name != "" && !dshServerName.MatchString(s.Name) {
@@ -305,7 +420,7 @@ func (f *mcpFile) supports(s *Server) error {
 
 // windowsPath is a program named as Windows names one: C:/…, a path with a
 // backslash in it, or …/npx.cmd.
-var windowsPath = regexp.MustCompile(`^[A-Za-z]:[\\/]|\\|(?i)\.(?:exe|cmd|bat|ps1)$`)
+var windowsPath = lazyre.New(`^[A-Za-z]:[\\/]|\\|(?i)\.(?:exe|cmd|bat|ps1)$`)
 
 // foreign says why an entry by the server's name that magpie can't read as
 // a server is one it mustn't write over, or nil: Zed's server from an
@@ -411,6 +526,18 @@ func selfTimeout(s *Server, def int) int {
 	return def
 }
 
+// idleFor is how long a server magpie runs is kept with no call: its own
+// IdleTimeout, else def; 0 with KeepAlive, which is never ended for it.
+func (s *Server) idleFor(def time.Duration) time.Duration {
+	switch {
+	case s.KeepAlive:
+		return 0
+	case s.IdleTimeout > 0:
+		return time.Duration(s.IdleTimeout) * time.Second
+	}
+	return def
+}
+
 // maxStartupTimeout is the longest startup timeout a server is given: a
 // day, as a hook's timeout.
 const maxStartupTimeout = 86400
@@ -479,6 +606,9 @@ func (f *mcpFile) behind(s *Server, old map[string]any) bool {
 	if f.Format == fmtCodex && slices.ContainsFunc(codexRefused(s), func(k string) bool { _, ok := old[k]; return ok }) {
 		return true
 	}
+	if f.Format == fmtPiNative && old != nil && len(piDirect(s)) > 0 && !piExposed(old) {
+		return true
+	}
 	if selfTimeout(s, 0) == 0 {
 		return false
 	}
@@ -490,6 +620,13 @@ func (f *mcpFile) behind(s *Server, old map[string]any) bool {
 		return isNumber(old["timeout"], gooseOldTimeout)
 	}
 	return false
+}
+
+// piExposed is whether a Pi entry says how its tools reach the model.
+func piExposed(old map[string]any) bool {
+	_, a := old["exposure"]
+	_, b := old["toolExposure"]
+	return a || b
 }
 
 func isNumber(v any, n float64) bool {
@@ -639,6 +776,13 @@ func (f *mcpFile) encode(s *Server) ordered {
 		if s.about != "" {
 			add("description", s.about)
 		}
+		if d := piDirect(s); len(d) > 0 {
+			ex := map[string]any{}
+			for _, n := range d {
+				ex[n] = "direct"
+			}
+			add("toolExposure", ex)
+		}
 	case fmtHermes, fmtAlma:
 		// Hermes' own `hermes mcp add` writes url/headers or
 		// command/args/env; transport: sse is its only other transport
@@ -681,7 +825,31 @@ func (f *mcpFile) encode(s *Server) ordered {
 				add("transport", "stdio")
 			}
 		}
-	case fmtKiro:
+	case fmtOpenClaw:
+		// as `openclaw mcp set` takes one: a url with no transport is
+		// SSE to OpenClaw, so streamable HTTP is named, and `type: "http"`
+		// is an alias its doctor rewrites (docs/cli/mcp.md)
+		if s.Remote() {
+			add("url", s.URL)
+			t := "streamable-http"
+			if s.Transport == "sse" {
+				t = "sse"
+			}
+			add("transport", t)
+			optional("headers", s.Headers)
+		} else {
+			add("command", s.Command)
+			add("args", list(s.Args))
+			optional("env", s.Env)
+		}
+		// OpenClaw gives a request a minute unless the entry says more
+		// (mcp-transport-config DEFAULT_REQUEST_TIMEOUT_MS); every other
+		// key fails the whole file (`openclaw config validate`), timeout
+		// among them
+		if t := selfTimeout(s, 0); t > 0 {
+			add("requestTimeoutMs", t*1000)
+		}
+	case fmtKiro, fmtTrae:
 		// as the docs show them: command/args/env, or url/headers — no
 		// type, the entry's shape saying which (kiro.dev/docs/mcp/
 		// configuration); an SSE server never comes this far
@@ -996,12 +1164,29 @@ func (f *mcpFile) decode(name string, m map[string]any) (*Server, bool) {
 		if f.Format == fmtPiNative && name == HubEntry {
 			s.about = str(m, "description")
 		}
-	case fmtKiro:
+	case fmtKiro, fmtTrae:
 		// a url is streamable HTTP: the docs give no way to name SSE
 		// (kiro.dev/docs/mcp/configuration), so no transport in the entry
 		// is read as one
 		if u := str(m, "url"); u != "" {
 			remote("http", u, m["headers"])
+		} else {
+			local(str(m, "command"), m["args"], m["env"])
+		}
+	case fmtOpenClaw:
+		// streamable HTTP when the transport (or the type alias `openclaw
+		// mcp set` also takes) says so, else SSE: a url with no transport
+		// is SSE to OpenClaw (mcp-config-normalize.ts)
+		if u := str(m, "url"); u != "" {
+			named := str(m, "transport")
+			if named == "" {
+				named = str(m, "type")
+			}
+			t := "sse"
+			if n := strings.ToLower(strings.TrimSpace(named)); n == "streamable-http" || n == "http" {
+				t = "http"
+			}
+			remote(t, u, m["headers"])
 		} else {
 			local(str(m, "command"), m["args"], m["env"])
 		}
@@ -1079,7 +1264,8 @@ func (f *mcpFile) parseEntries(raw []byte) (map[string]map[string]any, error) {
 	var err error
 	switch f.Format {
 	case fmtCodex, fmtGrok:
-		err = toml.Unmarshal(raw, &doc)
+		// only the servers' tables are read: not Codex's thousands of projects
+		err = toml.Unmarshal(edit.TOMLWithout(raw, "projects"), &doc)
 	case fmtGoose, fmtHermes:
 		err = yaml.Unmarshal(raw, &doc)
 	default:
@@ -1304,9 +1490,16 @@ var owned = map[mcpFormat][]string{
 	// disabled, autoApprove, disabledTools and oauth are the user's; a
 	// transport names nothing Kiro reads
 	fmtKiro: {"transport", "url", "headers", "command", "args", "env"},
+	// cwd, oauth, disabled and fromGalleryId are the user's (TRAE CN's
+	// own entries); a transport names nothing TRAE CN reads
+	fmtTrae: {"transport", "url", "headers", "command", "args", "env"},
 	// enabled, and the id's description, docsUrl, cwd, timeoutMs,
 	// workspaceRoots, policy and auth, are the user's
 	fmtLiveAgent: {"transport", "url", "headers", "command", "args", "env"},
+	// enabled, cwd, the timeouts, auth, oauth, toolFilter, sslVerify and
+	// the client certificate are the user's; a type is the alias OpenClaw
+	// rewrites to transport
+	fmtOpenClaw: {"transport", "type", "url", "headers", "command", "args", "env"},
 
 	// a url agy read in place of serverUrl goes when magpie writes one
 	fmtAntigravity: {"type", "serverUrl", "url", "headers", "command", "args", "env"},
@@ -1377,6 +1570,13 @@ func (f *mcpFile) merged(s *Server, old map[string]any) ordered {
 			o = slices.DeleteFunc(o, func(e kv) bool { return e.k == "startup_timeout_sec" })
 		} else {
 			mine = append(slices.Clone(mine), "startup_timeout_sec")
+		}
+	}
+	// an exposure of the user's says how the server's tools reach Pi's
+	// model, each of them
+	if f.Format == fmtPiNative && old != nil {
+		if _, ok := old["exposure"]; ok {
+			o = slices.DeleteFunc(o, func(e kv) bool { return e.k == "toolExposure" })
 		}
 	}
 	for i, e := range o {

@@ -45,8 +45,18 @@ test("a plugin's words are its own", () => {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {
       const p = path.join(d, e.name);
       if (e.isDirectory()) {
-        if (!["node_modules", ".git", "site", "tests", "testdata", "docs"].includes(e.name)) walk(p);
-      } else if (/\.(go|js|html|css)$/.test(e.name) && e.name !== "i18n.js") texts.push([p, fs.readFileSync(p, "utf8")]);
+        // third_party is vendored code, which says nothing to the window
+        if (!["node_modules", ".git", "site", "tests", "testdata", "docs", "third_party"].includes(e.name)) walk(p);
+      } else if (/\.(go|js|html|css)$/.test(e.name) && e.name !== "i18n.js" && !e.name.endsWith("_test.go")) {
+        // a Go test says nothing to the window: claude_image_budget_test.go's
+        // "turn i, with an image" turned this red for a day (#6877)
+        let text = fs.readFileSync(p, "utf8");
+        // a comment line says nothing to the window: Go's "(View routing,
+        // the …" and "Use the library's sets …" cite a plugin's words
+        // (#5332, #5327, #5426, #5482)
+        if (/\.(go|js)$/.test(e.name)) text = text.split("\n").filter((l) => !/^\s*\/\//.test(l)).join("\n");
+        texts.push([p, text]);
+      }
     }
   };
   walk(repo);

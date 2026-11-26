@@ -23,13 +23,13 @@ import (
 	"errors"
 	"os"
 	"reflect"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -37,8 +37,8 @@ import (
 // "NVIDIA #595", "Mistral #0001", or "NVIDIA NIM 2" as freeName names a
 // second one alike.
 var (
-	numberedHash  = regexp.MustCompile(`^(.*\S)\s*#\s*\d+$`)
-	numberedSpace = regexp.MustCompile(`^(.*\S) (\d+)$`)
+	numberedHash  = lazyre.New(`^(.*\S)\s*#\s*\d+$`)
+	numberedSpace = lazyre.New(`^(.*\S) (\d+)$`)
 )
 
 // copyBase is the name a numbered copy is a copy of, and whether name is
@@ -149,17 +149,32 @@ func foldRefs(f file, s *settings.Settings) map[string][]string {
 		for _, m := range g.Fast {
 			note(at+"fast", m)
 		}
+		for _, m := range g.Ultra {
+			note(at+"ultra", m)
+		}
 		for _, m := range g.Off {
 			note(at+"off", m)
 		}
 		for m, w := range g.Weights {
 			note(at+"weight"+strconv.Itoa(w), m)
 		}
+		for m, to := range g.EffortMaps {
+			pairs := make([]string, 0, len(to))
+			for from, l := range to {
+				pairs = append(pairs, from+">"+l)
+			}
+			slices.Sort(pairs)
+			note(at+"effortmap"+strings.Join(pairs, ","), m)
+		}
 		if g.Pick != "" {
 			note(at+"pick", g.Pick)
 		}
-		if g.Classifier != "" {
-			note(at+"classifier", g.Classifier)
+		for i, c := range g.Classifiers() {
+			if i == 0 {
+				note(at+"classifier", c)
+			} else {
+				note(at+"classifier"+strconv.Itoa(i), c)
+			}
 		}
 		for i := range g.Rules {
 			r := g.Rules[i]
@@ -342,11 +357,13 @@ func foldWhere(candidates func([]Provider) [][]int) (int, error) {
 			g.Rules[k].MapUses(ref)
 		}
 		g.Fast = compact(mapEach(g.Fast, ref))
+		g.Ultra = compact(mapEach(g.Ultra, ref))
 		g.Placed = compact(mapEach(g.Placed, ref))
 		g.Seen = compact(mapEach(g.Seen, ref))
 		g.Off = compact(mapEach(g.Off, ref))
 		g.Weights = renamedWeights(g.Weights, ref)
-		g.Classifier = ref(g.Classifier)
+		g.EffortMaps = renamedEffortMaps(g.EffortMaps, ref)
+		g.MapClassifiers(ref)
 		g.Pick = ref(g.Pick)
 	}
 	if err := store(f); err != nil {

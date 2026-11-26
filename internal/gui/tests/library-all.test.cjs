@@ -97,7 +97,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await browser.close();
     });
     const open = async (lang, tab, posts, fail, { width = 980, fixture } = {}) => {
-      const ctx = await browser.newContext({ viewport: { width, height: 800 } }); // the MCP tab fits, its "In projects" too
+      const ctx = await browser.newContext({ viewport: { width, height: 800 } }); // the MCP tab fits, its "Project servers" too
       await ctx.addInitScript((tab) => { try { localStorage.setItem("magpie.libTab", tab); } catch {} }, tab);
       const page = await ctx.newPage();
       page.setDefaultTimeout(5000);
@@ -109,7 +109,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await page.locator("#view-library .lib-body:not(.lib-skel) .lib-row").first().waitFor();
       return page;
     };
-    const row = (page, name) => page.locator("#view-library .lib-row").filter({ has: page.locator(".name", { hasText: new RegExp("^" + name + "$") }) });
+    const row = (page, name) => page.locator("#view-library .lib-row:not(.lib-hub)").filter({ has: page.locator(".name", { hasText: new RegExp("^" + name + "$") }) });
     const toast = (page, text) => page.waitForFunction((text) => document.querySelector("#status").textContent === text, text).catch(async () => {
       assert.equal(await page.locator("#status").textContent(), text);
     });

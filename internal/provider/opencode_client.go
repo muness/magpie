@@ -14,8 +14,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // OpenCodeVersion is the oldest OpenCode release magpie says it is to
@@ -83,7 +84,7 @@ func openCodeLatest() string {
 	return v
 }
 
-var openCodeVersionRe = regexp.MustCompile(`^\d{1,4}\.\d{1,4}\.\d{1,6}$`)
+var openCodeVersionRe = lazyre.New(`^\d{1,4}\.\d{1,4}\.\d{1,6}$`)
 
 // openCodeAskVersion is the latest version u says, or "" when it can't be
 // read, isn't a release version or is older than OpenCodeVersion (a stale
@@ -210,15 +211,55 @@ func OpenCodeSession(h http.Header, u string) {
 // whose id doesn't say so (361 on Discord: it answered 403 "OpenCode's
 // free tier can only be used from within OpenCode"); openCodeFreeIDs are
 // such ones known without the catalog.
+//
+// On OpenCode Go's gateway a model Go lists itself (models.dev's
+// opencode-go: beam-free and cat-jam-free among them) is none of these.
+// Go serves its models, the free ones too, to a Go key from any client its
+// docs validate (Claude Code, Codex, Hermes, Pi, Raycast), so they are
+// asked as the client asked them, with nothing of OpenCode's added. Asked
+// as Zen's, Go's free models got the environment block's "Prefer
+// /tmp/opencode over generic system temporary directories" in Claude
+// Code's prompt and said it back (withtee on X). A Zen free model Go
+// doesn't list stays one, for Zen's free tier asks it when Go refuses it
+// (RetryOpenCodeFreeOnZen).
 func (p Provider) OpenCodeFree(model string) bool {
 	if !p.IsOpenCode() {
 		return false
 	}
-	if strings.HasSuffix(model, "-free") || openCodeFreeIDs[model] {
-		return true
+	if !strings.HasSuffix(model, "-free") && !openCodeFreeIDs[model] {
+		pr, ok := catalog.PriceOf("opencode", model)
+		if !ok || pr.Input != 0 || pr.Output != 0 {
+			return false
+		}
 	}
-	pr, ok := catalog.PriceOf("opencode", model)
-	return ok && pr.Input == 0 && pr.Output == 0
+	return !p.openCodeGoLists(model)
+}
+
+// openCodeGoLists says p is at OpenCode Go's gateway and models.dev's
+// opencode-go lists model.
+func (p Provider) openCodeGoLists(model string) bool {
+	if !p.atOpenCodeGo() {
+		return false
+	}
+	_, ok := catalog.PriceOf("opencode-go", model)
+	return ok
+}
+
+// atOpenCodeGo says p is at OpenCode Go's gateway, on one of its APIs.
+func (p Provider) atOpenCodeGo() bool {
+	return slices.ContainsFunc([]string{p.Chat, p.Responses, p.Anthropic}, func(u string) bool { return openCodeGateway(u) == "go" })
+}
+
+// openCodeGoFree says model is one of OpenCode Go's free models on p, at
+// Go's gateway: one models.dev's opencode-go prices at nothing on every
+// count (beam-free, hy4-flash-free), as Go's own list gives no monthly
+// usage for it. Go's windows don't count it (#7496).
+func (p Provider) openCodeGoFree(model string) bool {
+	if !p.atOpenCodeGo() {
+		return false
+	}
+	pr, ok := catalog.PriceOf("opencode-go", model)
+	return ok && pr.Input == 0 && pr.Output == 0 && pr.CacheRead == 0 && pr.CacheWrite == 0
 }
 
 // openCodeFreeIDs are Zen's free models whose ids don't end in -free.
@@ -319,7 +360,7 @@ func zenFreeProbe(proto Protocol, body string) string {
 
 // openCodeHasEnvironment matches OpenCode's environment block: <env>, a
 // Working directory: line and </env>.
-var openCodeHasEnvironment = regexp.MustCompile(`<env>[\s\S]*Working directory:[\s\S]*</env>`)
+var openCodeHasEnvironment = lazyre.New(`<env>[\s\S]*Working directory:[\s\S]*</env>`)
 
 // OpenCodeHasEnvironment says whether a system prompt already carries
 // OpenCode's environment block, as OpenCode's own does.
@@ -407,12 +448,12 @@ func openCodeLocalDir(dir string) string {
 }
 
 var (
-	openCodeRemoteRe = regexp.MustCompile(`(?m)^\s*\[remote\s+"([^"]+)"\]([^\[]*)`)
-	openCodeURLRe    = regexp.MustCompile(`(?m)^\s*url\s*=\s*(.+)$`)
-	openCodeGitdirRe = regexp.MustCompile(`(?m)^gitdir:\s*(.+)$`)
-	openCodeSchemeRe = regexp.MustCompile(`(?i)^[a-z][a-z0-9+.-]*://`)
-	openCodeSCPRe    = regexp.MustCompile(`^([^@/:]+@)?([^/:]+):(.+)$`)
-	openCodeDotGitRe = regexp.MustCompile(`\.git/?$`)
+	openCodeRemoteRe = lazyre.New(`(?m)^\s*\[remote\s+"([^"]+)"\]([^\[]*)`)
+	openCodeURLRe    = lazyre.New(`(?m)^\s*url\s*=\s*(.+)$`)
+	openCodeGitdirRe = lazyre.New(`(?m)^gitdir:\s*(.+)$`)
+	openCodeSchemeRe = lazyre.New(`(?i)^[a-z][a-z0-9+.-]*://`)
+	openCodeSCPRe    = lazyre.New(`^([^@/:]+@)?([^/:]+):(.+)$`)
+	openCodeDotGitRe = lazyre.New(`\.git/?$`)
 )
 
 // openCodeRepository is the git repository dir is in, as OpenCode finds
@@ -544,7 +585,7 @@ func openCodeTrace(session string) (b3, traceparent string) {
 	return trace + "-" + span + "-1-" + hexOf(8), "00-" + trace + "-" + span + "-01"
 }
 
-var openCodeIDRe = regexp.MustCompile(`^[a-z]{3}_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
+var openCodeIDRe = lazyre.New(`^[a-z]{3}_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
 
 const base62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 

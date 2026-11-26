@@ -243,7 +243,8 @@ func settle(r Record, provider, model string) {
 }
 
 // Clear deletes every record kept: each day's file, and what memory has
-// of them (their snips, the requests' text). A day goes whole, never
+// of them (their snips, the requests' text), and each agent's counts of
+// turns looked over (checked.go). A day goes whole, never
 // rewritten, so nothing is left half-cleared for a reader; a request still
 // going is written to a new day's file once it is done. A day that can't
 // be removed stays, and is named in the error. What a placeholder stood
@@ -261,6 +262,7 @@ func Clear() error {
 		delete(store.days, d.path)
 	}
 	store.snips, store.sent, store.sentBytes = nil, nil, 0
+	errs = append(errs, clearChecked()...)
 	return errors.Join(errs...)
 }
 
@@ -419,22 +421,27 @@ func SentOf(key int64) (string, bool) {
 
 // Filter narrows List: by kind (one, or several split by commas), by
 // finder, by agent or provider, "" is any; Blocked keeps only the requests
-// masking held back.
+// masking held back. Value, where set, keeps a record only for a value it
+// takes, one that also has the kind and finder asked for: the page's
+// search, which asks the masker's memory what each placeholder stood for
+// (a record holds no value). It is called under the store's lock, so it
+// never calls back into this package.
 type Filter struct {
 	Kind, By, Agent, Provider string
 	Blocked                   bool
+	Value                     func(Value) bool
 }
 
 func (f Filter) takes(r Record) bool {
 	if f.Agent != "" && r.Agent != f.Agent || f.Provider != "" && r.Provider != f.Provider || f.Blocked && !r.Blocked {
 		return false
 	}
-	if f.Kind == "" && f.By == "" {
+	if f.Kind == "" && f.By == "" && f.Value == nil {
 		return true
 	}
 	kinds := strings.Split(f.Kind, ",")
 	for _, v := range r.Values {
-		if (f.Kind == "" || slices.Contains(kinds, v.Kind)) && (f.By == "" || v.By == f.By) {
+		if (f.Kind == "" || slices.Contains(kinds, v.Kind)) && (f.By == "" || v.By == f.By) && (f.Value == nil || f.Value(v)) {
 			return true
 		}
 	}

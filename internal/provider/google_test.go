@@ -161,6 +161,7 @@ func TestGeminiOwnLoginRefreshesInMemory(t *testing.T) {
 // minted for another client (Antigravity's) can't be refreshed as Gemini
 // CLI's and isn't listed; one without an ID token is taken as Gemini CLI's.
 func TestGeminiOwnLoginOnlyGeminiCLIsClient(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	idToken := func(claims map[string]any) string {
 		b, _ := json.Marshal(claims)
 		return "e30." + base64.RawURLEncoding.EncodeToString(b) + ".sig"
@@ -268,6 +269,7 @@ func TestSetGoogleProject(t *testing.T) {
 // roll it out to the account, previews where its quota has one — and each
 // goes to Code Assist by the id the CLI sends.
 func TestGeminiModelsAsTheCLIOffersThem(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	ids := func(ms []catalog.Model) string {
 		var s []string
 		for _, m := range ms {
@@ -355,6 +357,7 @@ func TestGeminiModelsAsTheCLIOffersThem(t *testing.T) {
 // Antigravity's account is onboarded on the daily endpoint, asking until
 // it is done, and its requests carry what Antigravity sends.
 func TestAntigravityProjectAndEnvelope(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	f := &fakeGoogle{
 		load:    `{"allowedTiers":[{"id":"free-tier","name":"Antigravity","isDefault":true}]}`,
 		onboard: `{"done":true,"response":{"cloudaicompanionProject":"ag-proj"}}`,
@@ -409,6 +412,7 @@ func TestAntigravityProjectAndEnvelope(t *testing.T) {
 // read as bloat), so the GUI can show one figure a family; the windows
 // themselves, and the model each counts for routing, stay as they were.
 func TestAntigravityQuotaFamilies(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	f := &fakeGoogle{
 		load:    `{"allowedTiers":[{"id":"free-tier","name":"Antigravity","isDefault":true}]}`,
 		onboard: `{"done":true,"response":{"cloudaicompanionProject":"ag-proj"}}`,
@@ -462,6 +466,7 @@ func TestAntigravityQuotaFamilies(t *testing.T) {
 // after the models', each model naming its group, and a page of text shows
 // the groups' windows in place of the models'.
 func TestAntigravityQuotaPools(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	f := &fakeGoogle{
 		load:    `{"allowedTiers":[{"id":"free-tier","name":"Antigravity","isDefault":true}]}`,
 		onboard: `{"done":true,"response":{"cloudaicompanionProject":"ag-proj"}}`,
@@ -608,6 +613,7 @@ func TestPooledWindowsPartialAggregateKeepsModelFallback(t *testing.T) {
 // model it adds isn't given those of a model of that name elsewhere
 // (Anthropic's 1M for Claude), nor said to see when it doesn't.
 func TestAntigravityModelsAsItListsThem(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	f := &fakeGoogle{
 		load:    `{"allowedTiers":[{"id":"free-tier","name":"Antigravity","isDefault":true}]}`,
 		onboard: `{"done":true,"response":{"cloudaicompanionProject":"ag-proj"}}`,
@@ -661,6 +667,7 @@ func TestAntigravityModelsAsItListsThem(t *testing.T) {
 // list and in Usage's windows, so no two read the same; a level tagged
 // with its own family keeps the name it was given.
 func TestAntigravityRetiredModelNamedForItself(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	f := &fakeGoogle{
 		load:    `{"allowedTiers":[{"id":"free-tier","name":"Antigravity","isDefault":true}]}`,
 		onboard: `{"done":true,"response":{"cloudaicompanionProject":"ag-proj"}}`,
@@ -747,6 +754,7 @@ func TestAntigravityRetiredModelNamedForItself(t *testing.T) {
 // name does; no two models read the same, and the names Antigravity gives
 // the rest stay.
 func TestAntigravityRetiredModelNamedWithoutTag(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	raw, err := os.ReadFile("testdata/antigravity-models-2026-10-20.json")
 	if err != nil {
 		t.Fatal(err)
@@ -831,6 +839,7 @@ func TestAntigravityRetiredModelNamedWithoutTag(t *testing.T) {
 // models, whichever Google lists first and whether or not it has 5 hours
 // (01huadalang on Discord: a Gemini 4 bar of 7 days, and Claude's gone).
 func TestAntigravityQuotaModelGroup(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
 	argon := func(five bool) string {
 		b := `{"bucketId":"gemini-argon-wtu-weekly","window":"weekly","remainingFraction":0.53,"resetTime":"2099-01-07T00:00:00Z","displayName":"Gemini 4 Argon Weekly Limit"}`
 		if five {
@@ -889,5 +898,155 @@ func TestAntigravityQuotaModelGroup(t *testing.T) {
 		if got := strings.Join(names, ","); got != c.pooled {
 			t.Errorf("%s: pooled\n%s\nwant\n%s", c.name, got, c.pooled)
 		}
+	}
+}
+
+// runking on Discord: an account whose summary has no Gemini 4 Argon
+// group, only "Gemini Models" and "Claude and GPT models" (an Ultra
+// account's, whose Argon quota Antigravity-Manager reads in Gemini's; or
+// the prod endpoint's, CodexBar), while fetchAvailableModels gives
+// gemini-4-argon a reading of its own, apart from the other Gemini
+// models'. Folded into Gemini's pool, its reading was hidden behind
+// Gemini's 92%: the card showed Gemini and Claude, no Gemini 4. A model
+// read otherwise than its group is a pool of its own, named as Google
+// names it; one read alike folds, as before; with the group in the
+// summary, the group's (TestAntigravityQuotaModelGroup).
+func TestAntigravityQuotaModelApartFromGroup(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
+	at := func(d time.Duration) string { return time.Now().Add(d).UTC().Format(time.RFC3339) }
+	five, week := at(3*time.Hour), at(6*24*time.Hour)
+	gemini := `{"displayName":"Gemini Models","description":"Models within this group: Gemini Flash, Gemini Pro","buckets":[
+		{"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.98,"resetTime":"` + week + `"},
+		{"bucketId":"gemini-5h","window":"5h","remainingFraction":0.92,"resetTime":"` + five + `"}]}`
+	claude := `{"displayName":"Claude and GPT models","description":"Models within this group: Claude Opus, Claude Sonnet, GPT-OSS","buckets":[
+		{"bucketId":"3p-weekly","window":"weekly","resetTime":"` + week + `"},
+		{"bucketId":"3p-5h","window":"5h","resetTime":"` + five + `"}]}`
+	argonGroup := `{"displayName":"Gemini 4 Argon","description":"For paid Pro plans, Argon quota is separate.","buckets":[
+		{"bucketId":"gemini-argon-wtu-weekly","window":"weekly","remainingFraction":0.53,"resetTime":"` + week + `","displayName":"Gemini 4 Argon Weekly Limit"}]}`
+	models := func(argon string) string {
+		return `{"models":{
+			"gemini-3-flash":{"displayName":"Gemini 3 Flash","quotaInfo":{"remainingFraction":0.92,"resetTime":"` + five + `"}},
+			"gemini-3.1-pro-high":{"displayName":"Gemini 3.1 Pro (High)","quotaInfo":{"remainingFraction":0.92,"resetTime":"` + five + `"}},
+			"gemini-4-argon-high":{"displayName":"Gemini 4 Argon (High)","quotaInfo":` + argon + `},
+			"gemini-4-argon-low":{"displayName":"Gemini 4 Argon (Low)","quotaInfo":` + argon + `},
+			"claude-sonnet-4-6":{"displayName":"Claude Sonnet 4.6","quotaInfo":{"resetTime":"` + five + `"}}}}`
+	}
+	apart := `{"remainingFraction":0.53,"resetTime":"` + week + `"}`
+	alike := `{"remainingFraction":0.92,"resetTime":"` + five + `"}`
+	f := &fakeGoogle{
+		load:    `{"allowedTiers":[{"id":"free-tier","name":"Antigravity","isDefault":true}]}`,
+		onboard: `{"done":true,"response":{"cloudaicompanionProject":"ag-proj"}}`,
+	}
+	googleSandbox(t, f)
+	auth := googleAuth{AccessToken: "tok", RefreshToken: "rt-ag", Expiry: time.Now().Add(time.Hour).UnixMilli()}
+	if err := addGoogleLogin("antigravity", "ag@example.com", "", auth); err != nil {
+		t.Fatal(err)
+	}
+	argonPool := map[string]string{"gemini-3-flash": "Gemini", "gemini-3.1-pro-high": "Gemini",
+		"gemini-4-argon-high": "Gemini 4 Argon", "gemini-4-argon-low": "Gemini 4 Argon", "claude-sonnet-4-6": "Claude & GPT"}
+	folded := maps.Clone(argonPool)
+	folded["gemini-4-argon-high"], folded["gemini-4-argon-low"] = "Gemini", "Gemini"
+	for _, c := range []struct {
+		name, groups, argon string
+		pools               map[string]string
+		pooled              string
+	}{
+		{"no Argon group, read apart (runking)", gemini + "," + claude, apart, argonPool,
+			"Gemini · 7 days,Gemini · 5 hours,Claude & GPT · 7 days,Claude & GPT · 5 hours,Gemini 4 Argon · 7 days"},
+		{"no Argon group, read alike", gemini + "," + claude, alike, folded,
+			"Gemini · 7 days,Gemini · 5 hours,Claude & GPT · 7 days,Claude & GPT · 5 hours"},
+		{"the Argon group", gemini + "," + claude + "," + argonGroup, apart, argonPool,
+			"Gemini 4 Argon (High),Gemini 4 Argon (Low),Gemini · 7 days,Gemini · 5 hours,Claude & GPT · 7 days,Claude & GPT · 5 hours,Gemini 4 Argon · 7 days"},
+	} {
+		f.mu.Lock()
+		f.models, f.summary = models(c.argon), `{"groups":[`+c.groups+`]}`
+		f.mu.Unlock()
+		q := googleLogins("antigravity")[0].acct.quota(context.Background(), "")
+		pools := map[string]string{}
+		for _, w := range q.Windows {
+			if w.Model != "" {
+				pools[w.Model] = w.Pool
+			}
+		}
+		if !maps.Equal(pools, c.pools) {
+			t.Errorf("%s: pools %v, want %v", c.name, pools, c.pools)
+		}
+		var names []string
+		for _, w := range PooledWindows(q.Windows) {
+			names = append(names, w.Name)
+		}
+		if got := strings.Join(names, ","); got != c.pooled {
+			t.Errorf("%s: pooled\n%s\nwant\n%s", c.name, got, c.pooled)
+		}
+		for _, w := range q.Windows {
+			if w.Pool == "Gemini 4 Argon" && w.Model == "" && (w.Used < 46 || w.Used > 48 || !w.Aside) {
+				t.Errorf("%s: Argon's pool reads %+v, want 47%% used, aside", c.name, w)
+			}
+		}
+		// routing reads the models' own windows, none of the pools'
+		if a := allowanceOf(q.Windows, time.Now()); len(a) != 5 {
+			t.Errorf("%s: allowance has %d limits, want the 5 models'", c.name, len(a))
+		}
+	}
+}
+
+// stacofman on X: one Antigravity account whose Gemini week is used up
+// (1% left) while its 5 hours are untouched. Google then gives each Gemini
+// model the week's reading, not the 5 hours', and each was made a pool of
+// its own: the card showed Gemini's week again for every model, five
+// "Gemini … 7d" rings at 1% beside Gemini's own. A model read as any of
+// its group's windows draws on the group.
+func TestAntigravityQuotaModelsReadAsGroupWeek(t *testing.T) {
+	t.Cleanup(AntigravityBuiltinForTest()) // the retired built-in route
+	at := func(d time.Duration) string { return time.Now().Add(d).UTC().Format(time.RFC3339) }
+	five, week := at(5*time.Hour), at(5*24*time.Hour)
+	gemini := `{"displayName":"Gemini Models","description":"Models within this group: Gemini Flash, Gemini Pro","buckets":[
+		{"bucketId":"gemini-weekly","window":"weekly","remainingFraction":0.01,"resetTime":"` + week + `"},
+		{"bucketId":"gemini-5h","window":"5h","remainingFraction":1,"resetTime":"` + five + `"}]}`
+	claude := `{"displayName":"Claude and GPT models","description":"Models within this group: Claude Opus, Claude Sonnet, GPT-OSS","buckets":[
+		{"bucketId":"3p-weekly","window":"weekly","resetTime":"` + week + `"},
+		{"bucketId":"3p-5h","window":"5h","resetTime":"` + five + `"}]}`
+	wk := `{"remainingFraction":0.01,"resetTime":"` + week + `"}`
+	f := &fakeGoogle{
+		load:    `{"allowedTiers":[{"id":"free-tier","name":"Antigravity","isDefault":true}]}`,
+		onboard: `{"done":true,"response":{"cloudaicompanionProject":"ag-proj"}}`,
+		models: `{"models":{
+			"gemini-3-flash":{"displayName":"Gemini 3 Flash","quotaInfo":` + wk + `},
+			"gemini-3.1-pro-high":{"displayName":"Gemini 3.1 Pro (High)","quotaInfo":` + wk + `},
+			"gemini-3.1-pro-low":{"displayName":"Gemini 3.1 Pro (Low)","quotaInfo":` + wk + `},
+			"gemini-3.5-flash":{"displayName":"Gemini 3.5 Flash","quotaInfo":` + wk + `},
+			"gemini-3.1-flash-lite":{"displayName":"Gemini 3.1 Flash Lite","quotaInfo":` + wk + `},
+			"claude-sonnet-4-6":{"displayName":"Claude Sonnet 4.6","quotaInfo":{"resetTime":"` + week + `"}},
+			"claude-opus-4-6-thinking":{"displayName":"Claude Opus 4.6 (Thinking)","quotaInfo":{"resetTime":"` + week + `"}}}}`,
+		summary: `{"groups":[` + gemini + `,` + claude + `]}`,
+	}
+	googleSandbox(t, f)
+	auth := googleAuth{AccessToken: "tok", RefreshToken: "rt-ag", Expiry: time.Now().Add(time.Hour).UnixMilli()}
+	if err := addGoogleLogin("antigravity", "ag@example.com", "", auth); err != nil {
+		t.Fatal(err)
+	}
+	q := googleLogins("antigravity")[0].acct.quota(context.Background(), "")
+	for _, w := range q.Windows {
+		if w.Model == "" {
+			continue
+		}
+		want := "Gemini"
+		if w.Family == "Claude" {
+			want = "Claude & GPT"
+		}
+		if w.Pool != want {
+			t.Errorf("%s: pool %q, want %q", w.Model, w.Pool, want)
+		}
+	}
+	var names []string
+	for _, w := range PooledWindows(q.Windows) {
+		names = append(names, w.Name)
+	}
+	if got, want := strings.Join(names, ","), "Gemini · 7 days,Gemini · 5 hours,Claude & GPT · 7 days,Claude & GPT · 5 hours"; got != want {
+		t.Errorf("pooled\n%s\nwant\n%s", got, want)
+	}
+	// routing still reads each model's own window, none of the pools'
+	if a := allowanceOf(q.Windows, time.Now()); len(a) != 7 {
+		t.Errorf("allowance has %d limits, want the 7 models'", len(a))
 	}
 }

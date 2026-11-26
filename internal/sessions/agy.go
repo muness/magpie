@@ -8,13 +8,15 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/tidwall/gjson"
+
 	"github.com/yetone/magpie/internal/dirent"
-	"github.com/yetone/magpie/internal/provider"
 )
 
 // Antigravity CLI's (agy's) conversations, on the Sessions page (RickyWei on
@@ -37,10 +39,14 @@ import (
 // SYSTEM steps (notices, the errors of a failed request) are agy's own.
 // What agy calls the conversation, and the folder it was started in, are
 // its row of conversation_summaries.db beside brain/: title (written by a
-// second, small model once the first reply is in, "" until then) and
-// workspace_uris, a JSON list of file:// URIs. The steps name no model, so
-// a conversation's tokens are counted under "agy", as its calls are left
-// with no model. `agy --conversation <id>` picks one up again, from any
+// second, small model once the first reply is in, "" until then),
+// preview (what the app lists the conversation as: the user's own words
+// until it has a title, the title after) and workspace_uris, a JSON list
+// of file:// URIs. The Antigravity app's language server is agy's, and
+// keeps the same database in its own data folder (antigravity_app.go). The steps name no model:
+// a conversation's tokens are counted under the model its database,
+// conversations/<id>.db, names for each step (agyStepModels), as its calls
+// are, and under "agy" when it names none. `agy --conversation <id>` picks one up again, from any
 // folder; started on magpie's gateway, it needs the variables and --model
 // the agent's row gives (AgyStart).
 
@@ -50,24 +56,31 @@ var AgyStart func() string
 
 // agySummary is what conversation_summaries.db says of a conversation.
 type agySummary struct {
-	Title, Cwd string
+	Title, Preview, Cwd string
 	// Last is last_modified_time: the time of a conversation that has
 	// no transcript to read it from
 	Last time.Time
 }
 
-// agySummaries is conversation_summaries.db's rows, read again only when
-// the database (or its write-ahead log) changed. A read that fails keeps
-// the rows read before.
+// agySummaries is each conversation_summaries.db's rows by its path (agy's
+// and the Antigravity app's), read again only when the database (or its
+// write-ahead log) changed. A read that fails keeps the rows read before.
 var agySummaries struct {
 	sync.Mutex
-	path string
+	read map[string]agySummaryRead
+}
+
+type agySummaryRead struct {
 	rev  string
 	rows map[string]agySummary
 }
 
 // agySummariesOf are the rows of the conversation_summaries.db in dir.
-func agySummariesOf(dir string) map[string]agySummary {
+func agySummariesOf(dir string) map[string]agySummary { return agySummariesOn(dir, runtime.GOOS) }
+
+// agySummariesOn is agySummariesOf with the folders the rows name read as
+// goos names them: "linux" for a WSL distro's, read from Windows.
+func agySummariesOn(dir, goos string) map[string]agySummary {
 	path := filepath.Join(dir, "conversation_summaries.db")
 	rev := ""
 	for _, p := range []string{path, path + "-wal"} {
@@ -79,33 +92,42 @@ func agySummariesOf(dir string) map[string]agySummary {
 	}
 	agySummaries.Lock()
 	defer agySummaries.Unlock()
-	if agySummaries.path == path && agySummaries.rev == rev {
-		return agySummaries.rows
+	was, seen := agySummaries.read[path]
+	if seen && was.rev == rev {
+		return was.rows
 	}
-	rows, ok := readAgySummaries(path)
+	rows, ok := readAgySummaries(path, goos)
 	if !ok {
-		if agySummaries.path == path {
-			return agySummaries.rows
-		}
-		return nil
+		return was.rows
 	}
-	agySummaries.path, agySummaries.rev, agySummaries.rows = path, rev, rows
+	if agySummaries.read == nil {
+		agySummaries.read = map[string]agySummaryRead{}
+	}
+	agySummaries.read[path] = agySummaryRead{rev, rows}
 	return rows
 }
 
 // readAgySummaries opens the database for the one read and closes it: it
 // is read again only when it changed.
-func readAgySummaries(path string) (map[string]agySummary, bool) {
-	db, err := provider.OpenReadOnly(path)
+func readAgySummaries(path, goos string) (map[string]agySummary, bool) {
+	db, done, err := openAppStore(path)
 	if err != nil {
 		return nil, false
 	}
-	defer db.Close()
-	return agyRows(db)
+	defer done()
+	return agyRowsOn(db, goos)
 }
 
-func agyRows(db *sql.DB) (map[string]agySummary, bool) {
-	rows, err := db.Query("SELECT conversation_id, title, workspace_uris, last_modified_time FROM conversation_summaries")
+// agyRows reads the rows; a database made before preview was a column is
+// read without it.
+func agyRows(db *sql.DB) (map[string]agySummary, bool) { return agyRowsOn(db, runtime.GOOS) }
+
+// agyRowsOn is agyRows with the folders read as goos names them.
+func agyRowsOn(db *sql.DB, goos string) (map[string]agySummary, bool) {
+	rows, err := db.Query("SELECT conversation_id, title, preview, workspace_uris, last_modified_time FROM conversation_summaries")
+	if err != nil {
+		rows, err = db.Query("SELECT conversation_id, title, '', workspace_uris, last_modified_time FROM conversation_summaries")
+	}
 	if err != nil {
 		return nil, false
 	}
@@ -113,16 +135,16 @@ func agyRows(db *sql.DB) (map[string]agySummary, bool) {
 	out := map[string]agySummary{}
 	for rows.Next() {
 		var id string
-		var t, ws sql.NullString
+		var t, p, ws sql.NullString
 		var last any
-		if rows.Scan(&id, &t, &ws, &last) != nil || id == "" {
+		if rows.Scan(&id, &t, &p, &ws, &last) != nil || id == "" {
 			continue
 		}
 		var uris []string
 		json.Unmarshal([]byte(ws.String), &uris)
-		s := agySummary{Title: t.String, Last: agyTime(last)}
+		s := agySummary{Title: t.String, Preview: p.String, Last: agyTime(last)}
 		for _, u := range uris {
-			if s.Cwd = agyFolder(u, runtime.GOOS); s.Cwd != "" {
+			if s.Cwd = agyFolder(u, goos); s.Cwd != "" {
 				break
 			}
 		}
@@ -198,18 +220,19 @@ func agyTranscripts(dir string) []file {
 // agyFiles are agy's conversations on this computer, each with its row of
 // conversation_summaries.db: rev is that row, so a title agy writes after
 // the transcript reads the conversation again, and only that one.
-func agyFiles() []file { return agyFilesIn(AgyDir()) }
+func agyFiles() []file { return agyFilesIn(AgyDir(), runtime.GOOS) }
 
-// agyFilesIn is agyFiles of the agy data folder dir. A conversation with a
+// agyFilesIn is agyFiles of the agy data folder dir, whose rows name
+// folders as goos does. A conversation with a
 // row and no transcript (#1718: agy keeps each one's
 // steps in conversations/<id>.db too, protobuf this doesn't read) is
 // listed from its row alone: its title, folder and time, and no tokens.
-func agyFilesIn(dir string) []file {
+func agyFilesIn(dir, goos string) []file {
 	if !Reads("agy") {
 		return nil
 	}
 	out := agyTranscripts(dir)
-	rows := agySummariesOf(dir)
+	rows := agySummariesOn(dir, goos)
 	if len(out) == 0 && len(rows) == 0 {
 		return nil
 	}
@@ -217,9 +240,20 @@ func agyFilesIn(dir string) []file {
 	for i := range out {
 		id := strings.TrimPrefix(out[i].key, "agy:")
 		has[id] = true
+		rev := ""
 		if r, ok := rows[id]; ok {
 			out[i].w().agy = &r
-			out[i].w().rev = agyRev(r)
+			rev = agyRev(r)
+		}
+		// the conversation's database names its steps' models, and may
+		// be written after the transcript
+		for _, p := range agyDBFiles(out[i].path) {
+			if fi, err := os.Stat(p); err == nil {
+				rev += "\x00" + strconv.FormatInt(fi.ModTime().UnixNano(), 10) + ":" + strconv.FormatInt(fi.Size(), 10)
+			}
+		}
+		if rev != "" {
+			out[i].w().rev = rev
 		}
 	}
 	for id, r := range rows {
@@ -237,7 +271,7 @@ func agyFilesIn(dir string) []file {
 }
 
 func agyRev(r agySummary) string {
-	return r.Title + "\x00" + r.Cwd + "\x00" + r.Last.UTC().Format(time.RFC3339Nano)
+	return r.Title + "\x00" + r.Preview + "\x00" + r.Cwd + "\x00" + r.Last.UTC().Format(time.RFC3339Nano)
 }
 
 // agyRowOnly says the file is a conversation's own database, listed from
@@ -273,19 +307,33 @@ type agyCarry struct {
 type agyCounted struct {
 	Date   string `json:"d"`
 	Tokens Tokens `json:"t"`
+	// Model is the model the step's tokens are counted under, "" for
+	// agyModel
+	Model string `json:"m,omitempty"`
 }
 
-// agyModel is the name a conversation's tokens are counted under: agy's
-// steps name no model.
+// agyModel is the name a step's tokens are counted under when its
+// conversation's database names no model for it.
 const agyModel = "agy"
+
+// agyModelOr is the name a step of model m is counted under.
+func agyModelOr(m string) string {
+	if m == "" {
+		return agyModel
+	}
+	return m
+}
 
 // parseAgy reads a transcript, on from where the read before left off when
 // the file has only grown (agy appends a step at a time).
 func parseAgy(f file, old *state) *state {
 	if agyRowOnly(f.path) {
-		s := &state{Size: f.size, Mod: f.mod.UnixNano(), DBRevision: f.m().rev}
+		s := &state{Size: f.size, Mod: f.mod.UnixNano(), StateMore: moreOf(StateMore{DBRevision: f.m().rev})}
 		if f.m().agy != nil {
-			s.Named, s.Cwd = title(f.m().agy.Title), f.m().agy.Cwd
+			s.own().Named, s.Cwd = title(f.m().agy.Title), f.m().agy.Cwd
+			// no transcript to read the prompt from: what the row lists
+			// it as until it has a title
+			s.Title = title(f.m().agy.Preview)
 			if !f.m().agy.Last.IsZero() {
 				s.saw(f.m().agy.Last, true)
 			}
@@ -295,8 +343,8 @@ func parseAgy(f file, old *state) *state {
 	var s *state
 	c := agyCarry{Last: -1}
 	var off int64
-	if old != nil && old.Agy != nil && old.Agy.Tail.holds(f.path) {
-		s, c, off = old.clone(), *old.Agy, old.Agy.Tail.Off
+	if old != nil && old.more().Agy != nil && old.more().Agy.Tail.holds(f.path) {
+		s, c, off = old.clone(), *old.more().Agy, old.more().Agy.Tail.Off
 		steps := make(map[int]agyCounted, len(c.Steps))
 		for k, v := range c.Steps {
 			steps[k] = v
@@ -305,25 +353,45 @@ func parseAgy(f file, old *state) *state {
 	} else {
 		s = &state{}
 	}
+	// the database is read once a read has a model's step to count
+	var models map[int]string
+	read := false
+	model := func(step int) string {
+		if !read {
+			models, read = agyStepModels(agyConversationDB(f.path)), true
+		}
+		return models[step]
+	}
 	end, err := scanAt(f.path, off, nil, func(b []byte, _, _ int64) bool {
-		agyCount(s, &c, b)
+		agyCount(s, &c, b, model)
 		return true
 	})
+	// a model the database names after its step was counted (or a read
+	// before this one counted under agyModel) moves the step's tokens
+	for i, was := range c.Steps {
+		if m := model(i); m != "" && m != was.Model {
+			s.dropUse(was.Date, agyModelOr(was.Model), was.Tokens)
+			s.use(was.Date, m, was.Tokens)
+			was.Model = m
+			c.Steps[i] = was
+		}
+	}
 	c.Tail = nil
 	if err == nil {
 		c.Tail = markTail(f.path, end, 0, end)
 	}
-	s.Size, s.Mod, s.DBRevision = f.size, f.mod.UnixNano(), f.m().rev
-	s.Named, s.Cwd = "", ""
+	s.Size, s.Mod, s.own().DBRevision = f.size, f.mod.UnixNano(), f.m().rev
+	s.own().Named, s.Cwd = "", ""
 	if f.m().agy != nil {
-		s.Named, s.Cwd = title(f.m().agy.Title), f.m().agy.Cwd
+		s.own().Named, s.Cwd = title(f.m().agy.Title), f.m().agy.Cwd
 	}
-	s.Agy = &c
+	s.own().Agy = &c
 	return s
 }
 
-// agyCount counts one step of a transcript.
-func agyCount(s *state, c *agyCarry, b []byte) {
+// agyCount counts one step of a transcript, under the model model names
+// for its index.
+func agyCount(s *state, c *agyCarry, b []byte, model func(int) string) {
 	var l agyLine
 	if json.Unmarshal(b, &l) != nil || l.Step == nil {
 		return
@@ -339,14 +407,15 @@ func agyCount(s *state, c *agyCarry, b []byte) {
 			t.CacheRead = *l.CacheRead
 		}
 		if was, ok := c.Steps[i]; ok {
-			s.dropUse(was.Date, agyModel, was.Tokens)
+			s.dropUse(was.Date, agyModelOr(was.Model), was.Tokens)
 		}
 		if !t.zero() {
 			if c.Steps == nil {
 				c.Steps = map[int]agyCounted{}
 			}
-			c.Steps[i] = agyCounted{dateOf(at), t}
-			s.use(dateOf(at), agyModel, t)
+			m := model(i)
+			c.Steps[i] = agyCounted{dateOf(at), t, m}
+			s.use(dateOf(at), agyModelOr(m), t)
 		} else {
 			delete(c.Steps, i)
 		}
@@ -362,14 +431,79 @@ func agyCount(s *state, c *agyCarry, b []byte) {
 		if s.Title == "" {
 			s.Title = title(agyRequest(l.Content))
 		}
-	case l.Source == "MODEL" && l.Type == "PLANNER_RESPONSE":
-		for _, tc := range l.ToolCalls {
-			s.tool(at, tc.Name, "")
+		for _, k := range agyAskedSkills(l.Content) {
+			s.tool(at, "", k)
 		}
+	case l.Source == "MODEL" && l.Type == "PLANNER_RESPONSE":
+		agyTools(s, at, l)
 		if len(l.ToolCalls) == 0 && l.Content != "" {
 			s.day(dateOf(at)).Replies++
 		}
 	}
+}
+
+// agyTools counts a model step's tool calls: each tool, and each skill a
+// call calls up by reading its SKILL.md. agy (1.5.13, and the app's
+// language server) has no tool for skills: its system prompt lists each
+// skill's SKILL.md by its path and tells the model to read it, which it
+// does with read_file ({"Path":…}) or run_command ({"CommandLine":…}). A
+// skill is named by its SKILL.md's folder, as Codex's and Grok Build's
+// are (skillReadsIn); a write_file or edit_file of a SKILL.md calls none
+// up.
+func agyTools(s *state, at time.Time, l agyLine) {
+	for _, tc := range l.ToolCalls {
+		s.tool(at, tc.Name, "")
+		var text string
+		switch tc.Name {
+		case "read_file":
+			text = gjson.GetBytes(tc.Args, "Path").String()
+		case "run_command":
+			text = gjson.GetBytes(tc.Args, "CommandLine").String()
+		}
+		if strings.Contains(text, "SKILL.md") {
+			for _, k := range skillReadsIn(text) {
+				s.tool(at, "", k)
+			}
+		}
+	}
+}
+
+// agySkillCalls are the notes agy adds after a prompt for a skill it puts
+// in the prompt whole, each "<SKILL>" then the skill's name in brackets:
+// typed as /<name> at the start of the prompt (in print mode and the
+// TUI alike), or mentioned. A third note, "The user requested you read
+// and use the "<name>" skill", gives the path only; the model's read of
+// it is what counts then, so it isn't counted twice.
+var agySkillCalls = []string{
+	"<SKILL>The user has explicitly invoked the (",
+	"<SKILL>The user mentioned the (",
+}
+
+// agyAskedSkills are the skills a prompt calls up by itself: those agy
+// added a note for after what the user typed (agySkillCalls), once each.
+// The user's own words, in <USER_REQUEST>, can't call one up.
+func agyAskedSkills(content string) []string {
+	if _, after, ok := strings.Cut(content, "</USER_REQUEST>"); ok {
+		content = after
+	}
+	if !strings.Contains(content, "<SKILL>") {
+		return nil
+	}
+	var out []string
+	for _, note := range agySkillCalls {
+		for rest := content; ; {
+			_, after, ok := strings.Cut(rest, note)
+			if !ok {
+				break
+			}
+			name, tail, ok := strings.Cut(after, ") skill.")
+			rest = tail
+			if name = strings.TrimSpace(name); ok && name != "" && !strings.Contains(name, "\n") && !slices.Contains(out, name) {
+				out = append(out, name)
+			}
+		}
+	}
+	return out
 }
 
 // agyRequest is what the user typed, out of the <USER_REQUEST> agy wraps
@@ -465,6 +599,6 @@ func agyParts(l agyLine) []Part {
 // forgetAgySummaries forgets the rows read of conversation_summaries.db.
 func forgetAgySummaries() {
 	agySummaries.Lock()
-	agySummaries.path, agySummaries.rev, agySummaries.rows = "", "", nil
+	agySummaries.read = nil
 	agySummaries.Unlock()
 }

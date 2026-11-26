@@ -4,7 +4,8 @@
 // a FetchSession whose fetch is the real one's, the request, connection
 // and TLS untouched, and copies the reply of each of the main turn's
 // requests (x-claude-code-request-class: main), as it streams, to the
-// file MAGPIE_CLAUDE_TAP names: a JSON line an event. Claude Code reads
+// file MAGPIE_CLAUDE_TAP names: a JSON line an event, and the reply's
+// anthropic-ratelimit-unified-* headers as it opens. Claude Code reads
 // its own copy of the stream as before.
 //
 // MAGPIE_CLAUDE_GUARD names a file of the bridge's holding the
@@ -15,6 +16,13 @@
 // Claude Code would have put them there had the variable said so, and
 // the variable is set to it for the requests after. The file says it was
 // seen (<file>.live) at the first request it could be put in.
+//
+// The file's effort, beside the extra body, is the level the run was told
+// since it started (#5584): each main request asks it in
+// output_config.effort, in place of the --effort Claude Code started
+// with. The interactive mode takes another level only from a person
+// typing /effort, which saves it as the user's default for new sessions;
+// a --settings file is read once, as Claude Code starts.
 (() => {
   const file = process.env.MAGPIE_CLAUDE_TAP;
   const guard = process.env.MAGPIE_CLAUDE_GUARD;
@@ -52,37 +60,65 @@
   }
   let streams = 0;
   let live = false;
-  // body is a request's body with the guard file's safeguards: the same
-  // bytes when they are what it has, or when it has none to replace (a
-  // request Claude Code builds without the extra body)
-  const guarded = (body) => {
-    if (!guard || typeof body !== "string" || body.indexOf('"safeguards"') < 0) return body;
-    let extra, now;
+  // StartValueMax (tap.go)
+  const envValueMax = 16384;
+  // body is a request's body with the guard file's safeguards and effort:
+  // the same bytes when they are what it has, or when it has none to
+  // replace (a request Claude Code builds without the extra body). The
+  // effort goes in the main turn's requests (main) alone, never in what
+  // Claude Code asks beside them (titles, summaries, its classifiers).
+  const guarded = (body, main) => {
+    if (!guard || typeof body !== "string") return body;
+    const carries = body.indexOf('"safeguards"') >= 0;
+    if (!carries && !main) return body;
+    let text, now;
     try {
-      extra = fs.readFileSync(guard, "utf8");
-      now = JSON.parse(extra);
+      text = fs.readFileSync(guard, "utf8");
+      now = JSON.parse(text);
     } catch {
       return body;
     }
-    if (!now || typeof now !== "object" || !("safeguards" in now)) return body;
+    if (!now || typeof now !== "object") return body;
+    // the file is the extra body Claude Code is to send, and the effort
+    // beside it, which is no field of a request
+    const { effort, ...extra } = now;
+    const level = main && typeof effort === "string" ? effort : "";
+    const safeguards = carries && "safeguards" in extra;
+    if (!safeguards && !main) return body;
     let req;
     try {
       req = JSON.parse(body);
     } catch {
       return body;
     }
-    if (!req || typeof req !== "object" || !("safeguards" in req)) return body;
+    if (!req || typeof req !== "object") return body;
+    if (safeguards && !("safeguards" in req)) return body;
     if (!live) {
       live = true;
       try {
         fs.writeFileSync(guard + ".live", "");
       } catch {}
     }
-    if (process.env.CLAUDE_CODE_EXTRA_BODY !== extra) process.env.CLAUDE_CODE_EXTRA_BODY = extra;
-    if (JSON.stringify(req.safeguards) === JSON.stringify(now.safeguards)) return body;
-    req.safeguards = now.safeguards;
-    put({ guard: "set" });
-    return JSON.stringify(req);
+    let changed = false;
+    if (safeguards) {
+      // the variable is set to a file that fits what a program is
+      // started with (envValueMax): whatever Claude Code runs inherits
+      // it, and Linux refuses to start one with a variable over 128KiB
+      // (#6848). A larger file's safeguards are put in each request
+      // here, over the variable's stand-in
+      const env = effort === undefined ? text : JSON.stringify(extra);
+      if (env.length <= envValueMax && process.env.CLAUDE_CODE_EXTRA_BODY !== env) process.env.CLAUDE_CODE_EXTRA_BODY = env;
+      if (JSON.stringify(req.safeguards) !== JSON.stringify(extra.safeguards)) {
+        req.safeguards = extra.safeguards;
+        changed = true;
+        put({ guard: "set" });
+      }
+    }
+    if (level && !(req.output_config && req.output_config.effort === level)) {
+      req.output_config = { ...(req.output_config || {}), effort: level };
+      changed = true;
+    }
+    return changed ? JSON.stringify(req) : body;
   };
   // read tells each event of stream s, then its end: cut when it broke
   // off, as a dropped connection or Claude Code's own Esc ends it
@@ -124,7 +160,8 @@
       try {
         const url = String((input && input.url) || input);
         if (init && /\/v1\/messages(\?|$)/.test(url)) {
-          const body = guarded(init.body);
+          const headers = new Headers(init.headers || (input && input.headers) || undefined);
+          const body = guarded(init.body, headers.get("x-claude-code-request-class") === "main");
           if (body !== init.body) init = { ...init, body };
         }
       } catch {}
@@ -143,7 +180,13 @@
           // told before Claude Code has the reply, so the helper knows a
           // stream is coming before any of its messages
           const s = ++streams;
-          put({ s, open: true });
+          // with the account's allowance as Anthropic tells it on the
+          // reply, which -p tells in its rate_limit_event
+          const h = {};
+          res.headers.forEach((v, k) => {
+            if (/^anthropic-ratelimit-unified-/i.test(k)) h[k.toLowerCase()] = v;
+          });
+          put(Object.keys(h).length ? { s, open: true, h } : { s, open: true });
           read(s, mine);
         }
       } catch {}

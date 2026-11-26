@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -215,13 +216,20 @@ func listPlugins(ctx context.Context, asJSON bool) error {
 		fmt.Println("No plugins. Add one: magpie plugin add <npm package | git repo | path>")
 		return nil
 	}
-	loaded, lerr := plugin.Plugins(ctx)
+	var loaded []plugin.Loaded
+	var ps []plugin.Provider
+	var lerr, perr error
+	if slices.ContainsFunc(l.Plugins, func(e plugin.Entry) bool {
+		return !e.Off && !plugin.InMagpieOnly(plugin.Target(e.Spec))
+	}) {
+		loaded, lerr = plugin.Plugins(ctx)
+		ps, perr = plugin.Providers(ctx)
+	}
 	errs := map[string]string{}
 	for _, p := range loaded {
 		errs[p.Spec] = p.Error
 	}
 	clashes := plugin.Clashes(loaded)
-	ps, perr := plugin.Providers(ctx)
 	mws := middleware.States()
 	var pts []plugin.PluginTools
 	for _, p := range loaded {
@@ -279,6 +287,9 @@ func listPlugins(ctx context.Context, asJSON bool) error {
 			if len(w.Panels) > 0 {
 				fmt.Printf("  %s  %s\n", muted.Render("panels"), panelsLine(w))
 			}
+		}
+		if p, _ := plugin.PrivacyModels(plugin.Target(e.Spec)); p != nil {
+			fmt.Println("  " + muted.Render("local privacy models"))
 		}
 		for _, p := range ps {
 			if p.Spec != e.Spec {
@@ -509,6 +520,9 @@ type declaredSwitch struct {
 // from the plugin host when none were listed for it yet (a plugin just
 // added from the command line). A host that can't be asked is none known.
 func declaredSwitches(ctx context.Context, spec string, ask bool) []declaredSwitch {
+	if plugin.InMagpieOnly(plugin.Target(spec)) {
+		return nil
+	}
 	of := func(ps []plugin.Provider) (out []declaredSwitch, listed bool) {
 		for _, p := range ps {
 			if p.Spec != spec {
@@ -604,7 +618,8 @@ func pluginLogin(ctx context.Context, name, method string) error {
 		// window's sign-in installs it (#2223: Grok Build in Docker)
 		if name := pluginSignInCLI.missing(pp.ID); name != "" {
 			fmt.Println(amber.Render("!"), name, "isn't installed here: "+pp.Name+" signs in through it. Installing it, as its vendor's installer does…")
-			if err := pluginSignInCLI.install(ctx, pp.ID); err != nil {
+			// through the proxy the sign-in and the provider's requests take
+			if err := pluginSignInCLI.install(provider.Via(ctx, provider.PluginID(pp.ID)), pp.ID); err != nil {
 				return err
 			}
 			fmt.Println(green.Render("✓"), name, "installed")
@@ -640,7 +655,7 @@ func pluginLogin(ctx context.Context, name, method string) error {
 	var saved plugin.Saved
 	if pp.Methods[m].Type == "api" {
 		key := ""
-		if !pp.Methods[m].Keyless {
+		if !pp.Methods[m].NoKey() {
 			var err error
 			key, err = secret("key", keyPrompt(pp.Name, pp.Methods[m]), false)
 			if err != nil {
@@ -658,7 +673,7 @@ func pluginLogin(ctx context.Context, name, method string) error {
 		if a.URL != "" {
 			// the user may keep sign-in pages to a browser of their own; a
 			// page the plugin's CLI opened itself is open either way
-			linkOnly := settings.Load().SignInLinkOnly && !a.Opened
+			linkOnly := settings.Shared().SignInLinkOnly && !a.Opened
 			if linkOnly {
 				fmt.Println("Open this link in the browser you sign in with:")
 			} else {

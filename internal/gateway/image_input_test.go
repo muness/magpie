@@ -57,7 +57,7 @@ func TestKnownTextOnlyModelRejectsImagesBeforeUpstream(t *testing.T) {
 		}
 		// it says why magpie takes it for text-only, and where that is
 		// changed (KimYx0207 on X)
-		if b := rec.Body.String(); !strings.Contains(b, "Probe's model list marks it as not taking images") || !strings.Contains(b, "Providers → Probe → Names, prices & levels") {
+		if b := rec.Body.String(); !strings.Contains(b, "Probe's model list marks it as not taking images") || !strings.Contains(b, "Providers → Probe → Model settings") {
 			t.Errorf("%s: doesn't say why or where: %s", tc.path, b)
 		}
 	}
@@ -482,8 +482,19 @@ func TestGeminiNonImageFileTranslation(t *testing.T) {
 			}
 			responses := buildResponses(r, "text", "", false)
 			anthropic := buildAnthropic(r, "text")
+			// inline data rides whole in both tongues (#5452); a file
+			// only referenced (a fileUri on the vendor's storage) is told
+			// of, Responses' file_id and Anthropic's url source being
+			// someone else's
+			rides := tc.field == "inlineData"
 			for protocol, out := range map[string][]byte{"Responses": responses, "Anthropic": anthropic} {
-				if strings.Contains(string(out), `"image_url"`) || strings.Contains(string(out), `"type":"image"`) || !strings.Contains(string(out), "[attachment "+tc.mime) {
+				if strings.Contains(string(out), `"image_url"`) || strings.Contains(string(out), `"type":"image"`) {
+					t.Errorf("%s mislabeled file as image: %s", protocol, out)
+				}
+				if rides && !strings.Contains(string(out), tc.mime) {
+					t.Errorf("%s lost the file: %s", protocol, out)
+				}
+				if !rides && !strings.Contains(string(out), "[attachment "+tc.mime) {
 					t.Errorf("%s lost or mislabeled file: %s", protocol, out)
 				}
 			}
@@ -521,7 +532,7 @@ func TestTextOnlyRefusalSaysWhyAndWhere(t *testing.T) {
 	s := New()
 	body := `{"model":"MODEL","messages":[{"role":"user","content":[{"type":"text","text":"read"},{"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}}]}]}`
 	for model, want := range map[string]string{
-		"probe/sol":   "Accepts images is turned off for it in magpie, in Providers → Probe → Names, prices & levels",
+		"probe/sol":   "Accepts images is turned off for it in magpie, in Providers → Probe → Model settings",
 		"group/words": "no model in the group Words is marked as taking images",
 	} {
 		rec := httptest.NewRecorder()

@@ -19,6 +19,7 @@ import (
 
 	"github.com/yetone/magpie/internal/backup"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/sigv4"
 )
 
 // fakeS3 is an S3 server with one bucket and one access key, keeping
@@ -36,6 +37,8 @@ type fakeS3 struct {
 	log                []string // each request: method, and the condition sent
 	onWrite            func()   // runs once, at the next PUT or HEAD (a write's look first), before it is answered
 	sent               int      // the bytes of objects read
+	put                int      // the bytes of objects written
+	lists, deletes     int      // the LISTs and DELETEs answered
 	// reread, when set, is how the server reads a header back before it
 	// checks the signature over it
 	reread func(name, value string) string
@@ -79,6 +82,10 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
+		if key == "" && r.URL.Query().Get("list-type") == "2" {
+			f.list(w, r.URL.Query().Get("prefix"))
+			return
+		}
 		b, ok := f.objects[key]
 		if !ok {
 			if r.Method == http.MethodHead {
@@ -109,11 +116,49 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.fail(w, http.StatusPreconditionFailed, "PreconditionFailed")
 			return
 		}
+		f.put += len(body)
 		f.store(key, body)
 		w.Header().Set("ETag", f.etags[key])
+	case http.MethodDelete:
+		f.deletes++
+		delete(f.objects, key)
+		delete(f.etags, key)
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		f.fail(w, http.StatusNotImplemented, "NotImplemented")
 	}
+}
+
+// list answers a ListObjectsV2 of prefix, in one page.
+func (f *fakeS3) list(w http.ResponseWriter, prefix string) {
+	f.lists++
+	var keys []string
+	for k := range f.objects {
+		if strings.HasPrefix(k, prefix) {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><IsTruncated>false</IsTruncated>`)
+	for _, k := range keys {
+		fmt.Fprintf(&b, `<Contents><Key>%s</Key><ETag>%s</ETag><Size>%d</Size></Contents>`, k, f.etags[k], len(f.objects[k]))
+	}
+	b.WriteString(`</ListBucketResult>`)
+	w.Header().Set("Content-Type", "application/xml")
+	w.Write([]byte(b.String()))
+}
+
+// stored is the bytes the bucket holds under prefix.
+func (f *fakeS3) stored(prefix string) (n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k, b := range f.objects {
+		if strings.HasPrefix(k, prefix) {
+			n += len(b)
+		}
+	}
+	return n
 }
 
 func (f *fakeS3) store(key string, b []byte) {
@@ -144,7 +189,7 @@ func (f *fakeS3) signed(r *http.Request, body []byte) bool {
 	}
 	// the path as S3 has it: decoded, then encoded again as SigV4 says —
 	// a + sent bare is signed as %2B
-	u.RawPath = awsEscape(u.Path, true)
+	u.RawPath = sigv4.Escape(u.Path, true)
 	again := &http.Request{Method: r.Method, URL: u, Host: r.Host, Header: http.Header{}}
 	for _, n := range strings.Split(names, ";") {
 		if n != "host" {
@@ -157,7 +202,7 @@ func (f *fakeS3) signed(r *http.Request, body []byte) bool {
 			again.Header[http.CanonicalHeaderKey(n)] = vs
 		}
 	}
-	signer{id: f.id, secret: f.secret, region: f.region, service: "s3"}.sign(again, sum(body), at)
+	sigv4.Signer{ID: f.id, Secret: f.secret, Region: f.region, Service: "s3"}.Sign(again, sum(body), at)
 	return again.Header.Get("Authorization") == auth
 }
 
@@ -290,8 +335,8 @@ func TestS3Address(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := s.objectURL().String(); got != c.url || s.sig.region != c.region {
-			t.Errorf("%+v: %s in %s, want %s in %s", c.cfg, got, s.sig.region, c.url, c.region)
+		if got := s.objectURL().String(); got != c.url || s.sig.Region != c.region {
+			t.Errorf("%+v: %s in %s, want %s in %s", c.cfg, got, s.sig.Region, c.url, c.region)
 		}
 	}
 	for _, bad := range []Config{{URL: "s3://"}, {URL: "s3:///prefix"}, {URL: "s3://bkt", Endpoint: "ftp://x"}, {URL: "s3://bkt", Endpoint: "https://x?y=z"}} {

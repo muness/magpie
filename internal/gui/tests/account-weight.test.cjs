@@ -7,6 +7,9 @@
 // provider/accountweight. Hidden under the other routings. Each line stays
 // one line, with nothing past the sheet's edge, at the window's narrowest
 // and in a phone's browser, in every language, without the page scrolling.
+// The account Claude Code is signed in to says Signed in rather than First
+// while By weight, since the weights, not the order, share the
+// conversations out (Wing8Aqua on X).
 // MAGPIE_ACC_ASSETS runs it on older assets.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
@@ -84,16 +87,28 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 
       // Smart: no weights shown
       assert.equal(await chip("max@example.com").isVisible(), false, `${at}: a weight under Smart`);
+      // Routing is under Advanced
+      { const adv = page.locator(".editor details.advanced"); await adv.waitFor({ state: "attached" }); if (!(await adv.evaluate((d) => d.open))) await adv.locator(":scope > summary").click(); }
       const by = page.locator(".editor").getByRole("button", { name: await say(page, lang, "By weight"), exact: true });
       await by.scrollIntoViewIfNeeded();
-      const sc = await scrolled();
+      // the weights it shows sit above it, in the accounts, so the editor
+      // holds it where it was clicked rather than keep its scroll
+      const top = () => by.evaluate((b) => Math.round(b.getBoundingClientRect().top));
+      const was = await top();
       await by.click();
-      assert.equal(await scrolled(), sc, `${at}: a click scrolled`);
+      await chip("max@example.com").waitFor();
+      assert(Math.abs((await top()) - was) <= 1, `${at}: By weight moved from ${was} to ${await top()}`);
       // the routing's hint names accounts too
       await page.locator(".editor .hint", { hasText: (await say(page, lang, "Requests spread over the keys or accounts by the weight set beside each: one weighing 3 takes three requests for every one weighing 1 takes, evenly over a few requests. One that fails is passed over while it rests, and the others share its requests; a conversation stays with it as Stays says.")).slice(0, 20) }).first().waitFor();
       assert.equal((await chip("max@example.com").textContent()).trim(), await say(page, lang, "Weight {n} · {share}%", { n: 3, share: 75 }), at);
       assert.equal((await chip("pro@example.com").textContent()).trim(), await say(page, lang, "Weight {n} · {share}%", { n: 1, share: 25 }), at);
       assert.equal(await chip("off@example.com").count(), 0, `${at}: an account not in use has no share`);
+      // the one Claude Code is signed in to isn't called First, which read
+      // as the account used most (Wing8Aqua on X): By weight shares the
+      // conversations out, not the order
+      const using = page.locator('.editor .acc[data-account-id="max@example.com"] .acc-line > .using');
+      assert.equal((await using.textContent()).trim(), await say(page, lang, "Signed in"), `${at}: By weight still says First`);
+      assert.equal(await using.getAttribute("title"), await say(page, lang, "By weight, each new conversation goes to an account by its weight and stays there"), at);
 
       // each line one line, nothing past its row
       const fit = await page.evaluate(() => [...document.querySelectorAll(".editor .accts .acc[data-account-id]")].map((r) => {
@@ -131,8 +146,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal((await page.locator("#status").textContent()).trim(), note, at);
 
       // back to Smart hides them
-      await page.locator(".editor").getByRole("button", { name: await say(page, lang, "Smart"), exact: true }).first().click();
+      await page.locator(".editor").getByRole("button", { name: await say(page, lang, "Quota first"), exact: true }).first().click();
       assert.equal(await chip("max@example.com").isVisible(), false, `${at}: a weight under Smart`);
+      assert.equal((await using.textContent()).trim(), await say(page, lang, "First"), `${at}: First under Smart`);
+      // open, the editor scrolls and the dialog around it doesn't: the lines
+      // its check-in and warm-up rows keep out of sight were held against
+      // the dialog and grew it a second scrollbar, every row 8px narrower
+      const dialog = await page.evaluate(() => { const d = document.querySelector(".dialog"); return [d.scrollHeight, d.clientHeight]; });
+      assert.ok(dialog[0] <= dialog[1] + 1, `${at}: the dialog scrolls beside the editor (${dialog})`);
       assert.deepEqual(errors, [], at);
       await context.close();
     }

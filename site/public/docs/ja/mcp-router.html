@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MCP ルーター · magpie ドキュメント</title>
+<title>MCP ルーター：1 つのアドレスで MCP サーバーを全エージェントに · magpie ドキュメント</title>
 <meta name="description" content="magpie の MCP ルーターの役割：ライブラリのサーバーの代わりにエージェントごとに magpie という MCP サーバーを一つ渡し、コマンドのサーバーは一度だけ動かし、ほかのアプリには一つのアドレスを。">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#fafafa">
@@ -39,6 +39,54 @@
 <meta property="og:image" content="https://usemagpie.ai/img/og.png">
 <meta property="og:url" content="https://usemagpie.ai/docs/ja/mcp-router">
 <meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+ "@context": "https://schema.org",
+ "@graph": [
+  {
+   "@type": "TechArticle",
+   "headline": "MCP ルーター",
+   "description": "magpie の MCP ルーターの役割：ライブラリのサーバーの代わりにエージェントごとに magpie という MCP サーバーを一つ渡し、コマンドのサーバーは一度だけ動かし、ほかのアプリには一つのアドレスを。",
+   "inLanguage": "ja",
+   "url": "https://usemagpie.ai/docs/ja/mcp-router",
+   "about": {
+    "@type": "SoftwareApplication",
+    "name": "magpie",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "macOS, Windows, Linux"
+   },
+   "publisher": {
+    "@type": "Organization",
+    "name": "magpie",
+    "url": "https://usemagpie.ai/"
+   }
+  },
+  {
+   "@type": "BreadcrumbList",
+   "itemListElement": [
+    {
+     "@type": "ListItem",
+     "position": 1,
+     "name": "magpie",
+     "item": "https://usemagpie.ai/ja/"
+    },
+    {
+     "@type": "ListItem",
+     "position": 2,
+     "name": "ドキュメント",
+     "item": "https://usemagpie.ai/docs/ja/start"
+    },
+    {
+     "@type": "ListItem",
+     "position": 3,
+     "name": "MCP ルーター",
+     "item": "https://usemagpie.ai/docs/ja/mcp-router"
+    }
+   ]
+  }
+ ]
+}
+</script>
 </head>
 <body>
 
@@ -55,6 +103,13 @@
     <a class="toc-only" href="/docs/ja/masking">プライバシーマスキング</a>
     <a class="toc-only" href="/docs/ja/mcp-router">MCP ルーター</a>
     <a class="toc-only" href="/docs/ja/library">ライブラリ</a>
+    <a class="toc-only" href="/docs/ja/claude-code-models">Claude Code で他のモデル</a>
+    <a class="toc-only" href="/docs/ja/codex-models">Codex で他のモデル</a>
+    <a class="toc-only" href="/docs/ja/gemini-cli-models">Gemini CLI で他のモデル</a>
+    <a class="toc-only" href="/docs/ja/subscriptions">サブスクを任意のエージェントで</a>
+    <a class="toc-only" href="/docs/ja/local-models">ローカルモデル</a>
+    <a class="toc-only" href="/docs/ja/opencode-models">OpenCode で他のモデル</a>
+    <a class="toc-only" href="/docs/ja/alternatives">CC Switch・CCR との比較</a>
     <a href="/docs/ja/import">magpie に追加</a>
     <a href="/docs/integrate">アプリ連携</a>
     <a href="https://github.com/yetone/magpie-releases/releases">リリース</a>
@@ -79,6 +134,7 @@
     <a href="#overview">概要</a>
     <a href="#on">オンにする</a>
     <a href="#apps">ほかのアプリ</a>
+    <a href="#away">別のコンピュータから</a>
     <a href="#kept">自分のエントリを残すエージェント</a>
     <a href="#when">使いどころ</a>
   </aside>
@@ -90,7 +146,7 @@
     <ul>
       <li><b>設定は一度。</b>ライブラリで一度書いたサーバーが、一つのエントリですべてのエージェントとアプリに届きます。</li>
       <li><b>動かすのも一度。</b>コマンドのサーバー（<code>npx …</code> のようにプログラムとして起動するもの）は、エージェントごとではなく magpie の中で一つだけ動きます。10 分間呼び出しのないサーバーは止まり、次の呼び出しでまた起動します。</li>
-      <li><b>ほかのアプリには一つのアドレス。</b>Cursor、VS Code、Windsurf、別のコンピュータのアプリも magpie に接続すれば、ライブラリのすべてのサーバーを使えます。</li>
+      <li><b>ほかのアプリには一つのアドレス。</b>Cursor、VS Code、Windsurf、別のコンピュータのアプリも magpie に接続すれば、ライブラリのサーバーを使えます（別のコンピュータのアプリには<a href="#away">その一部</a>）。</li>
     </ul>
     <p>ツールはエージェントに <code>サーバー__ツール</code> として見えます。提供するのはツールだけ（resources と prompts はなし）で、ライブラリでオフにしたツールは一覧にも出ず、実行もされません。</p>
 
@@ -109,9 +165,30 @@ magpie library mcp router off</pre>
     </div>
     <p><code>magpie library</code> で、ルーターを渡されたエージェントと個別のエントリを残すエージェントが、理由とともに一覧できます。</p>
 
+    <h2 id="on-demand"><a class="anchor" href="#on-demand">ツールをオンデマンドで渡す</a></h2>
+    <p>エージェントに渡したツールは、パラメーターのスキーマ全体とともに毎回のリクエストで送られます。そのため、ルーター経由で 10 個を超えるツールを渡されるエージェントには、代わりに 2 つのツールを渡します。これは<b>既定でオン</b>です：</p>
+    <ul>
+      <li><b><code>find_tools</code></b>：タスクに必要な語で一致するツールを探します。上位 5 個は説明とパラメーター付きで、続けて最大 15 個を名前で返します。説明には各サーバーとそのツールが書かれているので、モデルは何が探せるかを知っています。</li>
+      <li><b><code>call_tool</code></b>：ツールを名前で、引数とともに実行します。</li>
+    </ul>
+    <p>MCP ツールを自分で検索するエージェントにはすべてのツールを渡し、そのエージェント自身の検索が毎回のリクエストからツールを外します：Claude Code、Claude Desktop、Codex、Pi、Droid、omp。ツールが 10 個以下のエージェントと、<a href="#apps">ほかのアプリ</a> のアドレスに接続するアプリ（どのアプリかは magpie にはわかりません）にもすべてのツールを渡します。ツールを自分で検索しないアプリは、アドレスに <code>?tools=on-demand</code> を付けるとオンデマンドで受け取れます。例：<code>http://127.0.0.1:3425/mcp/magpie/hub?tools=on-demand</code>。</p>
+    <p>すべてのエージェントにすべてのツールを渡すには、<span class="ui">ライブラリ</span> → <span class="ui">MCP</span> の <span class="ui">MCP ルーター</span> の下にある <span class="ui">ツールをオンデマンドで渡す</span> をオフにして、エージェントを再起動してください。</p>
+
     <h2 id="apps"><a class="anchor" href="#apps">ほかのアプリ</a></h2>
-    <p>ルーターがオンのとき、<span class="ui">ほかのアプリ</span> の行に <code>/mcp/magpie/hub</code> で終わるアドレスが出ます。ここではライブラリのすべてのサーバーを提供します。<span class="ui">接続…</span> を押すと、Cursor、VS Code、Windsurf、JSON の MCP 設定を受け付けるアプリ向けのエントリがコピーできるシートが開きます。アプリのウィンドウでは、Cursor と VS Code には <span class="ui">追加</span> もあり、そのアプリが開いて確認を求めます。別のコンピュータのアプリには、ネットワークからのほかのリクエストと同じくゲートウェイのキーが必要です（<a href="/docs/ja/remote">リモート magpie</a> を参照）。</p>
-    <div class="callout"><b>コマンドのサーバーはこのコンピュータで動きます。</b>ネットワーク上でゲートウェイのキーを持つ人は、ルーターを通してあなたの権限でそれを呼び出せます。キーは信頼できる人にだけ渡してください。</div>
+    <p>ルーターがオンのとき、<span class="ui">ほかのアプリ</span> の行に <code>/mcp/magpie/hub</code> で終わるアドレスが出ます。ここではライブラリのすべてのサーバーを提供します。<span class="ui">接続…</span> → <span class="ui">ほかのアプリ</span> には <code>?tools=on-demand</code> を付けたアドレスもあり、ツールを<a href="#on-demand">オンデマンドで</a>受け取りたいアプリに使います。<span class="ui">接続…</span> を押すと、Cursor、VS Code、Windsurf、JSON の MCP 設定を受け付けるアプリ向けのエントリがコピーできるシートが開きます。アプリのウィンドウでは、Cursor と VS Code には <span class="ui">追加</span> もあり、そのアプリが開いて確認を求めます。別のコンピュータのアプリには、ネットワークからのほかのリクエストと同じくゲートウェイのキーが必要です（<a href="/docs/ja/remote">リモート magpie</a> を参照）。</p>
+    <div class="callout"><b>コマンドのサーバーはこのコンピュータで動きます。</b>ネットワーク上で、モデル、アカウント、利用額の制限がないゲートウェイのキーを持つ人は、ルーターを通してあなたの権限でそれを呼び出せます。キーは信頼できる人にだけ渡してください。</div>
+
+    <h2 id="away"><a class="anchor" href="#away">別のコンピュータから</a></h2>
+    <p>別のコンピュータのアプリに渡されるものは、magpie が動いているコンピュータのアプリより少なくなります。トンネルやプロキシ経由のアプリも、Docker の magpie のホストにあるアプリも同じです。ホストからはコンテナの外から接続するためです。</p>
+    <ul>
+      <li><b>ここでプログラムとして動くサーバー</b>（<code>npx …</code> や <code>uvx …</code> などのコマンド、プラグインのツール）は、モデル、アカウント、利用額の制限がないゲートウェイのキーにだけ渡されます。どれかの制限があるキーには、ライブラリの URL のサーバーだけが渡されます。</li>
+      <li><b>ここであなたとして動くサーバー</b>は渡されません：magpie の画像サーバーとセッションのサーバー、別の magpie のルーター。画像はキーで <code>/mcp/magpie/image</code> を呼んでください。キーの制限が守られます。</li>
+      <li><b>Magpie Browser</b> はどのゲートウェイのキーにも渡され、同じキーで接続したブラウザだけを使います。</li>
+      <li><b>Magpie Memory</b> は、メモリーの利用を許可したキーにだけ渡されます（<a href="/docs/ja/remote#memory">ほかのコンピュータからのメモリー</a> を参照）。</li>
+      <li>一部の MCP サーバーだけを許可したキーには、そのサーバーだけが渡されます。</li>
+    </ul>
+    <p>渡されなかったものはアプリに伝えられます。magpie がアプリに渡す指示の最後に、渡さなかった種類ごとに <code>Not given to this caller: …</code> の行があり、どのサーバーか、なぜか、どうすれば渡されるかを書きます。そのツールを呼んだときも同じ理由が返ります。キーに許可されていないサーバーは数だけを示し、名前は出しません。</p>
+    <p><b>すべてのサーバーを使うには</b>、モデル、アカウント、利用額の制限がないゲートウェイのキーをアプリに渡すか（<span class="ui">ゲートウェイ</span> → <span class="ui">ゲートウェイキー</span>）、magpie が動いているコンピュータでアプリを動かします。あなたとして動くサーバーは、どちらの場合もそのコンピュータの中だけです。</p>
 
     <h2 id="kept"><a class="anchor" href="#kept">自分のエントリを残すエージェント</a></h2>
     <p>次のエージェントは各サーバーの個別のエントリを残し、ライブラリのページにどれがなぜかが表示されます：</p>
@@ -142,6 +219,13 @@ magpie library mcp router off</pre>
     <a href="/docs/ja/masking">プライバシーマスキング</a>
     <a href="/docs/ja/mcp-router">MCP ルーター</a>
     <a href="/docs/ja/library">ライブラリ</a>
+    <a href="/docs/ja/claude-code-models">Claude Code で他のモデル</a>
+    <a href="/docs/ja/codex-models">Codex で他のモデル</a>
+    <a href="/docs/ja/gemini-cli-models">Gemini CLI で他のモデル</a>
+    <a href="/docs/ja/subscriptions">サブスクを任意のエージェントで</a>
+    <a href="/docs/ja/local-models">ローカルモデル</a>
+    <a href="/docs/ja/opencode-models">OpenCode で他のモデル</a>
+    <a href="/docs/ja/alternatives">CC Switch・CCR との比較</a>
     <a href="/docs/ja/import">magpie に追加</a>
     <a href="/docs/integrate">アプリ連携</a>
     <a href="https://github.com/yetone/magpie">GitHub</a>

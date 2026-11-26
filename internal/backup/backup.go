@@ -5,7 +5,9 @@
 // servers and skills magpie gives the agents). Sign-ins (subscription
 // accounts and the plugins') are in it only when the user asks for them
 // (WithSignIns): each is the sign-in of an agent on this machine, and
-// without them each machine signs in on its own.
+// without them each machine signs in on its own. The usage history is in
+// it when asked for (WithUsage), as the CLI and the Settings page's Export
+// do unless told not to; a sync's and an automatic backup's never have it.
 //
 // The file is JSON: a header naming how it is sealed, and the bundle
 // encrypted with AES-256-GCM under a key derived from the passphrase with
@@ -13,6 +15,8 @@
 package backup
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -22,6 +26,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"maps"
 	"os"
 	"path/filepath"
@@ -33,10 +39,12 @@ import (
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/library"
+	"github.com/yetone/magpie/internal/memory"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/profile"
 	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/usage"
 )
 
 // Ext is the extension backups are saved with.
@@ -64,18 +72,21 @@ func isBackupJSON(data []byte) bool {
 
 // Bundle is what a backup holds.
 type Bundle struct {
-	Version     int                        `json:"version"`
-	Created     time.Time                  `json:"created"`
-	App         string                     `json:"app,omitempty"` // the magpie that made it
-	Keys        bool                       `json:"keys"`          // whole-backup credential policy
-	Providers   []provider.Provider        `json:"providers"`
-	Icons       map[string][]byte          `json:"icons,omitempty"`  // pictures picked for providers, by file name
-	Groups      []provider.Group           `json:"groups,omitempty"` // the user's model groups
-	Settings    *settings.Settings         `json:"settings,omitempty"`
-	GatewayKeys *[]access.Key              `json:"gatewayKeys,omitempty"`
-	Profiles    map[string]profile.Profile `json:"profiles,omitempty"`
-	Agents      map[string]string          `json:"agents,omitempty"`  // every agent's fields as they are now
-	Library     *library.Bundle            `json:"library,omitempty"` // nil from a magpie before it, or with none
+	Version     int                 `json:"version"`
+	Created     time.Time           `json:"created"`
+	App         string              `json:"app,omitempty"` // the magpie that made it
+	Keys        bool                `json:"keys"`          // whole-backup credential policy
+	Providers   []provider.Provider `json:"providers"`
+	Icons       map[string][]byte   `json:"icons,omitempty"`  // pictures picked for providers, by file name
+	Groups      []provider.Group    `json:"groups,omitempty"` // the user's model groups
+	Settings    *settings.Settings  `json:"settings,omitempty"`
+	GatewayKeys *[]access.Key       `json:"gatewayKeys,omitempty"`
+	// AccountGroups are the account groups gateway keys name (LeiWang_2000
+	// on X), carried with the keys; nil from a magpie before them.
+	AccountGroups *[]access.AccountGroup     `json:"accountGroups,omitempty"`
+	Profiles      map[string]profile.Profile `json:"profiles,omitempty"`
+	Agents        map[string]string          `json:"agents,omitempty"`  // every agent's fields as they are now
+	Library       *library.Bundle            `json:"library,omitempty"` // nil from a magpie before it, or with none
 	// Searches are the web search APIs (#419), their keys with the
 	// providers'; nil from a magpie before them.
 	Searches *[]provider.SearchAPI `json:"searches,omitempty"`
@@ -90,6 +101,10 @@ type Bundle struct {
 	// the providers they serve come with them. Their sign-ins don't, as a
 	// subscription's don't. Nil from a magpie before them.
 	Plugins *[]plugin.Entry `json:"plugins,omitempty"`
+	// Proxies are the proxies kept by name, which providers, accounts and
+	// Settings name as "@id". They travel with the providers, passwords
+	// only when the providers' keys do; nil from a magpie before them.
+	Proxies *[]settings.NamedProxy `json:"proxies,omitempty"`
 	// Sync can carry one part's credentials without changing the others'
 	// Keys policy; these are absent from older backups and whole collects.
 	ProvidersKeys *bool `json:"providersKeys,omitempty"`
@@ -99,6 +114,68 @@ type Bundle struct {
 	// with their credentials: only when the user asked for them
 	// (WithSignIns). Nil otherwise, and from a magpie before them.
 	SignIns *provider.SignIns `json:"signIns,omitempty"`
+	// Memory is what the agents know (memory.Collect): merged where it is
+	// put back, memory by memory, never put over what is there. Nil from
+	// a magpie before it, or with no memory.
+	Memory *memory.Bundle `json:"memory,omitempty"`
+	// Usage is the history of the calls made here and of the accounts'
+	// windows (WithUsage): merged where it is put back, never put over
+	// what is there. Nil when left out, and from a magpie before it.
+	Usage *Usage `json:"usage,omitempty"`
+}
+
+// Usage is the usage history a backup carries, so a restore on a new
+// computer has it (JasonLeeForOnly on Discord): usage.jsonl's lines,
+// gzipped (usage.LogBackup), and the quota cards' history as
+// provider.QuotaHistoryData keeps it, gzipped too.
+type Usage struct {
+	Calls  int    `json:"calls"`            // how many lines Log has
+	Log    []byte `json:"log,omitempty"`    // gzipped usage.jsonl
+	Quotas []byte `json:"quotas,omitempty"` // gzipped quota-history.json
+}
+
+// WithUsage puts this computer's usage history in b. A log that can't be
+// read is an error, never none.
+func WithUsage(b *Bundle) error {
+	lines, n, err := usage.LogBackup()
+	if err != nil {
+		return err
+	}
+	u := &Usage{Calls: n, Log: lines}
+	if q := provider.QuotaHistoryData(); len(q) > 0 {
+		var z bytes.Buffer
+		w, _ := gzip.NewWriterLevel(&z, gzip.BestCompression)
+		w.Write(q)
+		if err := w.Close(); err != nil {
+			return err
+		}
+		u.Quotas = z.Bytes()
+	}
+	b.Usage = u
+	return nil
+}
+
+// restoreUsage merges u into this computer's usage history, and says how
+// many calls it added.
+func restoreUsage(u *Usage) (int, error) {
+	n, err := usage.MergeLog(u.Log)
+	if err != nil {
+		return n, err
+	}
+	if len(u.Quotas) > 0 {
+		zr, err := gzip.NewReader(bytes.NewReader(u.Quotas))
+		if err != nil {
+			return n, err
+		}
+		q, err := io.ReadAll(zr)
+		if err != nil {
+			return n, err
+		}
+		if err := provider.MergeQuotaHistory(q, time.Now()); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // WithSignIns puts this computer's sign-ins in b. One that can't be read
@@ -158,6 +235,8 @@ func (b Bundle) scopedKeys(part string) bool {
 		own = b.SettingsKeys
 	case "library":
 		own = b.LibraryKeys
+	case "providers":
+		own = b.ProvidersKeys
 	}
 	if own != nil {
 		return *own
@@ -197,6 +276,15 @@ func Collect(keys bool, app string) (Bundle, error) {
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return b, err
 		}
+		if _, err := os.Stat(access.GroupsPath()); err == nil {
+			groups, err := access.ExportGroups()
+			if err != nil {
+				return b, err
+			}
+			b.AccountGroups = &groups
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return b, err
+		}
 	}
 	for _, p := range stored {
 		if !keys {
@@ -215,15 +303,26 @@ func Collect(keys bool, app string) (Bundle, error) {
 		}
 	}
 	plugins := provider.Carried(keys)
+	if plugins == nil {
+		plugins = []plugin.Entry{} // none, as against a file that carries no list
+	}
 	b.Plugins = &plugins
 	searches := []provider.SearchAPI{}
 	for _, a := range provider.StoredSearchAPIs() {
 		if !keys {
-			a.Key = ""
+			a = a.WithoutKeys() // those switched off too
 		}
 		searches = append(searches, a)
 	}
 	b.Searches = &searches
+	// the saved proxies ride with the providers that name them
+	proxies := settings.Load().Proxies
+	if !keys {
+		proxies = settings.WithoutProxyPasswords(proxies)
+	}
+	if len(proxies) > 0 {
+		b.Proxies = &proxies
+	}
 	// a settings.json that can't be read stops it too: carried as the
 	// defaults, it would put them over the settings where it is put back,
 	// or on every other computer sync mirrors it to (#2269)
@@ -232,10 +331,13 @@ func Collect(keys bool, app string) (Bundle, error) {
 		if err != nil {
 			return b, err
 		}
+		// the saved proxies hold passwords and are this computer's own (KeepOwn)
+		s.Proxies = nil
 		if !keys {
 			s.LANKey, s.LANKeyID = "", ""
 			s.OTel.Headers = nil
 			s.GitHubToken = ""
+			s.BarkKey = ""
 		}
 		b.Settings = &s
 	}
@@ -255,6 +357,10 @@ func Collect(keys bool, app string) (Bundle, error) {
 	if !keys && b.Library != nil {
 		b.Library.WithoutSecrets(Secret)
 	}
+	// memory that can't be read stops it too: unknown, not none
+	if b.Memory, err = memory.Collect(); err != nil {
+		return b, fmt.Errorf("memory: %w", err)
+	}
 	return b, nil
 }
 
@@ -265,7 +371,7 @@ func Secret(name string) bool { return provider.SecretHeader(name) }
 func withoutKeys(p provider.Provider) provider.Provider {
 	p.Key, p.KeyName, p.Keys, p.KeyProtocol, p.KeyWeight, p.KeyPlan = "", "", nil, "", 0, ""
 	p.BalanceToken = ""
-	p.AccessKeyID, p.SecretAccessKey = "", ""
+	p.AccessKeyID, p.SecretAccessKey, p.SessionToken = "", "", ""
 	if len(p.Headers) > 0 {
 		h := map[string]string{}
 		for k, v := range p.Headers {
@@ -373,10 +479,16 @@ type Parts struct {
 	// SignIns puts the backup's sign-ins in, when it has them
 	// (provider.RestoreSignIns: nothing renewed later here is written over).
 	SignIns bool
+	// Memory merges the backup's memory into this computer's
+	// (memory.Put): a memory here is never taken away by it.
+	Memory bool
+	// Usage merges the backup's usage history into this computer's
+	// (usage.MergeLog): a call here already is never added again.
+	Usage bool
 }
 
 // All is every part.
-var All = Parts{Providers: true, Settings: true, Profiles: true, Agents: true, Library: true, SignIns: true}
+var All = Parts{Providers: true, Settings: true, Profiles: true, Agents: true, Library: true, SignIns: true, Memory: true, Usage: true}
 
 // Result says what a restore did.
 type Result struct {
@@ -387,13 +499,17 @@ type Result struct {
 	SignIn []string `json:",omitempty"`
 	// Plugins are the plugins installed for it, PluginErrors why the others
 	// couldn't be, by spec
-	Plugins         []string          `json:",omitempty"`
-	PluginErrors    map[string]string `json:",omitempty"`
-	Settings        bool
-	Profiles        int
-	Agents          int               // agent fields changed
-	Skipped         []string          // agent fields left alone: the agent is not on this machine, or the value failed
-	Library         bool              // the library was put in
+	Plugins      []string          `json:",omitempty"`
+	PluginErrors map[string]string `json:",omitempty"`
+	Settings     bool
+	Profiles     int
+	Agents       int      // agent fields changed
+	Skipped      []string // agent fields left alone: the agent is not on this machine, or the value failed
+	Library      bool     // the library was put in
+	Memory       bool     `json:",omitempty"` // memory changed: the backup's merged in
+	// Usage is how many of the backup's calls were added to the usage
+	// history here; nil when it had none, or they weren't asked for.
+	Usage           *int              `json:",omitempty"`
 	LibraryProblems []library.Problem `json:",omitempty"` // what of it couldn't be given to an agent
 	// SignIns is what putting the backup's sign-ins in did; nil when it
 	// had none, or they weren't asked for.
@@ -418,6 +534,12 @@ func Restore(b Bundle, parts Parts) (Result, error) {
 		r.SignIns = &res
 	}
 	if parts.Providers {
+		// the proxies first: a provider's choice of one is checked against them
+		if b.Proxies != nil {
+			if err := settings.RestoreProxies(*b.Proxies, b.scopedKeys("providers")); err != nil {
+				return r, fmt.Errorf("putting the saved proxies in: %w", err)
+			}
+		}
 		for name, data := range b.Icons {
 			if f := provider.IconFile(name); f != "" && len(data) <= provider.MaxIcon {
 				if _, err := os.Stat(f); err != nil {
@@ -477,6 +599,7 @@ func Restore(b Bundle, parts Parts) (Result, error) {
 		if !keys {
 			s.LANKey, s.LANKeyID = cur.LANKey, cur.LANKeyID
 			s.GitHubToken = cur.GitHubToken
+			s.BarkKey = cur.BarkKey
 			s.OTel.Headers = nil
 			if strings.TrimRight(strings.TrimSpace(s.OTel.Endpoint), "/") == cur.OTel.Endpoint {
 				s.OTel.Headers = cur.OTel.Headers
@@ -495,6 +618,15 @@ func Restore(b Bundle, parts Parts) (Result, error) {
 		}
 		if err := settings.Save(s); err != nil {
 			return r, err
+		}
+		// the groups before the keys that name them
+		if keys && b.AccountGroups != nil {
+			if err := access.RestoreGroups(*b.AccountGroups); err != nil {
+				if rollback := settings.Save(cur); rollback != nil {
+					return r, errors.Join(err, fmt.Errorf("could not restore original settings after account-group restore failed: %w", rollback))
+				}
+				return r, err
+			}
 		}
 		if keys && b.GatewayKeys != nil {
 			if err := access.Restore(*b.GatewayKeys); err != nil {
@@ -568,6 +700,26 @@ func Restore(b Bundle, parts Parts) (Result, error) {
 			return r, fmt.Errorf("the library: %w", err)
 		}
 		r.Library, r.LibraryProblems = true, res.Problems
+	}
+	if parts.Memory && b.Memory != nil {
+		changed, err := memory.Put(b.Memory)
+		if err != nil {
+			return r, fmt.Errorf("memory: %w", err)
+		}
+		if r.Memory = changed; changed {
+			// the agents' instructions given what came, as after a change
+			// the user made to memory
+			if _, err := library.PublishMemory(false); err != nil {
+				log.Printf("backup: memory digest: %v", err)
+			}
+		}
+	}
+	if parts.Usage && b.Usage != nil {
+		n, err := restoreUsage(b.Usage)
+		if err != nil {
+			return r, fmt.Errorf("the usage history: %w", err)
+		}
+		r.Usage = &n
 	}
 	return r, nil
 }

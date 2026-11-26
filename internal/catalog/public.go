@@ -15,8 +15,18 @@ import (
 // the image models the key can use: AIHubMix lists only its Gemini image
 // models there, while gpt-image-2 and the rest draw with the same key. Its
 // public catalog, by the host of the vendor's base URL, has them.
+// OpenRouter's /models lists only the models that answer in text, so of
+// its image models only those that chat (Nano Banana, GPT-5 Image) were
+// there; FLUX, Seedream, Riverflow, Recraft, GPT Image and the rest, which
+// answer with an image alone, are listed by its Image API's own
+// /images/models (iwinux on Discord). They draw at its /images, as the
+// gateway asks it. That list leaves out a model's variants, though:
+// recraft/recraft-v4.1-flash-v2:free is listed by /models asked for image
+// output alone (AllenH__ on X), which lists every model /images/models
+// does as well, each row with the endpoints it is asked at.
 var PublicCatalogs = map[string]string{
-	"aihubmix.com": "https://aihubmix.com/api/v1/models",
+	"aihubmix.com":  "https://aihubmix.com/api/v1/models",
+	"openrouter.ai": "https://openrouter.ai/api/v1/models?output_modalities=image",
 }
 
 // PublicDrawers are the image models the public catalog for base's host
@@ -55,6 +65,12 @@ func PublicDrawers(ctx context.Context, base string) []Model {
 	}
 	var out []Model
 	for _, raw := range list.Data {
+		if d, ok := openRouterDrawer(raw); ok {
+			if d.ID != "" {
+				out = append(out, d)
+			}
+			continue
+		}
 		var m struct {
 			ID      string `json:"model_id"`
 			Name    string `json:"model_name"`
@@ -81,6 +97,50 @@ func PublicDrawers(ctx context.Context, base string) []Model {
 		out = append(out, d)
 	}
 	return out
+}
+
+// openRouterDrawer reads a row of OpenRouter's /models?output_modalities=image
+// or /images/models: {"id", "name": "Black Forest Labs: FLUX.2 Pro",
+// "created": <unix seconds>, "architecture": {"input_modalities",
+// "output_modalities"}, "endpoints"}. One whose output has no image isn't
+// kept, nor, when its endpoints are a list (/models'), one not asked at
+// /api/v1/images: openrouter/auto, a router that may answer with an image.
+// ok is false for a row of another shape (AIHubMix's model_id), and a
+// row of OpenRouter's that isn't kept is ok with no ID.
+func openRouterDrawer(raw json.RawMessage) (Model, bool) {
+	var m struct {
+		ID           string  `json:"id"`
+		Name         string  `json:"name"`
+		Created      float64 `json:"created"`
+		Architecture *struct {
+			In  []string `json:"input_modalities"`
+			Out []string `json:"output_modalities"`
+		} `json:"architecture"`
+		// /images/models' is the URL of the model's endpoints, a string
+		Endpoints json.RawMessage `json:"endpoints"`
+	}
+	if json.Unmarshal(raw, &m) != nil || m.ID == "" || m.Architecture == nil || !slices.Contains(m.Architecture.Out, "image") {
+		return Model{}, false
+	}
+	var at []string
+	if json.Unmarshal(m.Endpoints, &at) == nil && at != nil && !slices.Contains(at, "/api/v1/images") {
+		return Model{}, true
+	}
+	d := Model{ID: m.ID, Name: m.Name, Draws: true, OutputModalities: Kinds(m.Architecture.Out)}
+	// the vendor's prefix ("Black Forest Labs: ") is the provider's to say
+	if _, rest, ok := strings.Cut(d.Name, ": "); ok && rest != "" {
+		d.Name = rest
+	}
+	if d.Name == "" {
+		d.Name = m.ID
+	}
+	if m.Created > 0 {
+		d.Released = time.Unix(int64(m.Created), 0).UTC().Format("2006-01-02")
+	}
+	if slices.Contains(m.Architecture.In, "image") {
+		d.Images, d.ImageInput = true, imageInputOf(true)
+	}
+	return d, true
 }
 
 // WithDrawers adds the drawers not already in ms.

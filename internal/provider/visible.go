@@ -99,6 +99,8 @@ func catalogFor(agent string) (shown, hidden []Entry) {
 			shown = append(shown, e)
 		}
 	}
+	// the windows the user set for this agent alone (settings.AgentContexts)
+	shown = withAgentWindows(heldSettings(), agent, shown)
 	return shown, hidden
 }
 
@@ -262,6 +264,55 @@ func sortedIDs(ids []string) []string {
 	return keep
 }
 
+// Widen lets agent's visibility give it these entries, of those it keeps
+// now (whysugarsweet on X: Claude Desktop narrowed to five providers, set
+// from the terminal, never listed OpenCode Go added later, and the Agents
+// page's list had no way to it): each one's provider, or its group, is
+// added to the names the agent is narrowed to, so the provider's other
+// models are listed too, for its list to show or not. When nothing is
+// kept after, the agent is narrowed no more. An id not kept is passed by.
+func Widen(agent string, ids []string) error {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if agent == "" {
+		return errors.New("no agent")
+	}
+	names, narrowed := VisibleTo(agent)
+	if !narrowed || len(ids) == 0 {
+		return nil
+	}
+	_, kept := ListedFor(agent)
+	added := false
+	for _, e := range kept {
+		if !slices.Contains(ids, e.ID) {
+			continue
+		}
+		n := e.Provider.ID
+		if e.Group != "" {
+			n = e.Group
+		}
+		if !slices.ContainsFunc(names, func(v string) bool { return strings.EqualFold(v, n) }) {
+			names, added = append(names, n), true
+		}
+	}
+	if !added {
+		return nil
+	}
+	s := settings.Load()
+	if slices.ContainsFunc(kept, func(e Entry) bool { return !Shows(names, e) }) {
+		if s.Visible == nil {
+			s.Visible = map[string][]string{}
+		}
+		s.Visible[agent] = names
+	} else {
+		delete(s.Visible, agent)
+	}
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	catalog.Touched()
+	return nil
+}
+
 // SetHiddenModels takes these entries out of agent's lists, and puts back
 // every other; none shows it every model its visibility gives it. The
 // agents that keep the models in files of their own are told.
@@ -274,6 +325,22 @@ func SetHiddenModels(agent string, ids []string) error {
 	for _, id := range ids {
 		if id = strings.TrimSpace(id); id != "" && !slices.Contains(keep, id) {
 			keep = append(keep, id)
+		}
+	}
+	// a model taken out that its provider's list lacks now (ZCode's
+	// -Trial entries are listed from 23:00 only) isn't in the list the
+	// editor sent, so it stays taken out for when it is listed again, as
+	// SetPickedModels keeps a pick of it
+	if was := HiddenModels(agent); len(was) > 0 {
+		listed, _ := ListedFor(agent)
+		now := map[string]bool{}
+		for _, e := range listed {
+			now[e.ID] = true
+		}
+		for id := range was {
+			if !now[id] && !slices.Contains(keep, id) {
+				keep = append(keep, id)
+			}
 		}
 	}
 	slices.Sort(keep)
@@ -422,4 +489,128 @@ func InOrder(agent string, es []Entry) []Entry {
 // which the ChatGPT backend lists to Codex by its bare slug (e.Model).
 func CodexOwn(e Entry) bool {
 	return e.Group == "" && e.Provider.Account != nil && e.Provider.Account.Agent == "codex"
+}
+
+// ShowFor puts entry id back in agent's lists, as the user picks it in
+// one of the agent's pickers where its lists leave it out (a routing
+// group made after the agent was narrowed, or shown only its picks): its
+// provider or group is added to the names the agent is narrowed to, and
+// it is picked for an agent shown only its picks, else no longer taken
+// out. Nothing else in the lists changes.
+func ShowFor(agent, id string) error {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if id = strings.TrimSpace(id); agent == "" || id == "" {
+		return errors.New("no agent or model")
+	}
+	if err := Widen(agent, []string{id}); err != nil {
+		return err
+	}
+	s := settings.Load()
+	changed := false
+	if picks, only := s.PickedModels[agent]; only {
+		if !slices.ContainsFunc(picks, func(p string) bool { return PublicRef(p) == id }) {
+			s.PickedModels[agent], changed = sortedIDs(append(slices.Clone(picks), id)), true
+		}
+	} else if was := s.HiddenModels[agent]; slices.ContainsFunc(was, func(h string) bool { return PublicRef(h) == id }) {
+		keep := slices.DeleteFunc(slices.Clone(was), func(h string) bool { return PublicRef(h) == id })
+		if len(keep) == 0 {
+			delete(s.HiddenModels, agent)
+		} else {
+			s.HiddenModels[agent] = keep
+		}
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	catalog.Touched()
+	return nil
+}
+
+// PicksJoin reports whether agent, shown only the models picked for it,
+// takes in the models picked for a provider as well (eiyuuzaki2333 on X):
+// a model ticked in a provider's editor is ticked for it too.
+func PicksJoin(agent string) bool {
+	return slices.Contains(heldSettings().PicksJoin, strings.ToLower(strings.TrimSpace(agent)))
+}
+
+// SetPicksJoin switches whether agent takes in the models picked for a
+// provider. It changes no pick: only the models picked from now on join.
+func SetPicksJoin(agent string, on bool) error {
+	agent = strings.ToLower(strings.TrimSpace(agent))
+	if agent == "" {
+		return errors.New("no agent")
+	}
+	s := settings.Load()
+	if slices.Contains(s.PicksJoin, agent) == on {
+		return nil
+	}
+	if on {
+		s.PicksJoin = append(s.PicksJoin, agent)
+		slices.Sort(s.PicksJoin)
+	} else {
+		s.PicksJoin = slices.DeleteFunc(s.PicksJoin, func(a string) bool { return a == agent })
+	}
+	return settings.Save(s)
+}
+
+// JoinPicks ticks the models picked for p now (its Models) that before,
+// p as it was saved (nil: just added), didn't serve, for every agent shown
+// only its picks that takes in a provider's (PicksJoin), and returns those
+// agents, sorted. Only a pick the user made joins: a provider serving its
+// vendor's list (none picked) gives none, nor does a model its vendor
+// lists later, nor one it served before it was picked (a first untick in
+// a provider serving its vendor's list makes the rest picks). An agent
+// shown every model not taken out is shown a new one already, and one that
+// isn't shown only its picks keeps its list as the user left it.
+func JoinPicks(p Provider, before *Provider) ([]string, error) {
+	if p.ID == "" || p.NoModels {
+		return nil, nil
+	}
+	had := map[string]bool{}
+	if before != nil && !before.NoModels {
+		for _, m := range before.Models {
+			had[before.ListedModelID(strings.TrimSpace(m))] = true
+		}
+		if len(before.Models) == 0 {
+			for _, m := range before.Exposed() {
+				had[m.ID] = true
+			}
+		}
+	}
+	var add []string
+	for _, m := range normalModels(p.Models) {
+		if id := p.ListedModelID(m); !had[id] {
+			add = append(add, p.ID+"/"+id)
+		}
+	}
+	if len(add) == 0 {
+		return nil, nil
+	}
+	s := settings.Load()
+	var changed []string
+	for _, a := range s.PicksJoin {
+		picks, only := s.PickedModels[a]
+		if !only {
+			continue
+		}
+		next := sortedIDs(append(slices.Clone(picks), add...))
+		if slices.Equal(next, picks) {
+			continue
+		}
+		s.PickedModels[a] = next
+		changed = append(changed, a)
+	}
+	if len(changed) == 0 {
+		return nil, nil
+	}
+	if err := settings.Save(s); err != nil {
+		return nil, err
+	}
+	catalog.Touched()
+	slices.Sort(changed)
+	return changed, nil
 }

@@ -1,11 +1,12 @@
 package redact
 
 import (
-	"regexp"
 	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // A local model (internal/pii, Settings → Privacy's "Find with a local
@@ -84,7 +85,7 @@ func modelSpans(s string, o Options) []span {
 		if kind == "PERSON" {
 			a, b = zhTrim(s, a, b)
 		}
-		if a < b && utf8.ValidString(s[a:b]) && modelTakes(kind, s[a:b]) && modelFits(s, a, b, kind) && !(kind == "PERSON" && zhWordNotName(s, a, b)) {
+		if a < b && utf8.ValidString(s[a:b]) && modelTakes(kind, s[a:b]) && modelFits(s, a, b, kind, o.args) && !(kind == "PERSON" && zhWordNotName(s, a, b)) {
 			out = append(out, span{a, b, kind, ByModel, f.Score, false})
 		}
 	}
@@ -120,6 +121,9 @@ func delimiter(c byte) bool { return isSpace(c) || strings.IndexByte(`"',;:`, c)
 // the local model was turned off (#3144). Such a word is a protocol's or a
 // program's, wherever it is: a setting, a tool's argument, code.
 func modelTakes(kind, v string) bool {
+	if hexLiteral.MatchString(v) {
+		return false
+	}
 	switch kind {
 	case "SECRET":
 		return len(v) >= 8 && !madeID(v) && !namesThing(v) && !versionValue(v)
@@ -190,23 +194,23 @@ func modelName(v string) bool {
 }
 
 var (
-	dashedRe   = regexp.MustCompile(`^[a-z][a-z0-9.]*(?:-[a-z0-9.]+)+$`)
-	sizePartRe = regexp.MustCompile(`^(?:\d+x)?\d+(?:\.\d+)?[bkm]$|^20\d{6}$`)
-	dateIn     = regexp.MustCompile(`(?:^|-)20\d\d-[01]\d-[0-3]\d(?:-|$)`)
+	dashedRe   = lazyre.New(`^[a-z][a-z0-9.]*(?:-[a-z0-9.]+)+$`)
+	sizePartRe = lazyre.New(`^(?:\d+x)?\d+(?:\.\d+)?[bkm]$|^20\d{6}$`)
+	dateIn     = lazyre.New(`(?:^|-)20\d\d-[01]\d-[0-3]\d(?:-|$)`)
 )
 
 var (
-	uuidRe = regexp.MustCompile(`^(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	uuidRe = lazyre.New(`^(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	// a model's, a repo's or a package's name (qwen/qwen3-14b, acme/web)
-	slugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._@-]*(?:/[a-z0-9._@-]+)+$`)
+	slugRe = lazyre.New(`^[a-z0-9][a-z0-9._@-]*(?:/[a-z0-9._@-]+)+$`)
 	// a file's name in lower case (make-icons.sh, run_all.py)
-	fileNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*(?:\.[a-z0-9_-]+)*\.[a-z][a-z0-9]{0,4}$`)
-	digestRe   = regexp.MustCompile(`^(?i)(?:md5|sha-?(?:1|224|256|384|512)|blake2b?|blake3)[ :=-]+[0-9a-f]{32,128}$`)
+	fileNameRe = lazyre.New(`^[a-z0-9][a-z0-9_-]*(?:\.[a-z0-9_-]+)*\.[a-z][a-z0-9]{0,4}$`)
+	digestRe   = lazyre.New(`^(?i)(?:md5|sha-?(?:1|224|256|384|512)|blake2b?|blake3)[ :=-]+[0-9a-f]{32,128}$`)
 	// a package's digest as a lock file pins it (Subresource Integrity:
 	// package-lock.json's and pnpm-lock.yaml's "integrity"), sha512- and
 	// the hash in base64, with the } or quote the model took in after it.
 	// Privacy Filter took each one for a secret.
-	sriRe = regexp.MustCompile(`^sha(?:256|384|512)-[A-Za-z0-9+/]{43,86}={0,2}[}"',;)\]]*$`)
+	sriRe = lazyre.New(`^sha(?:256|384|512)-[A-Za-z0-9+/]{43,86}={0,2}[}"',;)\]]*$`)
 )
 
 // madeID says v is an id of the shape vendors and tools give theirs: a
@@ -307,11 +311,14 @@ func withModel(o Options, texts []string) Options {
 // A name's words each start with a capital, but for the particles names
 // have (van, de, bin): "local LLM", "User yetone" and claudeKeychain are
 // a program's or a log's words.
-func modelFits(s string, a, b int, kind string) bool {
+func modelFits(s string, a, b int, kind string, args bool) bool {
 	if a > 0 && wordByte(s[a-1]) && wordByte(s[a]) || b < len(s) && wordByte(s[b-1]) && wordByte(s[b]) {
 		return false
 	}
 	v := s[a:b]
+	if publicID(s, a, b) {
+		return false
+	}
 	if evmRe.MatchString(v) {
 		// a wallet's or a contract's address (0x and 40 hex digits) is
 		// public, on its chain for anyone to read, and the vendor's model
@@ -325,7 +332,7 @@ func modelFits(s string, a, b int, kind string) bool {
 	}
 	switch kind {
 	case "PERSON":
-		return personFits(s, a, b, v)
+		return personFits(s, a, b, v, args)
 	case "ACCOUNT":
 		if hexRe.MatchString(v) && strings.ContainsAny(v, "abcdef") || versionRe.MatchString(v) || !numberLike(v) {
 			return false
@@ -383,6 +390,27 @@ func modelFits(s string, a, b int, kind string) bool {
 	return true
 }
 
+// publicID says s[a:b] is a video's id on a public site, an id anyone
+// with the link reads, which the vendor's model needs as written to look
+// the video up: a Bilibili BV id (BV1VMnk68E9Q) or av number, and a
+// YouTube video's, playlist's or channel's id in its link. The local
+// model took BV ids in a list a script was to fetch for secrets, and
+// five of nine went as {{SECRET_…}} (jimlee0824v2 on X). A BV id is known
+// by its own shape; a YouTube id has none (11 of base64url's letters, as
+// a key's piece may be), so only what is before it in its link says it
+// is one. A key that has either shape is still the rules' when its name
+// is before it (api_key=…).
+func publicID(s string, a, b int) bool {
+	v := s[a:b]
+	if bvidRe.MatchString(v) {
+		return true
+	}
+	if !youtubeID.MatchString(v) {
+		return false
+	}
+	return youtubeAt.MatchString(s[max(0, a-160):a])
+}
+
 // programWords says v, which the model took for a person's or a place's,
 // is a program's words: it has an underscore (node_modules, __pycache__,
 // node_modules 太, the model running on into the sentence after it), or
@@ -403,7 +431,7 @@ func programWords(v string) bool {
 // _: drizzle-orm, reflect-metadata, lodash.merge, secretstorage; and a
 // folder's name as a path or Python writes it, with the slash after it
 // or underscores around it: node_modules/, __pycache__.
-var wordsOnlyRe = regexp.MustCompile(`^_*[a-z]+(?:[-._][a-z]+)*_*/?$`)
+var wordsOnlyRe = lazyre.New(`^_*[a-z]+(?:[-._][a-z]+)*_*/?$`)
 
 // wordsOnly says v, which the model took for a secret, is made of words
 // in lower case alone, as a package's, a tool's or a setting's name is.
@@ -464,7 +492,7 @@ func pinnedAfter(s string, b int) bool {
 
 // moduleRe is what code names a module by: drizzle-orm, @scope/name/sub,
 // node:fs, ./db/schema, golang.org/x/net, serde_json::Value.
-var moduleRe = regexp.MustCompile(`^(?:[a-z]+:)?@?[A-Za-z0-9_.~-]+(?:(?:/|::)[A-Za-z0-9_.~@-]+)*$`)
+var moduleRe = lazyre.New(`^(?:[a-z]+:)?@?[A-Za-z0-9_.~-]+(?:(?:/|::)[A-Za-z0-9_.~@-]+)*$`)
 
 // moduleAt says s[a:b] is the module a line of code loads: import { eq }
 // from 'drizzle-orm', require(' jsonwebtoken '), import('x'), from
@@ -635,7 +663,7 @@ func depVersion(v string) bool {
 	return v != ""
 }
 
-var depRangeRe = regexp.MustCompile(`^(?:[~^]|[<>]=?|=)?[vV]?\d+(?:\.(?:\d+|[xX*]))*(?:[-+][0-9A-Za-z.-]+)?$`)
+var depRangeRe = lazyre.New(`^(?:[~^]|[<>]=?|=)?[vV]?\d+(?:\.(?:\d+|[xX*]))*(?:[-+][0-9A-Za-z.-]+)?$`)
 
 // underPackages says the name at a is a folder packages are installed in:
 // node_modules/drizzle-orm/…, site-packages/secretstorage/….
@@ -675,7 +703,7 @@ func missingModuleAt(s string, a, b int) bool {
 }
 
 // installRe is a package manager's command that names packages after it.
-var installRe = regexp.MustCompile(`(?:^|[\s;&|(` + "`" + `$])(?:npm|pnpm|yarn|bun|npx|pip|pip3|uv|poetry|pipx|cargo|gem|composer|deno|go)(?: +(?:pip|-[\w-]+))* +(?:add|install|i|remove|rm|uninstall|un|get|require|update|upgrade|up)(?: |$)`)
+var installRe = lazyre.New(`(?:^|[\s;&|(` + "`" + `$])(?:npm|pnpm|yarn|bun|npx|pip|pip3|uv|poetry|pipx|cargo|gem|composer|deno|go)(?: +(?:pip|-[\w-]+))* +(?:add|install|i|remove|rm|uninstall|un|get|require|update|upgrade|up)(?: |$)`)
 
 // installedAt says s[a:b] is one of the packages a command on its line
 // installs or removes: pnpm add drizzle-orm postgres, npm i -D x,
@@ -728,7 +756,7 @@ func pinnedAt(s string, a, b int) bool {
 	return m != "" && !(len(s) > b+1+len(m) && s[b+1+len(m)] == '.')
 }
 
-var pinVersionRe = regexp.MustCompile(`^[\^~]?v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]*[0-9A-Za-z])?`)
+var pinVersionRe = lazyre.New(`^[\^~]?v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]*[0-9A-Za-z])?`)
 
 // wordEnd says s ends in the word w.
 func wordEnd(s, w string) bool {
@@ -739,7 +767,7 @@ func wordByte(c byte) bool {
 	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 }
 
-func personFits(s string, a, b int, v string) bool {
+func personFits(s string, a, b int, v string, args bool) bool {
 	if strings.ContainsAny(v, "0123456789/\\@<>|=_") || strings.IndexFunc(v, unicode.IsUpper) < 0 && isASCII(v) {
 		return false
 	}
@@ -759,6 +787,13 @@ func personFits(s string, a, b int, v string) bool {
 	// an acronym (CI, API), a product's name in camel case (CodeRabbit,
 	// OpenAI) and a site's (Greptile beside app.greptile.com) are no one's
 	if w := strings.Fields(v); len(w) == 1 && (strings.Trim(v, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") == "" || camelProduct(v) || hostIn(s, v)) {
+		return false
+	}
+	// an app's or a product's name the model took for a first name, where
+	// its sentence speaks of a thing (thingname.go); never in a tool
+	// call's arguments, which name whom a tool acts for
+	// ({"recipient":"Rina"})
+	if w := strings.Fields(v); len(w) == 1 && isASCII(v) && !args && thingNamed(s, a, b) {
 		return false
 	}
 	for i, w := range strings.Fields(v) {
@@ -816,7 +851,7 @@ func hostIn(s, w string) bool {
 
 // hostTail is a domain's rest after its first part: .com, .greptile.com,
 // ending where the host does (not at an @ or more of a word)
-var hostTail = regexp.MustCompile(`^(?:\.[a-z0-9-]+)*\.[a-z]{2,6}(?:[/:\s"'),\x60]|$)`)
+var hostTail = lazyre.New(`^(?:\.[a-z0-9-]+)*\.[a-z]{2,6}(?:[/:\s"'),\x60]|$)`)
 
 // nameParticles are the words in lower case a name may have between its
 // others: Ludwig van Beethoven, Ibn al Haytham.
@@ -888,21 +923,40 @@ var assistantNames = map[string]bool{
 }
 
 var (
-	hexRe = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
+	hexRe = lazyre.New(`^[0-9a-f]{7,64}$`)
 	// an EVM chain's address: 0x and 40 hex digits, in either case or
 	// mixed (EIP-55's checksum)
-	evmRe     = regexp.MustCompile(`^0[xX][0-9a-fA-F]{40}$`)
-	decimalRe = regexp.MustCompile(`^\d+\.\d+$`)
+	evmRe     = lazyre.New(`^0[xX][0-9a-fA-F]{40}$`)
+	decimalRe = lazyre.New(`^\d+\.\d+$`)
+	// a number written in hex as code and notes write one, of 64 bits at
+	// most: a memory address (0x004EA5E0), a constant, a flag. The model
+	// took such an address in reverse-engineering notes for a secret, and
+	// the vendor's model read {{SECRET_…}} where the address was
+	// (TakaNaShi_ShiKi on X); as an account number it went as
+	// {{ACCOUNT_…}}. modelTakes takes one as no kind. No key is that
+	// short, and a cue isn't asked as for a bare hex run (secretCued): the
+	// function at an address is often named for a key (DecryptKey:
+	// 0x004EA5E0). A key written so is longer (0x and 64 hex digits) and
+	// is masked still.
+	hexLiteral = lazyre.New(`^0[xX][0-9a-fA-F]{1,16}$`)
+	// a Bilibili video's id: BV1 and nine base58 characters
+	// (BV1VMnk68E9Q), or its older av and a number (av170001)
+	bvidRe = lazyre.New(`^BV1[1-9A-HJ-NP-Za-km-z]{9}$|^(?i:av)[1-9]\d{0,11}$`)
+	// what is before a YouTube video's, playlist's or channel's id in its
+	// link: watch?v=, list=, youtu.be/, /shorts/, /embed/, /live/,
+	// /channel/
+	youtubeAt = lazyre.New(`(?i)(?:^|[^a-z0-9.-])(?:(?:www|m|music)\.)?(?:(?:youtube|youtube-nocookie)\.com/(?:(?:watch|playlist)\?(?:[^\s"'<>&]*&)*(?:v|list)=|(?:shorts|embed|live|v|channel)/)|youtu\.be/)$`)
+	youtubeID = lazyre.New(`^[A-Za-z0-9_-]{10,64}$`)
 	// a time of day in words the model took for a passphrase (release
 	// about 17:05Z)
-	clockIn   = regexp.MustCompile(`(?:^|\s)\d{1,2}:\d{2}(?::\d{2})?Z?(?:\s|$)`)
-	versionRe = regexp.MustCompile(`^v?\d+(?:\.\d+)+$`)
-	sizeRe    = regexp.MustCompile(`^\d+ ?[x×] ?\d+$`)
-	uuidIn    = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	clockIn   = lazyre.New(`(?:^|\s)\d{1,2}:\d{2}(?::\d{2})?Z?(?:\s|$)`)
+	versionRe = lazyre.New(`^v?\d+(?:\.\d+)+$`)
+	sizeRe    = lazyre.New(`^\d+ ?[x×] ?\d+$`)
+	uuidIn    = lazyre.New(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 	// a name in Go's module cache (d6426ecaaf0a28de@v31)
-	modCacheRe = regexp.MustCompile(`^[0-9a-f]{16}@v\d+$`)
+	modCacheRe = lazyre.New(`^[0-9a-f]{16}@v\d+$`)
 	// a link, or a host's name with a path (discord.gg/…)
-	linkRe = regexp.MustCompile(`^(?:[a-z][a-z0-9+.-]*://|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/)`)
+	linkRe = lazyre.New(`^(?:[a-z][a-z0-9+.-]*://|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/)`)
 )
 
 var (
